@@ -302,6 +302,7 @@ async def add_study(
         max_trials=simulations,
         task=task,
         status=StudyStatus.QUEUED if run else StudyStatus.IDLE,
+        sampler_notes="",
     )
     async with state.db.session() as session:
         session.add(row)
