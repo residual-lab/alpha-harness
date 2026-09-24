@@ -416,6 +416,7 @@ class Study(Base):
     #: long did it take" means; ``created_at`` would count the waiting too.
     started_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     finished_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    sampler_notes: Mapped[str] = mapped_column(Text, server_default="", nullable=False)
 
 
 class Trial(Base):
