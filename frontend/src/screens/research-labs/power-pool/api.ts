@@ -14,9 +14,15 @@ export interface PowerPoolRequest {
   delay: number
   universe: string
   dataset_ids: string[]
+  /** Only these fields, ranked, when any were chosen; the prompt lists them in this order. */
+  field_ids: string[]
+  /** How `field_ids` were ranked, as the prompt says it. */
+  rank_by: string | null
   /** The Data Explorer's filter the datasets were chosen under; `null` uses every field. */
   field_filter?: FieldFilterState | null
   model: string | null
+  /** A saved prompt from LLM Prompts; null sends the built-in. */
+  prompt_id: number | null
   /** Empty keeps every neutralization BRAIN offers for the market. */
   neutralizations: string[]
   /** Empty draws from every downloaded universe of the market. */

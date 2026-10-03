@@ -22,6 +22,7 @@ from .params import (
     CORRELATION_BREAKER,
     GA_SAMPLER,
     POWER_POOL_SAMPLER,
+    REGION_AGNOSTIC_SAMPLER,
     SEARCH_SAMPLER,
     SETTINGS_SAMPLER,
     SUPER_LAB,
@@ -321,7 +322,7 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
                 return await send_parked(optimizer, row, leftovers)
     if row.sampler == GA_SAMPLER:
         return await _breed(optimizer, row, last_number, want, waiting)
-    if row.sampler == POWER_POOL_SAMPLER:
+    if row.sampler in (POWER_POOL_SAMPLER, REGION_AGNOSTIC_SAMPLER):
         from . import power_pool  # imported here: labs.power_pool builds on this module
 
         return await power_pool.refill(optimizer, row, want, waiting)
@@ -491,10 +492,12 @@ async def _breed(
                         select(func.count()).where(Trial.study_id == row.id, Trial.generation > 0)
                     )
                 )
+            # Paused, not failed, when nothing was ever bred: the seeds may breed once the
+            # market's operators or data change, and a fresh clone is always there.
             await finish(
                 optimizer,
                 row.id,
-                StudyStatus.COMPLETE if bred else StudyStatus.FAILED,
+                StudyStatus.COMPLETE if bred else StudyStatus.PAUSED,
                 "No new child could be bred: every child of these parents was already "
                 "simulated or is not a valid Alpha here.",
             )
@@ -510,44 +513,6 @@ def _spent(rows: Sequence[Any]) -> list[float | None]:
         scores = json.loads(values or "null")
         out.append(float(scores[0]) if state == TrialState.COMPLETE and scores else None)
     return out
-
-
-async def stop_task(optimizer: Optimizer, row: Study, *, force: bool = False) -> None:
-    """Finish a task early. Simulations already sent still finish and are scored.
-
-    ``force`` is the second press, for a task that has been stopping and has not stopped.
-    An ordinary stop is cooperative: it waits for what is already out on BRAIN, which is
-    right, because that quota is spent either way. But it relies on every outstanding
-    simulation reaching a terminal state, and one that never does — BRAIN loses it, a poll
-    never resolves — holds the task RUNNING and its cores for good, with nothing on screen
-    to press but the button that already did nothing.
-
-    So a forced stop cancels what it can on BRAIN, closes the trials whatever their
-    simulations are doing, and ends the task. Anything BRAIN keeps running still lands in
-    the vault; it simply stops holding a task open.
-    """
-    async with optimizer.lock(row.id):
-        await optimizer.engine.drop_queued(row.task)
-        if force:
-            await optimizer.engine.abandon(row.task)
-        await prune_unsent(optimizer, row.id, everything=force)
-        counts = await optimizer.counts(row.id)
-        out = counts.get(TrialState.QUEUED, 0) + counts.get(TrialState.RUNNING, 0)
-        async with optimizer.db.session() as session:
-            stored = await session.get(Study, row.id)
-            if stored is not None:
-                params = task_params(stored)
-                params.stopping = True
-                stored.sampler_params = params.dump()
-                # With simulations still out it runs on only to score them.
-                if out:
-                    stored.status = StudyStatus.RUNNING
-                else:
-                    stored.status = StudyStatus.COMPLETE
-                    stored.finished_at = utcnow()
-                await session.commit()
-    await start_waiting(optimizer)
-    await optimizer.notify()
 
 
 async def resize_task(
@@ -612,6 +577,71 @@ async def finish(optimizer: Optimizer, study_id: int, status: StudyStatus, messa
     await optimizer.notify()
 
 
+def park_message(sampler: str) -> str | None:
+    """How a lab that writes its simulations before sending them marks one waiting to go, so a
+    trial taken back can wait again instead of being lost; ``None`` for a lab that asks anew."""
+    # Imported here: both modules build on this one.
+    from ..tools.settings_sampler import PENDING_SEND
+    from .power_pool import PROPOSED
+
+    return {
+        SETTINGS_SAMPLER: PENDING_SEND,
+        CORRELATION_BREAKER: PENDING_SEND,
+        POWER_POOL_SAMPLER: PROPOSED,
+        REGION_AGNOSTIC_SAMPLER: PROPOSED,
+    }.get(sampler)
+
+
+#: Said on a trial whose simulation was cancelled, when its lab will ask for another.
+CANCELLED_AGAIN = "Cancelled before it finished; the task asks for another in its place."
+
+
+async def requeue_cancelled(optimizer: Optimizer, row: Study) -> int:
+    """Put trials whose simulation was cancelled back where they came from. Returns how many.
+
+    A cancel in the Simulation Matrix stops one batch, not the task. Counted as failed, those
+    trials used up the task's target and could end it with work never done. Instead a
+    simulation written up front is parked again to be sent once more, and a lab that writes its
+    own asks for a new one in its place. A cancelled simulation that still left an Alpha is
+    scored as usual.
+    """
+    from optuna.trial import TrialState as OptunaState
+
+    park = park_message(row.sampler)
+    live = optimizer.open_trials.get(row.id, {})
+    study = optimizer.studies.get(row.id)
+    async with optimizer.db.session() as session:
+        cancelled = (
+            await session.scalars(
+                select(Trial)
+                .join(SimulationRecord, SimulationRecord.id == Trial.simulation_record_id)
+                .where(
+                    Trial.study_id == row.id,
+                    Trial.state.in_([TrialState.QUEUED, TrialState.RUNNING]),
+                    SimulationRecord.status == SimStatus.CANCELLED,
+                    SimulationRecord.alpha_id.is_(None),
+                )
+            )
+        ).all()
+        for trial in cancelled:
+            trial.state = TrialState.PRUNED
+            trial.simulation_record_id = None
+            trial.alpha_id = None
+            if park is not None:
+                trial.message = park
+                trial.finished_at = None
+                continue
+            trial.message = CANCELLED_AGAIN
+            trial.finished_at = utcnow()
+            optuna_trial = live.pop(trial.number, None)
+            if study is not None and optuna_trial is not None:
+                study.tell(optuna_trial, state=OptunaState.PRUNED, skip_if_finished=True)
+        await session.commit()
+    if cancelled:
+        log.info("task.cancelled_requeued", study_id=row.id, trials=len(cancelled))
+    return len(cancelled)
+
+
 async def prune_unsent(optimizer: Optimizer, study_id: int, *, everything: bool = False) -> int:
     """Mark trials whose simulation was taken off the queue as never run.
 
@@ -628,6 +658,9 @@ async def prune_unsent(optimizer: Optimizer, study_id: int, *, everything: bool 
     study = optimizer.studies.get(study_id)
     pruned = 0
     async with optimizer.db.session() as session:
+        stored = await session.get(Study, study_id)
+        # Written up front: taken off the queue, it waits to be sent again on resume.
+        park = park_message(stored.sampler) if stored is not None else None
         open_trials = list(
             (
                 await session.scalars(
@@ -652,6 +685,14 @@ async def prune_unsent(optimizer: Optimizer, study_id: int, *, everything: bool 
         for trial in open_trials:
             unsent = not trial.simulation_record_id or trial.simulation_record_id in cancelled
             if not (unsent or everything):
+                continue
+            if unsent and park is not None:
+                trial.state = TrialState.PRUNED
+                trial.message = park
+                trial.simulation_record_id = None
+                trial.alpha_id = None
+                trial.finished_at = None
+                pruned += 1
                 continue
             trial.state = TrialState.PRUNED
             trial.message = (

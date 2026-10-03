@@ -1,4 +1,7 @@
-/** Tasks: everything the labs added. Only here does a task run, wait for cores, pause or stop. */
+/**
+ * Tasks: everything the labs added. Only here does a task run, wait for cores, pause, continue
+ * or get cloned. None is ever stopped: whatever would end one early pauses it instead.
+ */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
@@ -9,12 +12,11 @@ import {
   PauseIcon,
   PencilIcon,
   PlayIcon,
-  SquareIcon,
   StarIcon,
   Trash2Icon,
   TriangleAlertIcon,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
 import { cn } from '@/lib/cn'
@@ -35,7 +37,10 @@ import {
   taskStatus,
 } from '@/screens/tasks/columns'
 import { resultsMarkdown } from '@/screens/tasks/copy'
+import { AlphaGroups } from '@/screens/tasks/groups'
 import { SubmittableAlphas } from '@/screens/tasks/submittable'
+import { TaskAbout, TaskControls } from '@/screens/tasks/task-info'
+import { HoldButton } from '@/ui/hold-button'
 import {
   Badge,
   Button,
@@ -59,8 +64,9 @@ import {
 import { Confirm, Dialog, Menu } from '@/ui/overlay'
 import { type Column, DataTable } from '@/ui/table'
 
-/** Matches `labs.params.SETTINGS_SAMPLER`. */
+/** Matches `labs.params.SETTINGS_SAMPLER` and `REGION_AGNOSTIC_SAMPLER`. */
 const SETTINGS_SAMPLER = 'settings-sampler'
+const REGION_AGNOSTIC = 'region-agnostic'
 
 const TOP_COLUMNS: Column<RankedAlpha>[] = [
   {
@@ -206,7 +212,54 @@ const topColumns = (task: LabTask): Column<RankedAlpha>[] =>
           ...TOP_COLUMNS.slice(1),
         ]
 
-type Act = { action: 'runAll' } | { action: 'run' | 'pause' | 'stop' | 'remove'; task: LabTask }
+/** A day in the reader's own timezone, as a key that sorts: `2026-11-28`. */
+const dayKey = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
+/** `Thu 28/11/26`. */
+const dayLabel = (d: Date) =>
+  `${d.toLocaleDateString('en-GB', { weekday: 'short' })} ${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getFullYear()).slice(-2)}`
+
+interface TaskDay {
+  key: string
+  label: string
+  today: boolean
+  tasks: LabTask[]
+}
+
+/**
+ * Tasks by the day they were added, newest day first, today's always first even when empty so
+ * a new day is plain to see. Within a day they keep the list's order.
+ */
+function byDay(tasks: LabTask[], now: Date): TaskDay[] {
+  const today = dayKey(now)
+  const days = new Map<string, TaskDay>([
+    [today, { key: today, label: dayLabel(now), today: true, tasks: [] }],
+  ])
+  for (const t of tasks) {
+    const at = t.createdAt ? new Date(t.createdAt) : null
+    const key = at ? dayKey(at) : 'undated'
+    let day = days.get(key)
+    if (!day) {
+      day = { key, label: at ? dayLabel(at) : 'Date not recorded', today: false, tasks: [] }
+      days.set(key, day)
+    }
+    day.tasks.push(t)
+  }
+  return [...days.values()].sort((a, b) =>
+    a.today
+      ? -1
+      : b.today
+        ? 1
+        : a.key === 'undated'
+          ? 1
+          : b.key === 'undated'
+            ? -1
+            : b.key.localeCompare(a.key),
+  )
+}
+
+type Act = { action: 'runAll' } | { action: 'run' | 'pause'; task: LabTask }
 
 export function TasksScreen() {
   const queryClient = useQueryClient()
@@ -219,6 +272,14 @@ export function TasksScreen() {
   const [confirming, setConfirming] = useState<Act | null>(null)
   const [alphaId, setAlphaId] = useState<string | null>(null)
   const [view, setView] = useState<'tasks' | 'submittable'>('tasks')
+  const detail = useRef<HTMLDivElement>(null)
+  const open = (id: number) => {
+    setSelectedId(id)
+    // After the pane has rendered the new task.
+    requestAnimationFrame(() =>
+      detail.current?.scrollIntoView({ behavior: 'instant', block: 'start' }),
+    )
+  }
 
   // Nothing picked yet: open on what is running, then stay there. Re-deriving this every render
   // would move the pane out from under the reader the moment that task finished.
@@ -248,14 +309,14 @@ export function TasksScreen() {
 
   const all = list.data?.tasks ?? []
   const slots = list.data?.slots ?? 8
-  const open = all.filter((t) => t.status !== 'COMPLETE' && t.status !== 'FAILED')
+  const live = all.filter((t) => t.status !== 'COMPLETE' && t.status !== 'FAILED')
   const total = (tasks: LabTask[], pick: (t: LabTask) => number) =>
     tasks.reduce((n, t) => n + pick(t), 0)
   const runningCores = total(
-    open.filter((t) => t.status === 'RUNNING'),
+    live.filter((t) => t.status === 'RUNNING'),
     (t) => t.cores,
   )
-  const assignedCores = total(open, (t) => t.cores)
+  const assignedCores = total(live, (t) => t.cores)
   const waiting = all.filter((t) => t.status === 'QUEUED').length
   const fresh = all.filter((t) => t.status === 'IDLE').length
   const selected = all.find((t) => t.id === selectedId) ?? null
@@ -266,52 +327,7 @@ export function TasksScreen() {
       key: 'task',
       header: 'Task',
       width: 'minmax(220px,2fr)',
-      cell: (t) => (
-        <span className="block min-w-0 truncate" title={t.datasetIds.join(', ')}>
-          <span className="text-ink">
-            {t.name ?? (
-              <>
-                {t.labName}
-                {t.templateName ? ` · ${t.templateName}` : ''}
-              </>
-            )}
-          </span>
-          <span className="text-ink-subtle">
-            {t.name && ` · ${t.labName}${t.templateName ? ` · ${t.templateName}` : ''}`}
-            {/* A sweep spans many markets, so naming the source Alpha's one would mislead. */}
-            {t.lab === SETTINGS_SAMPLER ? (
-              <>
-                {/* A sweep started from a typed expression has no source Alpha: "" not null. */}
-                {t.alphaId && (
-                  <>
-                    {' · '}
-                    <span className="num">{t.alphaId}</span>
-                  </>
-                )}
-                {' · '}
-                <span className="num">{fmt.int(t.markets)}</span>
-                {t.markets === 1 ? ' Market' : ' Markets'}
-              </>
-            ) : (
-              <>
-                {' · '}
-                <span className="num">{`${t.region} D${t.delay}`}</span>
-                {/* Neither seeds nor datasets: say nothing rather than report "0 datasets"
-                    about something the task never had. */}
-                {(t.seeds > 0 || t.datasetIds.length > 0) && (
-                  <>
-                    {' · '}
-                    <span className="num">
-                      {fmt.int(t.seeds > 0 ? t.seeds : t.datasetIds.length)}
-                    </span>
-                    {t.seeds > 0 ? ' seeds' : t.datasetIds.length === 1 ? ' dataset' : ' datasets'}
-                  </>
-                )}
-              </>
-            )}
-          </span>
-        </span>
-      ),
+      cell: (t) => <TaskName task={t} />,
     },
     {
       key: 'status',
@@ -367,6 +383,7 @@ export function TasksScreen() {
             action === 'pause' ? act.mutate({ action, task: t }) : ask({ action, task: t })
           }
           onEdit={() => setEditing(t)}
+          onDeleted={() => setSelectedId((id) => (id === t.id ? null : id))}
           onRename={() => setRenaming(t)}
         />
       ),
@@ -404,12 +421,12 @@ export function TasksScreen() {
         <Metric
           boxed
           label="Simulations Assigned"
-          value={list.isPending ? DASH : fmt.int(total(open, (t) => t.target))}
+          value={list.isPending ? DASH : fmt.int(total(live, (t) => t.target))}
         />
         <Metric
           boxed
           label="Simulated"
-          value={list.isPending ? DASH : fmt.int(total(open, (t) => t.simulated))}
+          value={list.isPending ? DASH : fmt.int(total(live, (t) => t.simulated))}
         />
       </div>
       {list.isError && all.length > 0 && (
@@ -438,23 +455,69 @@ export function TasksScreen() {
               Open Research Labs
             </Link>
           </Empty>
-        ) : (
+        ) : !list.data ? (
           <DataTable
             label="Tasks"
-            rows={all}
+            rows={[]}
             columns={columns}
             rowKey={(t) => String(t.id)}
-            onRowClick={(t) => setSelectedId(t.id)}
-            // Held through hover, which otherwise repaints the row as if nothing were picked.
-            rowClass={(t) =>
-              t.id === selectedId ? 'bg-primary-subtle hover:bg-primary-subtle' : undefined
-            }
             loading={list.isPending}
             error={list.error}
           />
+        ) : (
+          <div className="flex flex-col gap-6">
+            {byDay(all, new Date()).map((day, i, days) => (
+              <section
+                key={day.key}
+                aria-label={day.today ? "Today's Tasks" : day.label}
+                className="flex flex-col gap-2"
+              >
+                <h2 className="flex flex-wrap items-baseline gap-x-2 border-b border-hairline-strong pb-1.5">
+                  <span className="text-title font-medium text-ink">
+                    {day.today ? "Today's Tasks" : <span className="num">{day.label}</span>}
+                  </span>
+                  {day.today && (
+                    <span className="num text-body-compact text-ink-subtle">{day.label}</span>
+                  )}
+                  <span className="num ml-auto text-body-compact text-ink-subtle">
+                    {fmt.int(day.tasks.length)} {day.tasks.length === 1 ? 'task' : 'tasks'}
+                  </span>
+                </h2>
+                {day.tasks.length === 0 ? (
+                  <p className="py-2 text-body-compact text-ink-subtle">
+                    No tasks added today yet.
+                  </p>
+                ) : (
+                  <DataTable
+                    label={day.today ? "Today's Tasks" : `Tasks added ${day.label}`}
+                    rows={day.tasks}
+                    columns={columns}
+                    // The columns are named once, on the first table: every day below has the
+                    // same ones.
+                    header={i === days.findIndex((d) => d.tasks.length > 0)}
+                    rowKey={(t) => String(t.id)}
+                    onRowClick={(t) => open(t.id)}
+                    // Held through hover, which otherwise repaints the row as if nothing were picked.
+                    rowClass={(t) =>
+                      t.id === selectedId ? 'bg-primary-subtle hover:bg-primary-subtle' : undefined
+                    }
+                  />
+                )}
+              </section>
+            ))}
+          </div>
         )}
       </Panel>
-      {view === 'tasks' && selected && <TaskDetail task={selected} onOpenAlpha={setAlphaId} />}
+      {view === 'tasks' && selected && (
+        <div ref={detail} className="scroll-mt-4">
+          <TaskDetail
+            task={selected}
+            onOpenAlpha={setAlphaId}
+            onSelect={open}
+            onDeleted={() => setSelectedId(null)}
+          />
+        </div>
+      )}
 
       {editing && (
         <EditTask key={editing.id} task={editing} slots={slots} onClose={() => setEditing(null)} />
@@ -473,7 +536,7 @@ export function TasksScreen() {
         }}
         title={copy?.title ?? ''}
         confirmLabel={copy?.label ?? 'Confirm'}
-        danger={confirming?.action === 'stop' || confirming?.action === 'remove'}
+        danger={false}
         pending={act.isPending}
         onConfirm={() => confirming && act.mutate(confirming)}
       >
@@ -495,33 +558,72 @@ function confirmCopy(a: Act, fresh: number): { title: string; label: string; bod
       if (a.task.status === 'PAUSED') return { title: 'Resume this task?', label: 'Resume' }
       if (a.task.status === 'FAILED')
         return {
-          title: 'Retry this task?',
-          label: 'Retry',
-          body: 'Simulations it sent before it failed are scored on the way.',
+          title: 'Resume this task?',
+          label: 'Resume',
+          body: 'It carries on from where it left off; simulations it sent are scored on the way.',
         }
       return { title: 'Run this task?', label: 'Run Task' }
-    case 'stop':
-      // The second press, on a task that has been stopping and has not stopped. It says
-      // what it will cost, because forcing gives up on simulations the quota already paid
-      // for — which is the right trade only once the ordinary stop has failed.
-      if (a.task.stopping)
-        return {
-          title: 'Force this task to stop?',
-          label: 'Force Stop',
-          body: 'It is waiting on simulations that have not come back. Forcing cancels what it can on BRAIN, ends the task and frees its cores. Any simulation that finishes anyway is still kept in Alphas.',
-        }
-      return {
-        title: 'Stop this task?',
-        label: 'Stop Task',
-        body: 'Simulations already sent finish and are kept; the rest come off the queue.',
-      }
     default:
-      return {
-        title: 'Remove this task?',
-        label: 'Remove Task',
-        body: 'The Alphas it found stay in Alphas.',
-      }
+      return { title: 'Pause this task?', label: 'Pause' }
   }
+}
+
+/**
+ * A task's row name: the lab, its market, what it works from and when it was added. "LLM
+ * Power Pool Lab · USA D1 · 1 dataset" named a dozen tasks alike; the dataset's own name, the
+ * chosen fields, the prompt and the time tell them apart.
+ */
+function TaskName({ task: t }: { task: LabTask }) {
+  const names: string[] = t.datasetNames?.length ? t.datasetNames : t.datasetIds
+  const source =
+    t.lab === SETTINGS_SAMPLER
+      ? // A sweep started from a typed expression has no source Alpha: "" not null.
+        `${t.alphaId ? `${t.alphaId} · ` : ''}${fmt.int(t.markets)} ${t.markets === 1 ? 'Market' : 'Markets'}`
+      : t.chosenFields > 0
+        ? `${fmt.int(t.chosenFields)} chosen fields`
+        : t.seeds > 0
+          ? `${fmt.int(t.seeds)} seeds`
+          : names.length > 0
+            ? `${names[0]}${names.length > 1 ? ` +${names.length - 1}` : ''}`
+            : null
+  const at = t.createdAt
+    ? new Date(t.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : null
+  const title = [
+    t.labName,
+    t.templateName,
+    t.region ? `${t.region} D${t.delay}` : null,
+    ...names,
+    t.promptName ? `Prompt: ${t.promptName}` : null,
+    t.model,
+    `Task ${t.id}`,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  return (
+    <span className="block min-w-0 truncate" title={title}>
+      <span className="text-ink">
+        {t.labName}
+        {t.templateName ? ` · ${t.templateName}` : ''}
+      </span>
+      <span className="text-ink-subtle">
+        {t.lab !== SETTINGS_SAMPLER && t.region && (
+          <>
+            {' · '}
+            <span className="num">{`${t.region} D${t.delay}`}</span>
+          </>
+        )}
+        {source && <> · {source}</>}
+        {t.promptName && t.promptName !== 'Built-in' && <> · {t.promptName}</>}
+        {at && (
+          <>
+            {' · '}
+            <span className="num">{at}</span>
+          </>
+        )}
+      </span>
+    </span>
+  )
 }
 
 function TaskBadge({ task }: { task: LabTask }) {
@@ -537,21 +639,33 @@ function TaskBadge({ task }: { task: LabTask }) {
   )
 }
 
-/** A failed task can run again: simulations it sent before it failed are scored then. */
-const RUN_LABEL = { IDLE: 'Run', PAUSED: 'Resume', FAILED: 'Retry' } as const
+/** A task that failed before tasks only paused resumes like a paused one. */
+const RUN_LABEL = { IDLE: 'Run', PAUSED: 'Resume', FAILED: 'Resume' } as const
 
 function Actions({
   task,
   onAct,
   onEdit,
+  onDeleted,
   onRename,
 }: {
   task: LabTask
-  onAct: (action: 'run' | 'pause' | 'stop' | 'remove') => void
+  onAct: (action: 'run' | 'pause') => void
   onEdit: () => void
+  onDeleted: () => void
   onRename: () => void
 }) {
   const { status, stopping } = task
+  const queryClient = useQueryClient()
+  const remove = useMutation({
+    mutationFn: () => labTasks.remove(task.id, true),
+    onSuccess: () => {
+      toast.success('Task deleted', { description: 'The Alphas it found stay in Alphas.' })
+      onDeleted()
+      for (const key of [['lab-tasks'], ['bar'], ['simulations']])
+        void queryClient.invalidateQueries({ queryKey: key })
+    },
+  })
   const finished = status === 'COMPLETE' || status === 'FAILED'
   return (
     // Inside a clickable row: a click on these must not also select the row.
@@ -573,7 +687,7 @@ function Actions({
           <PlayIcon />
         </Button>
       )}
-      {(status === 'RUNNING' || status === 'QUEUED') && !stopping && (
+      {(status === 'RUNNING' || status === 'QUEUED') && (
         <Button
           size="icon-sm"
           variant="ghost"
@@ -584,36 +698,20 @@ function Actions({
           <PauseIcon />
         </Button>
       )}
-      {/* Stays through `stopping`, unlike Pause and Edit. A task waiting on a simulation
-          that never comes back is exactly when someone needs this button, and hiding it
-          left them with a task holding cores and nothing on screen to press. */}
-      {(status === 'RUNNING' || status === 'PAUSED' || status === 'QUEUED') && (
-        <Button
-          size="icon-sm"
-          variant={stopping ? 'danger' : 'ghost'}
-          aria-label={stopping ? 'Force stop' : 'Stop'}
-          title={stopping ? 'Force stop' : 'Stop'}
-          onClick={() => onAct('stop')}
-        >
-          <SquareIcon />
-        </Button>
-      )}
       {!finished && !stopping && (
         <Button size="icon-sm" variant="ghost" aria-label="Edit" title="Edit" onClick={onEdit}>
           <PencilIcon />
         </Button>
       )}
-      {status !== 'RUNNING' && (
-        <Button
-          size="icon-sm"
-          variant="ghost"
-          aria-label="Remove"
-          title="Remove"
-          onClick={() => onAct('remove')}
-        >
-          <Trash2Icon />
-        </Button>
-      )}
+      <HoldButton
+        size="icon-sm"
+        label="Delete task"
+        pending={remove.isPending}
+        onHold={() => remove.mutate()}
+        className="border-0 bg-transparent"
+      >
+        <Trash2Icon className="size-3.5" />
+      </HoldButton>
       <TaskActionsMenu task={task} onRename={onRename} />
     </span>
   )
@@ -645,9 +743,13 @@ function TaskActionsMenu({ task, onRename }: { task: LabTask; onRename: () => vo
 function TaskDetail({
   task,
   onOpenAlpha,
+  onSelect,
+  onDeleted,
 }: {
   task: LabTask
   onOpenAlpha: (alphaId: string) => void
+  onSelect: (id: number) => void
+  onDeleted: () => void
 }) {
   const top = useQuery({
     // Its own key, refreshed at most every 10s: the whole sweep is a megabyte or more on a
@@ -655,6 +757,8 @@ function TaskDetail({
     queryKey: ['lab-task-top', task.id],
     // The whole sweep is worth scrolling; the table virtualises, so the rows are cheap.
     queryFn: () => labTasks.top(task.id, Math.min(Math.max(task.target, 50), 5000)),
+    // Region Agnostic Lab's results are its Alpha groups instead.
+    enabled: task.lab !== REGION_AGNOSTIC,
   })
   useRefetchOn('studies', ['lab-task-top', task.id], 10_000)
   // The Alpha the sweep came from leads and is never ranked: it is the reference, not a
@@ -726,6 +830,7 @@ function TaskDetail({
       }
     >
       <div className="flex flex-col gap-4">
+        <TaskControls task={task} onCloned={onSelect} onDeleted={onDeleted} />
         <TaskDatasets task={task} />
         {/* As many boxes as there are figures, sharing the row: some only show when they
             have something to say, and a fixed grid left a hole where they were. */}
@@ -775,8 +880,9 @@ function TaskDetail({
           <Elapsed task={task} done={done} />
         </div>
         {task.message && (
-          <Notice tone={task.status === 'FAILED' ? 'error' : 'info'} title={task.message} />
+          <Notice tone={task.status === 'PAUSED' ? 'warn' : 'info'} title={task.message} />
         )}
+        <TaskAbout task={task} />
         {task.failures.length > 0 && (
           <Notice
             tone="error"
@@ -811,21 +917,21 @@ function TaskDetail({
             Open Full Results
           </Button>
         </div>
-        <DataTable
-          label={task.lab === SETTINGS_SAMPLER ? 'Results' : 'Top Alphas'}
-          rows={rows}
-          columns={topColumns(task)}
-          rowKey={(r) => String(r.trialId)}
-          onRowClick={(r) => r.alphaId && onOpenAlpha(r.alphaId)}
-          rowClass={rowClass}
-          loading={top.isPending}
-          error={top.error}
-          empty={
-            task.failed > 0
-              ? 'No Alphas back yet: every simulation so far returned none, for the reasons above.'
-              : 'No Alphas back yet.'
-          }
-        />
+        {task.lab === REGION_AGNOSTIC ? (
+          <AlphaGroups task={task} onOpenAlpha={onOpenAlpha} />
+        ) : (
+          <DataTable
+            label={task.lab === SETTINGS_SAMPLER ? 'Results' : 'Top Alphas'}
+            rows={rows}
+            columns={topColumns(task)}
+            rowKey={(r) => String(r.trialId)}
+            onRowClick={(r) => r.alphaId && onOpenAlpha(r.alphaId)}
+            rowClass={rowClass}
+            loading={top.isPending}
+            error={top.error}
+            empty="No Alphas back yet."
+          />
+        )}
         {task.lab === SETTINGS_SAMPLER && (
           // A two-column grid rather than padded text: the equals signs line up whatever the
           // labels are and whatever the font does.
@@ -934,7 +1040,7 @@ function EditTask({ task, slots, onClose }: { task: LabTask; slots: number; onCl
   const [simulations, setSimulations] = useState(String(task.target))
   const count = Number(simulations)
   // Below what it has already simulated the task is finished the moment it is saved, and the
-  // count reads past its own target. Stop is the way to end a task early.
+  // count reads past its own target. Pause is the way to hold a task early.
   const least = Math.max(1, task.simulated)
   const valid = Number.isInteger(count) && count >= least && count <= MAX_SIMULATIONS
   const change = useMutation({

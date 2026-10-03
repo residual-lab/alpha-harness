@@ -12,6 +12,8 @@ export interface SearchLabRequest {
   delay: number
   universe?: string | null
   dataset_ids: string[]
+  /** Only these fields of the datasets, when any were chosen. */
+  field_ids: string[]
   /** The Data Explorer's filter the datasets were chosen under; `null` uses every field. */
   field_filter?: FieldFilterState | null
   vector_operators: string[]

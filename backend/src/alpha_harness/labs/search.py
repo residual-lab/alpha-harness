@@ -292,9 +292,11 @@ async def field_pool(
     universes: list[str],
     dataset_ids: list[str],
     allow_vector: bool,
+    field_ids: list[str] | None = None,
     narrow: FieldFilter | None = None,
 ) -> Pool:
-    """Fields of the chosen datasets, and which searched universes have each.
+    """Fields of the chosen datasets, or only ``field_ids`` of them, and which searched
+    universes have each.
 
     BRAIN scopes fields by universe, so a field missing from one universe is not dropped:
     the search only pairs it with the universes that have it. Ordered by coverage in the
@@ -314,6 +316,7 @@ async def field_pool(
             (narrow or FieldFilter()).model_copy(
                 update={
                     "dataset_ids": list(dataset_ids),
+                    "field_ids": list(field_ids or []),
                     "field_types": types,
                     "sort_by": "coverage",
                     "sort_desc": True,

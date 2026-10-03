@@ -147,8 +147,15 @@ class Optimizer:
             try:
                 results[study_id] = await self.advance(study_id)
             except Exception as exc:
+                # Paused, never failed: whatever went wrong, the task picks up where it left off
+                # once resumed, and a fresh clone is always there.
                 log.exception("optimize.study_failed", study_id=study_id)
-                await scheduler.finish(self, study_id, StudyStatus.FAILED, str(exc))
+                await scheduler.finish(
+                    self,
+                    study_id,
+                    StudyStatus.PAUSED,
+                    f"Paused after an error: {exc}. Resume to carry on, or clone it fresh.",
+                )
         return results
 
     def lock(self, study_id: int) -> asyncio.Lock:
@@ -186,6 +193,8 @@ class Optimizer:
             if row.sampler not in TASK_SAMPLERS:
                 raise ValueError(f"No lab runs studies with the {row.sampler!r} sampler.")
 
+            # A cancel in the Simulation Matrix takes a batch back, not the task.
+            await scheduler.requeue_cancelled(self, row)
             # Evolution Lab breeds its own children: there is no sampler to tell.
             told = await self._harvest(
                 study_id, tell=row.sampler in (SEARCH_SAMPLER, TEMPLATE_SAMPLER)

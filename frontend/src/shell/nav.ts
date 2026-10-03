@@ -7,6 +7,7 @@ import {
   LayoutGridIcon,
   ListChecksIcon,
   RefreshCwIcon,
+  ScrollTextIcon,
   SparklesIcon,
   TriangleIcon,
   TrophyIcon,
@@ -24,7 +25,6 @@ export const AI_TABS = [
   { tab: 'keys', label: 'Keys' },
   { tab: 'models', label: 'Models' },
   { tab: 'budget', label: 'Budget' },
-  { tab: 'prompts', label: 'Prompts' },
   { tab: 'assistant', label: 'Assistant' },
 ] as const
 
@@ -36,6 +36,7 @@ export const LAB_TABS = [
   { tab: 'template', label: 'Template Lab', to: '/labs/template' },
   { tab: 'evolution', label: 'Evolution Lab', to: '/labs/evolution' },
   { tab: 'power-pool', label: 'LLM Power Pool Lab', to: '/labs/power-pool' },
+  { tab: 'region-agnostic', label: 'Region Agnostic Lab', to: '/labs/region-agnostic' },
   { tab: 'super-alpha', label: 'Super Alpha Lab', to: '/labs/super-alpha' },
 ] as const
 
@@ -81,6 +82,12 @@ export const NAV = [
     label: 'Tools',
     icon: WrenchIcon,
     tabs: TOOL_TABS,
+  },
+  {
+    to: '/prompts',
+    group: 'Research',
+    label: 'LLM Prompts',
+    icon: ScrollTextIcon,
   },
   {
     to: '/tasks',

@@ -34,7 +34,7 @@ from alpha_harness.window import open_window
 
 #: Written in by the release workflow; the version a fresh machine installs.
 BUILD_VERSION = "0.0.0"
-REPOSITORY = "residual-lab/alpha-harness"
+REPOSITORY = "Vedant-Vispute/alpha-harness-improved-"
 DOWNLOAD = f"https://github.com/{REPOSITORY}/releases/download"
 
 HOME_VARIABLE = "ALPHA_HARNESS_HOME"
@@ -87,7 +87,7 @@ def home() -> Path:
         base = Path.home() / "Library" / "Application Support"
     else:
         base = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
-    return Path(base) / "AlphaHarness"
+    return Path(base) / "alpha_harness_improved"
 
 
 def say(root: Path, message: str) -> None:
@@ -101,7 +101,9 @@ def recent(root: Path, lines: int = 8) -> str:
     """The tail of the log, for a message box. A traceback's last lines carry the reason."""
     try:
         return "\n".join(
-            (root / LOG_FILE).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+            (root / LOG_FILE)
+            .read_text(encoding="utf-8", errors="replace")
+            .splitlines()[-lines:]
         )
     except OSError as exc:
         return f"(the log could not be read: {exc})"
@@ -124,15 +126,23 @@ def fail(root: Path, message: str) -> None:
             "-e",
             "on run argv",
             "-e",
-            'display dialog (item 1 of argv) with title "Alpha Harness" buttons {"OK"} '
-            "default button 1 with icon stop",
+            (
+                'display dialog (item 1 of argv) with title "Alpha Harness" buttons {"OK"} '
+                "default button 1 with icon stop"
+            ),
             "-e",
             "end run",
             text,
         ]
     elif shutil.which("zenity"):
         # --no-markup: a path or an error with `<` or `&` in it is text, not Pango markup.
-        dialog = ["zenity", "--error", "--title=Alpha Harness", "--no-markup", f"--text={text}"]
+        dialog = [
+            "zenity",
+            "--error",
+            "--title=Alpha Harness",
+            "--no-markup",
+            f"--text={text}",
+        ]
     elif shutil.which("kdialog"):
         dialog = ["kdialog", "--title", "Alpha Harness", "--error", text]
     elif shutil.which("notify-send"):
@@ -140,7 +150,7 @@ def fail(root: Path, message: str) -> None:
     else:
         return
     try:
-        subprocess.run(dialog, check=False, timeout=600)  # noqa: S603
+        subprocess.run(dialog, check=False, timeout=600)
     except (OSError, subprocess.SubprocessError) as exc:
         say(root, f"could not show the message: {exc}")
 
@@ -219,7 +229,9 @@ def ensure_uv(root: Path) -> Path:
     """Copy the bundled uv out once, so an install is not reading from a temporary folder."""
     target = root / UV_NAME
     source = bundled(UV_NAME)
-    if source.exists() and (not target.exists() or source.stat().st_size != target.stat().st_size):
+    if source.exists() and (
+        not target.exists() or source.stat().st_size != target.stat().st_size
+    ):
         shutil.copy2(source, target)
     if not WINDOWS and target.exists():
         target.chmod(0o755)
@@ -293,7 +305,7 @@ def slot_version(root: Path, slot: str) -> str | None:
 def read_json(path: Path) -> dict[str, object]:
     try:
         body = json.loads(path.read_text(encoding="utf-8"))
-    except OSError, ValueError:
+    except (OSError, ValueError):
         return {}
     return body if isinstance(body, dict) else {}
 
@@ -341,7 +353,9 @@ def note_failure(root: Path, version: str, reason: str) -> None:
     )
 
 
-def install(root: Path, uv: Path, slot: str, version: str, wheel: str | None = None) -> None:
+def install(
+    root: Path, uv: Path, slot: str, version: str, wheel: str | None = None
+) -> None:
     """Build ``slot`` from scratch at exactly ``version``. Raises on failure.
 
     Always the slot that is *not* running. Installing over a live environment is how an
@@ -373,7 +387,7 @@ def install(root: Path, uv: Path, slot: str, version: str, wheel: str | None = N
     }
 
     def run(*arguments: str) -> None:
-        done = subprocess.run(  # noqa: S603 - fixed argv, version comes from our own release
+        done = subprocess.run(
             [str(uv), *arguments],
             capture_output=True,
             text=True,
@@ -388,9 +402,14 @@ def install(root: Path, uv: Path, slot: str, version: str, wheel: str | None = N
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             check=False,
         )
-        say(root, f"uv {arguments[0]} -> {done.returncode} {done.stderr.strip()[-2000:]}")
+        say(
+            root,
+            f"uv {arguments[0]} -> {done.returncode} {done.stderr.strip()[-2000:]}",
+        )
         if done.returncode != 0:
-            raise RuntimeError(f"uv {arguments[0]} failed: {done.stderr.strip()[-400:]}")
+            raise RuntimeError(
+                f"uv {arguments[0]} failed: {done.stderr.strip()[-400:]}"
+            )
 
     # The marker goes first: a half-built slot must never read as a working one.
     (root / f"slot-{slot}.json").unlink(missing_ok=True)
@@ -398,8 +417,18 @@ def install(root: Path, uv: Path, slot: str, version: str, wheel: str | None = N
     run("venv", "--python", "3.14", str(root / f"venv-{slot}"))
     # Constrained to the versions the release was locked against, so a transitive dependency
     # publishing a breaking version cannot break an install that worked yesterday.
-    run("pip", "install", "--python", str(venv_python(root, slot)), "-c", constraints, wheel)
-    (root / f"slot-{slot}.json").write_text(json.dumps({"version": version}), encoding="utf-8")
+    run(
+        "pip",
+        "install",
+        "--python",
+        str(venv_python(root, slot)),
+        "-c",
+        constraints,
+        wheel,
+    )
+    (root / f"slot-{slot}.json").write_text(
+        json.dumps({"version": version}), encoding="utf-8"
+    )
     say(root, f"installed {version} into slot {slot}")
 
 
@@ -444,10 +473,12 @@ def close_app(root: Path) -> None:
     # The app refuses a write that carries no ``X-Harness-Client``, which is what stops
     # another page in the browser from driving it. The launcher is a client like any other.
     ask = urllib.request.Request(
-        f"http://127.0.0.1:{APP_PORT}/api/quit", data=b"", headers={"X-Harness-Client": "1"}
+        f"http://127.0.0.1:{APP_PORT}/api/quit",
+        data=b"",
+        headers={"X-Harness-Client": "1"},
     )
     try:
-        with urllib.request.urlopen(ask, timeout=5) as answer:  # noqa: S310 - fixed loopback URL
+        with urllib.request.urlopen(ask, timeout=5) as answer:
             answer.read()
         say(root, "asked the app to close")
     except Exception as exc:  # noqa: BLE001 - an app that will not answer is still closing
@@ -528,7 +559,7 @@ class Tray:
         # passed as a C `int`, so a 64-bit handle arrives sign-extended from its low half —
         # 0x000001a2b3c4d5e6 becomes 0xffffffffb3c4d5e6 — and Win32 either fails or faults on
         # it. Measured. The same applies to a return value left at the default type.
-        HWND, LPCWSTR, INT = wintypes.HWND, wintypes.LPCWSTR, ctypes.c_int  # noqa: N806
+        HWND, LPCWSTR, INT = wintypes.HWND, wintypes.LPCWSTR, ctypes.c_int
         prototypes: dict[Any, list[tuple[str, Any, list[Any]]]] = {
             user32: [
                 (
@@ -562,7 +593,11 @@ class Tray:
                     [HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM],
                 ),
                 ("PostQuitMessage", None, [INT]),
-                ("GetMessageW", INT, [ctypes.c_void_p, HWND, wintypes.UINT, wintypes.UINT]),
+                (
+                    "GetMessageW",
+                    INT,
+                    [ctypes.c_void_p, HWND, wintypes.UINT, wintypes.UINT],
+                ),
                 ("TranslateMessage", wintypes.BOOL, [ctypes.c_void_p]),
                 ("DispatchMessageW", lresult, [ctypes.c_void_p]),
                 ("GetCursorPos", wintypes.BOOL, [ctypes.c_void_p]),
@@ -590,7 +625,11 @@ class Tray:
                 ("LoadIconW", wintypes.HICON, [wintypes.HINSTANCE, LPCWSTR]),
             ],
             shell32: [
-                ("ExtractIconW", wintypes.HICON, [wintypes.HINSTANCE, LPCWSTR, wintypes.UINT]),
+                (
+                    "ExtractIconW",
+                    wintypes.HICON,
+                    [wintypes.HINSTANCE, LPCWSTR, wintypes.UINT],
+                ),
                 ("Shell_NotifyIconW", wintypes.BOOL, [wintypes.DWORD, ctypes.c_void_p]),
             ],
             kernel32: [("GetModuleHandleW", wintypes.HMODULE, [LPCWSTR])],
@@ -656,7 +695,9 @@ class Tray:
             # Windows dismisses a tray menu only while its owner is the foreground window,
             # and only repaints after one more message reaches that window.
             user32.SetForegroundWindow(hwnd)
-            user32.TrackPopupMenu(handle, _TPM_RIGHTBUTTON, where.x, where.y, 0, hwnd, None)
+            user32.TrackPopupMenu(
+                handle, _TPM_RIGHTBUTTON, where.x, where.y, 0, hwnd, None
+            )
             user32.PostMessageW(hwnd, 0, 0, 0)
             user32.DestroyMenu(handle)
 
@@ -666,7 +707,9 @@ class Tray:
             elif command == _QUIT:
                 # Off the message loop: closing the app takes seconds, and a frozen icon
                 # during them reads as a crash.
-                threading.Thread(target=self._quit, name="tray-quit", daemon=True).start()
+                threading.Thread(
+                    target=self._quit, name="tray-quit", daemon=True
+                ).start()
 
         def handle(hwnd: int, message: int, wparam: int, lparam: int) -> int:
             if message == _TRAY_MESSAGE:
@@ -694,7 +737,18 @@ class Tray:
 
         # Never shown: it exists only to receive the icon's callbacks.
         hwnd = user32.CreateWindowExW(
-            0, "AlphaHarnessTray", "Alpha Harness", 0, 0, 0, 0, 0, None, None, instance, None
+            0,
+            "AlphaHarnessTray",
+            "Alpha Harness",
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            instance,
+            None,
         )
         if not hwnd:
             raise OSError(f"CreateWindowExW failed: {ctypes.get_last_error()}")
@@ -704,7 +758,9 @@ class Tray:
         icon = shell32.ExtractIconW(instance, sys.executable, 0)
         if not icon or icon == 1:
             # MAKEINTRESOURCE: a numbered resource is its ordinal cast to a string pointer.
-            icon = user32.LoadIconW(None, ctypes.cast(_IDI_APPLICATION, wintypes.LPCWSTR))
+            icon = user32.LoadIconW(
+                None, ctypes.cast(_IDI_APPLICATION, wintypes.LPCWSTR)
+            )
 
         icon_data = IconData()
         icon_data.cbSize = ctypes.sizeof(IconData)
@@ -783,7 +839,14 @@ def guard_children(root: Path) -> None:
     class IoCounters(ctypes.Structure):
         _fields_ = tuple(
             (name, ctypes.c_uint64)
-            for name in ("ReadOps", "WriteOps", "OtherOps", "ReadBytes", "WriteBytes", "OtherBytes")
+            for name in (
+                "ReadOps",
+                "WriteOps",
+                "OtherOps",
+                "ReadBytes",
+                "WriteBytes",
+                "OtherBytes",
+            )
         )
 
     class ExtendedLimits(ctypes.Structure):
@@ -807,7 +870,11 @@ def guard_children(root: Path) -> None:
             [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD],
         ),
         ("AssignProcessToJobObject", wintypes.BOOL, [wintypes.HANDLE, wintypes.HANDLE]),
-        ("OpenProcess", wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]),
+        (
+            "OpenProcess",
+            wintypes.HANDLE,
+            [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD],
+        ),
         ("CloseHandle", wintypes.BOOL, [wintypes.HANDLE]),
     )
     # Undeclared, ctypes passes every argument as a C ``int`` and truncates a 64-bit handle
@@ -863,7 +930,7 @@ def start(root: Path, slot: str) -> int:
     }
     say(root, f"starting app from slot {slot}")
     with (root / LOG_FILE).open("a", encoding="utf-8") as handle:
-        _child = subprocess.Popen(  # noqa: S603 - the venv this launcher built
+        _child = subprocess.Popen(
             [str(venv_pythonw(root, slot)), "-m", "alpha_harness"],
             stdout=handle,
             stderr=subprocess.STDOUT,
@@ -889,7 +956,9 @@ def detach(root: Path) -> int:
     starts it afresh, meets the supervisor's claim, and opens the browser, as on Windows.
     """
     frozen = getattr(sys, "frozen", False)
-    command = [sys.executable] if frozen else [sys.executable, str(Path(__file__).resolve())]
+    command = (
+        [sys.executable] if frozen else [sys.executable, str(Path(__file__).resolve())]
+    )
     # PYINSTALLER_RESET_ENVIRONMENT: without it the new copy takes itself for a child of this
     # one and runs from our unpacked folder, which is deleted the moment we exit.
     # The claim goes with it: an flock belongs to the open file, not to a process, so the copy
@@ -902,7 +971,7 @@ def detach(root: Path) -> int:
         **({LOCK_FD_VARIABLE: str(_lock)} if _lock is not None else {}),
     }
     try:
-        subprocess.Popen(  # noqa: S603 - this very program
+        subprocess.Popen(
             command,
             env=environment,
             stdin=subprocess.DEVNULL,
@@ -928,7 +997,9 @@ def _desktop_quoted(path: str) -> str:
     The spec applies its string escapes before its quoting rules, which is why one literal
     backslash takes four.
     """
-    escaped = "".join("\\\\\\\\" if c == "\\" else f"\\{c}" if c in '"`$' else c for c in path)
+    escaped = "".join(
+        "\\\\\\\\" if c == "\\" else f"\\{c}" if c in '"`$' else c for c in path
+    )
     return '"' + escaped.replace("%", "%%") + '"'
 
 
@@ -945,7 +1016,9 @@ def register_menu(root: Path) -> None:
     icon = root / "alpha-harness.svg"
     source = bundled(ICON_NAME)
     try:
-        if source.exists() and (not icon.exists() or icon.read_bytes() != source.read_bytes()):
+        if source.exists() and (
+            not icon.exists() or icon.read_bytes() != source.read_bytes()
+        ):
             icon.write_bytes(source.read_bytes())
         path = str(Path(sys.executable).resolve())
         text = "\n".join(
@@ -1036,7 +1109,9 @@ def supervise(root: Path, uv: Path) -> int:
         wanted = requested(root) or running or BUILD_VERSION
         if requested(root) is None and outgrown(root, running):
             (root / OUTGROWN_FILE).write_text(BUILD_VERSION, encoding="utf-8")
-            say(root, f"launcher {BUILD_VERSION} is newer than {running}; installing it")
+            say(
+                root, f"launcher {BUILD_VERSION} is newer than {running}; installing it"
+            )
             wanted = BUILD_VERSION
         swapped = False
 
@@ -1072,9 +1147,17 @@ def supervise(root: Path, uv: Path) -> int:
 
         # A version that dies on the way up cannot report anything itself: no server, no page,
         # no button. The launcher is the only thing left that can notice, so it does.
-        if swapped and code != 0 and alive < BOOT_SECONDS and slot_version(root, other(slot)):
+        if (
+            swapped
+            and code != 0
+            and alive < BOOT_SECONDS
+            and slot_version(root, other(slot))
+        ):
             previous = other(slot)
-            say(root, f"{wanted} exited {code} after {alive:.1f}s; reverting to {previous}")
+            say(
+                root,
+                f"{wanted} exited {code} after {alive:.1f}s; reverting to {previous}",
+            )
             activate(root, previous)
             note_failure(
                 root,

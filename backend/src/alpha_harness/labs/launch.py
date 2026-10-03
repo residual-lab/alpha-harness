@@ -24,6 +24,7 @@ from .params import (
     CORRELATION_BREAKER,
     GA_SAMPLER,
     POWER_POOL_SAMPLER,
+    REGION_AGNOSTIC_SAMPLER,
     SEARCH_SAMPLER,
     SETTINGS_SAMPLER,
     SUPER_LAB,
@@ -51,6 +52,7 @@ _TASKS: dict[str, tuple[str, str]] = {
     TEMPLATE_SAMPLER: ("template", "train_sharpe"),
     GA_SAMPLER: ("evolution", "train_fitness"),
     POWER_POOL_SAMPLER: ("power-pool", "sharpe"),
+    REGION_AGNOSTIC_SAMPLER: ("region-agnostic", "sharpe"),
     SETTINGS_SAMPLER: ("settings-sampler", "sharpe"),
     CORRELATION_BREAKER: ("correlation-breaker", "sharpe"),
     SUPER_LAB: ("super-alpha", "sharpe"),
@@ -156,12 +158,19 @@ async def synced_universes(
     return universes
 
 
+#: The most single fields a task can be told to use: past this, choose whole datasets.
+MAX_PICKED_FIELDS = 500
+
+
 class SearchRequest(BaseModel):
     region: str
     delay: int = Field(ge=0, le=1)
     #: The chosen market's universe; searched first, other universes join if they overlap.
     universe: str | None = None
     dataset_ids: list[str] = Field(default_factory=list, max_length=200)
+    #: Single fields ticked in the Data Explorer; the task searches only these, and
+    #: ``dataset_ids`` are theirs.
+    field_ids: list[str] = Field(default_factory=list, max_length=MAX_PICKED_FIELDS)
     vector_operators: list[str] = Field(default_factory=list)
     #: What the lab searches. Empty is refused: see :data:`NO_NEUTRALIZATION`.
     neutralizations: list[str] = Field(default_factory=list, max_length=20)
@@ -245,6 +254,7 @@ async def market_for(body: SearchRequest, state: Any, need: tuple[str, ...] = ()
             delay=body.delay,
             universes=universes,
             dataset_ids=body.dataset_ids,
+            field_ids=body.field_ids,
             allow_vector=bool(vector_ops),
             narrow=body.field_filter,
         )
@@ -261,6 +271,14 @@ async def market_for(body: SearchRequest, state: Any, need: tuple[str, ...] = ()
                     else ""
                 )
             )
+    unusable = [f for f in body.field_ids if f not in pool.fields] if pool.fields else []
+    if unusable:
+        more = f" and {len(unusable) - 5:,} more" if len(unusable) > 5 else ""
+        warnings.append(
+            f"{len(unusable):,} of the chosen fields can't be searched here — group fields, "
+            "vector fields without a vector operator, or not in a downloaded universe: "
+            f"{', '.join(unusable[:5])}{more}."
+        )
     if pool.vector_skipped and pool.fields:
         warnings.append(
             f"{pool.vector_skipped:,} vector fields are left out; "

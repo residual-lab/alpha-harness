@@ -15,6 +15,7 @@ from ..llm.chat import DEFAULT_REASONING, Reasoning, reasoning_options
 from ..llm.registry import LLMModels
 from ..schemas import Out
 from .deps import State, refuse
+from .prompts import chosen
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -164,6 +165,9 @@ class Say(BaseModel):
     dataset_ids: list[str] = Field(
         default_factory=list, description="Narrow it to particular datasets"
     )
+    prompt_id: int | None = Field(
+        default=None, description="A saved Assistant prompt from LLM Prompts; omit for the built-in"
+    )
 
 
 @router.post("")
@@ -174,6 +178,7 @@ async def say(body: Say, state: State) -> ChatReply:
     you see it and reported in ``dropped`` — an invented field costs a simulation to
     discover, and the consultant has a limited number each day.
     """
+    _, system = await chosen(state, "assistant", body.prompt_id)
     try:
         answered = await state.chat.say(
             body.thread_id,
@@ -182,6 +187,7 @@ async def say(body: Say, state: State) -> ChatReply:
             model=body.model,
             reasoning=body.reasoning,
             dataset_ids=body.dataset_ids,
+            system=system,
         )
     except ValueError as exc:
         # A market with nothing downloaded or an unknown conversation: each phrases itself,

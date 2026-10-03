@@ -235,6 +235,9 @@ class Backfill:
                         offset=offset,
                         order="-dateSubmitted",
                         filters=[Filter("status", "!=", "UNSUBMITTED")],
+                        # Hidden on BRAIN is still submitted: the listing leaves hidden
+                        # Alphas out unless told not to filter them.
+                        hidden=None,
                     )
                 )
                 results = page.get("results") or []
@@ -245,6 +248,23 @@ class Backfill:
                 if len(results) < PAGE:
                     break
                 offset += PAGE
+
+            # Stored as submitted but not listed: read one at a time, or it stays unlabelled
+            # and without PnL for good.
+            listed = set(ids)
+            unlisted = [
+                str(r["alpha_id"])
+                for r in await self.vault.submitted_members()
+                if str(r["alpha_id"]) not in listed
+            ]
+            for alpha_id in unlisted:
+                try:
+                    await self.vault.save_alphas([await self.endpoints.get_alpha(alpha_id)])
+                    ids.append(alpha_id)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "vault.submitted_refresh_failed", alpha_id=alpha_id, error=str(exc)[:160]
+                    )
 
             # A simulated series never changes, so one already stored is not fetched again.
             missing = await self.vault.lacking_series(ids)

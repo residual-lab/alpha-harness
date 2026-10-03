@@ -6,7 +6,8 @@ import { useEffect } from 'react'
 import type { Scope } from '@/api/types'
 import { DEFAULT_SCOPE, useScope } from '@/lib/scope'
 import { useDebounced } from '@/lib/use-debounced'
-import { type PickFrom, useDatasetPick } from '@/screens/data/dataset-pick'
+import { type PickedField, type PickFrom, useDatasetPick } from '@/screens/data/dataset-pick'
+import { useFieldSelection } from '@/screens/data/field-pick'
 import { type FieldFilterState, useFieldFilter } from '@/screens/data/state'
 
 export interface LabDraft {
@@ -17,6 +18,13 @@ export interface LabDraft {
   /** The Data Explorer's filter the datasets were chosen under: the lab uses only the fields it
    *  shows. `null` uses every field in them; a draft saved before labs kept one has none. */
   fieldFilter: FieldFilterState | null
+  /**
+   * Single fields chosen in the Data Explorer, ranked; `datasetIds` are theirs. Empty uses the
+   * datasets whole. Absent from a draft saved before fields could be chosen.
+   */
+  fields?: PickedField[]
+  /** How `fields` were ranked: "Alphas, most first". */
+  rankBy?: string | null
   /** `null` until chosen in the form: until then Settings' default applies. */
   cores: number | null
   /** `null` until the user assigns them: a task always has simulations chosen on purpose. */
@@ -34,6 +42,8 @@ export const LAB_DEFAULTS: LabDraft = {
   universe: DEFAULT_SCOPE.universe,
   datasetIds: [],
   fieldFilter: null,
+  fields: [],
+  rankBy: null,
   cores: null,
   simulations: null,
   decay: 0,
@@ -43,8 +53,16 @@ export const LAB_DEFAULTS: LabDraft = {
 
 export const MAX_SIMULATIONS = 100_000
 
-/** A draft's market and datasets, and the round trip to the Data Explorer to choose them. */
-type LabMarket = Pick<LabDraft, 'region' | 'delay' | 'universe' | 'datasetIds' | 'fieldFilter'>
+/**
+ * A draft's market, datasets and fields: the round trip to the Data Explorer to choose them, and
+ * the props of the Datasets panel that shows them.
+ */
+type LabMarket = Pick<
+  LabDraft,
+  'region' | 'delay' | 'universe' | 'datasetIds' | 'fieldFilter' | 'fields' | 'rankBy'
+>
+
+const NO_FIELDS: PickedField[] = []
 
 export function useLabMarket(
   draft: LabMarket,
@@ -70,19 +88,53 @@ export function useLabMarket(
         delay: pick.scope.delay,
         universe: pick.scope.universe,
         datasetIds: pick.ids,
-        fieldFilter: pick.extra ?? null,
+        // What the pick carries: the filter the datasets were chosen under, or the single
+        // fields ticked instead. A pick of whole datasets clears fields chosen before it.
+        fieldFilter: pick.extra?.filter ?? null,
+        fields: pick.extra?.fields ?? [],
+        rankBy: pick.extra?.rankBy ?? null,
       })
   }, [from, set])
 
+  const fields = draft.fields ?? NO_FIELDS
   const choose = () => {
     // Back to the filter this lab applies, so the Explorer shows the fields it will use.
     if (draft.fieldFilter) useFieldFilter.getState().replace({ ...draft.fieldFilter })
-    useDatasetPick.getState().start(scope, draft.datasetIds, from)
+    // Chosen fields come back selected. Their datasets are not ticked as well, which would
+    // narrow the table to those datasets instead of the search that found the fields.
+    useDatasetPick.getState().start(scope, fields.length ? [] : draft.datasetIds, from)
+    useFieldSelection.getState().load(scope, fields)
     setDataScope(scope)
     void navigate({ to: '/data' })
   }
-  return { chosen, scope, choose }
+  const panel = {
+    ids: draft.datasetIds,
+    scope,
+    fields,
+    rankBy: draft.rankBy ?? null,
+    filter: draft.fieldFilter,
+    onChoose: choose,
+    onClearFilter: () => set({ fieldFilter: null }),
+    // A dataset goes with its fields; the last field going leaves its datasets, used whole.
+    onRemove: (gone: string[]) =>
+      set({
+        datasetIds: draft.datasetIds.filter((x) => !gone.includes(x)),
+        fields: fields.filter((f) => !gone.includes(f.dataset)),
+      }),
+    onRemoveField: (id: string) => {
+      const left = fields.filter((f) => f.id !== id)
+      set({
+        fields: left,
+        datasetIds: left.length ? [...new Set(left.map((f) => f.dataset))] : draft.datasetIds,
+      })
+    },
+    onUseDatasets: () => set({ fields: [], rankBy: null }),
+  }
+  return { chosen, scope, choose, panel }
 }
+
+/** The single fields a task is told to use, in rank order; empty uses its datasets whole. */
+export const fieldIdsOf = (draft: Pick<LabDraft, 'fields'>) => (draft.fields ?? []).map((f) => f.id)
 
 /**
  * A lab's free preview of `body`, asked once the form has been still for `wait` ms. `current`
@@ -117,6 +169,7 @@ export function labBody(draft: LabDraft, vectorOperators: string[], cores: numbe
     delay: draft.delay,
     universe: draft.universe,
     dataset_ids: draft.datasetIds,
+    field_ids: fieldIdsOf(draft),
     field_filter: draft.fieldFilter ?? null,
     vector_operators: vectorOperators,
     neutralizations: draft.neutralizations,

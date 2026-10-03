@@ -86,6 +86,8 @@ class FieldFilter(BaseModel):
 
     search: str | None = None
     dataset_ids: list[str] = Field(default_factory=list)
+    #: Single fields, as ticked in the Data Explorer: a lab told to use only these.
+    field_ids: list[str] = Field(default_factory=list)
     category_ids: list[str] = Field(default_factory=list)
     field_types: list[str] = Field(default_factory=list)
 
@@ -102,6 +104,20 @@ class FieldFilter(BaseModel):
     #: When BRAIN first offered the field here, both ends inclusive.
     date_created_from: date | None = None
     date_created_to: date | None = None
+
+    #: Region ``ALL`` only: how many regions carry the field, both ends included.
+    region_coverage_min: int | None = None
+    region_coverage_max: int | None = None
+    #: The description holds at least one of these, as letters anywhere, any case.
+    keywords: list[str] = Field(default_factory=list)
+
+    #: What a selection of fields leaves out: these datasets, fields added in this date range
+    #: (either end may be open), and descriptions holding any of these words. A field with no
+    #: date or no description is never left out by the date or the words.
+    exclude_dataset_ids: list[str] = Field(default_factory=list)
+    exclude_date_min: date | None = None
+    exclude_date_max: date | None = None
+    exclude_keywords: list[str] = Field(default_factory=list)
 
     #: Only fields that also exist in region ``ALL`` — the ones an idea could be run
     #: region-agnostically on. Meaningless when the scope already is ``ALL``.
@@ -160,6 +176,7 @@ class FieldFilter(BaseModel):
             params.extend([needle, needle])
 
         for column, values in (
+            ("field_id", self.field_ids),
             ("dataset_id", self.dataset_ids),
             ("category_id", self.category_ids),
             ("field_type", self.field_types),
@@ -187,6 +204,33 @@ class FieldFilter(BaseModel):
                 clauses.append(f"{column} {op} ?")
                 params.append(value)
 
+        if self.region_coverage_min is not None:
+            clauses.append("region_coverage >= ?")
+            params.append(self.region_coverage_min)
+        if self.region_coverage_max is not None:
+            clauses.append("region_coverage <= ?")
+            params.append(self.region_coverage_max)
+        if words := _words(self.keywords):
+            clauses.append(_any_word(len(words)))
+            params.extend(words)
+
+        if self.exclude_dataset_ids:
+            placeholders = ", ".join("?" for _ in self.exclude_dataset_ids)
+            clauses.append(f"(dataset_id IS NULL OR dataset_id NOT IN ({placeholders}))")
+            params.extend(self.exclude_dataset_ids)
+        window = [
+            (op, value)
+            for op, value in ((">=", self.exclude_date_min), ("<=", self.exclude_date_max))
+            if value is not None
+        ]
+        if window:
+            inside = " AND ".join(f"date_created {op} ?" for op, _ in window)
+            clauses.append(f"(date_created IS NULL OR NOT ({inside}))")
+            params.extend(value for _, value in window)
+        if words := _words(self.exclude_keywords):
+            clauses.append(f"(description IS NULL OR NOT {_any_word(len(words))})")
+            params.extend(words)
+
         # By field id, across delays: whether a field exists elsewhere is a question about
         # the field, not about the delay it is read at. Never across instrument types.
         if self.region_agnostic and scope.region != REGION_AGNOSTIC_REGION:
@@ -204,6 +248,19 @@ class FieldFilter(BaseModel):
             params.extend([scope.instrument_type, scope.region])
 
         return " AND ".join(clauses), params
+
+
+def _words(words: list[str]) -> list[str]:
+    """Each word as a LIKE pattern: lower case, wildcards escaped, blanks dropped."""
+    return [
+        "%" + w.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        for w in (w.strip() for w in words)
+        if w
+    ]
+
+
+def _any_word(n: int) -> str:
+    return "(" + " OR ".join(r"lower(description) LIKE ? ESCAPE '\'" for _ in range(n)) + ")"
 
 
 class CatalogQueries:

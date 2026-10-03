@@ -162,6 +162,7 @@ class ChatService:
         model: str | None,
         reasoning: Reasoning,
         dataset_ids: list[str],
+        system: str = ASSISTANT,
     ) -> dict[str, Any]:
         """One exchange: their words in, a reply and a set of field picks out.
 
@@ -191,7 +192,7 @@ class ChatService:
         )
 
         answer = await self.llm.generate(
-            system=ASSISTANT,
+            system=system,
             user=prompt,
             model_ref=model,
             temperature=0.6,

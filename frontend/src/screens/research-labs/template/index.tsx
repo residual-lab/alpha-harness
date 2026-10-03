@@ -25,6 +25,7 @@ import {
   testPeriodOf,
 } from '@/screens/research-labs/simulation-settings'
 import { CoresSetting, SimulationsSetting } from '@/screens/research-labs/task-settings'
+import { TemplateSections } from '@/screens/research-labs/template-sections'
 import {
   Button,
   Chips,
@@ -203,7 +204,7 @@ export function TemplateLabScreen() {
         [picking]: {
           kind: 'fields',
           dataset_ids: pick.ids,
-          filter: pick.extra ?? null,
+          filter: pick.extra?.filter ?? null,
           vector_operators: before?.kind === 'fields' ? (before.vector_operators ?? []) : [],
         },
       },
@@ -358,6 +359,7 @@ export function TemplateLabScreen() {
   return (
     <Page>
       <PageHeader title="Template Lab" actions={<AddTaskButtons add={add} disabled={!ready} />} />
+      <TemplateSections />
       {options.isError && (
         <ErrorNotice error={options.error} title="Could not read your operators" />
       )}

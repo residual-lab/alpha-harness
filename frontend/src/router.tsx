@@ -60,6 +60,14 @@ const templateLab = createRoute({
     'TemplateLabScreen',
   ),
 })
+const templateBasicLab = createRoute({
+  getParentRoute: () => labs,
+  path: 'template/basic',
+  component: lazyRouteComponent(
+    () => import('@/screens/research-labs/template-basic'),
+    'BasicTemplateScreen',
+  ),
+})
 const evolutionLab = createRoute({
   getParentRoute: () => labs,
   path: 'evolution',
@@ -74,6 +82,14 @@ const powerPoolLab = createRoute({
   component: lazyRouteComponent(
     () => import('@/screens/research-labs/power-pool'),
     'PowerPoolLabScreen',
+  ),
+})
+const regionAgnosticLab = createRoute({
+  getParentRoute: () => labs,
+  path: 'region-agnostic',
+  component: lazyRouteComponent(
+    () => import('@/screens/research-labs/region-agnostic'),
+    'RegionAgnosticLabScreen',
   ),
 })
 const superAlphaLab = createRoute({
@@ -126,6 +142,20 @@ const correlationBreaker = createRoute({
     () => import('@/screens/tools/correlation-breaker'),
     'CorrelationBreakerScreen',
   ),
+})
+
+/** `open` is the prompt on screen: a saved prompt's id, or a built-in's slug. A number stays
+ *  one, since the router quotes a numeric string in the URL (`?open=%221%22`). */
+const llmPrompts = createRoute({
+  getParentRoute: () => root,
+  path: '/prompts',
+  validateSearch: (search: Record<string, unknown>): { open?: string | number | undefined } => ({
+    open:
+      typeof search['open'] === 'string' || typeof search['open'] === 'number'
+        ? search['open']
+        : undefined,
+  }),
+  component: lazyRouteComponent(() => import('@/screens/prompts'), 'PromptsScreen'),
 })
 
 const tasks = createRoute({ getParentRoute: () => root, path: '/tasks' })
@@ -182,7 +212,14 @@ const aiIndex = createRoute({
     throw redirect({ to: '/ai/$tab', params: { tab: 'providers' } })
   },
 })
-const aiTab = createRoute({ getParentRoute: () => ai, path: '$tab' })
+const aiTab = createRoute({
+  getParentRoute: () => ai,
+  path: '$tab',
+  // Prompts moved to their own screen, where they can be edited; old links follow them.
+  beforeLoad: ({ params }) => {
+    if (params.tab === 'prompts') throw redirect({ to: '/prompts', search: {} })
+  },
+})
 const aiThread = createRoute({ getParentRoute: () => ai, path: 'assistant/$threadId' })
 
 const competitionsRoute = createRoute({
@@ -208,8 +245,18 @@ const routeTree = root.addChildren([
   dashboard,
   matrix,
   data,
-  labs.addChildren([labsIndex, searchLab, templateLab, evolutionLab, powerPoolLab, superAlphaLab]),
+  labs.addChildren([
+    labsIndex,
+    searchLab,
+    templateLab,
+    templateBasicLab,
+    evolutionLab,
+    powerPoolLab,
+    regionAgnosticLab,
+    superAlphaLab,
+  ]),
   tools.addChildren([toolsIndex, settingsSampler, submissionPlanner, correlationBreaker]),
+  llmPrompts,
   competitionsRoute,
   tasks.addChildren([tasksIndex, taskResults]),
   pool.addChildren([poolIndex, poolTab]),

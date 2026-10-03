@@ -944,7 +944,10 @@ export interface paths {
         post?: never;
         /**
          * Remove
-         * @description Remove a task that is not running. The Alphas it found stay in Alphas.
+         * @description Remove a task. The Alphas it found stay in Alphas.
+         *
+         *     ``force``, from a held Delete, takes a running task down as well: it is paused, what it
+         *     has out on BRAIN is cancelled where BRAIN allows, and then it goes.
          */
         delete: operations["remove_api_lab_tasks__task_id__delete"];
         options?: never;
@@ -954,6 +957,120 @@ export interface paths {
          * @description Change a task's cores or simulations. A running task takes them from its next round.
          */
         patch: operations["change_api_lab_tasks__task_id__patch"];
+        trace?: never;
+    };
+    "/api/lab-tasks/{task_id}/calibrate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Calibrate
+         * @description Run BRAIN's submission checks on every Alpha the task has back, without submitting.
+         *
+         *     It spends no simulation quota; each check is a request BRAIN answers in its own time,
+         *     so this runs in the background and the groups rank themselves as the answers land.
+         */
+        post: operations["calibrate_api_lab_tasks__task_id__calibrate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/lab-tasks/{task_id}/clone": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Clone
+         * @description A fresh task with this one's market, datasets, fields and settings, and nothing it did.
+         *
+         *     Labs that write their simulations when added (Settings Sampler, Correlation Breaker) get
+         *     them all again; Evolution Lab gets its seeds.
+         */
+        post: operations["clone_api_lab_tasks__task_id__clone_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/lab-tasks/{task_id}/continue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Continue Task
+         * @description Carry any task on from where it left off, with more simulations if it met its target.
+         *
+         *     A paused, waiting-to-start or finished task all continue the same way: its trials, its
+         *     memory and what it learnt stay, and it runs until the new target is met.
+         */
+        post: operations["continue_task_api_lab_tasks__task_id__continue_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/lab-tasks/{task_id}/groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Groups
+         * @description Region Agnostic Lab's results: each expression once, with its run in every region.
+         *
+         *     Runs come back at different times; each lands in its expression's group as it does.
+         *     Groups are ranked by the share of their Alphas' submission checks that pass, then by how
+         *     many pass, then best Sharpe — so after Calibrate, the most submittable come first.
+         */
+        get: operations["groups_api_lab_tasks__task_id__groups_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/lab-tasks/{task_id}/info": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Info
+         * @description Everything known about a task: how it was set up, where its simulations went, and, for
+         *     the LLM lab, its prompt, model and recent calls.
+         */
+        get: operations["info_api_lab_tasks__task_id__info_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/lab-tasks/{task_id}/name": {
@@ -1010,31 +1127,6 @@ export interface paths {
          * @description Run a task, resume a paused one, or retry a failed one. It starts once its cores fit.
          */
         post: operations["run_api_lab_tasks__task_id__run_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/lab-tasks/{task_id}/stop": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Stop
-         * @description Finish a task early. Simulations already sent still finish and are scored.
-         *
-         *     Pressed on a task that is *already* stopping, it forces: what is out on BRAIN is
-         *     cancelled where it can be, the trials close whatever their simulations are doing, and
-         *     the cores come back. There is no separate button because there is no separate
-         *     intention — the second press means the first one did not work.
-         */
-        post: operations["stop_api_lab_tasks__task_id__stop_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1166,27 +1258,6 @@ export interface paths {
          * @description Query parameters, not a path: model ids carry slashes.
          */
         delete: operations["remove_model_api_llm_models_delete"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/llm/prompts": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List Prompts
-         * @description Every system prompt the application sends, in full. The token estimate is shown
-         *     because prompt tokens come out of the same per-minute budget as the answer.
-         */
-        get: operations["list_prompts_api_llm_prompts_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1371,6 +1442,51 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/prompts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Library
+         * @description Every prompt: each built-in first, then the saved ones, newest edit first.
+         */
+        get: operations["library_api_prompts_get"];
+        put?: never;
+        /**
+         * Create
+         * @description A new prompt, blank or a copy: a copy sends the text it starts from.
+         */
+        post: operations["create_api_prompts_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/prompts/{prompt_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Edit */
+        put: operations["edit_api_prompts__prompt_id__put"];
+        post?: never;
+        /**
+         * Remove
+         * @description A task already using it keeps the text it had when it was added.
+         */
+        delete: operations["remove_api_prompts__prompt_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/quarter": {
         parameters: {
             query?: never;
@@ -1413,6 +1529,60 @@ export interface paths {
          *     closes both stores, and the launcher exits when the process does.
          */
         post: operations["quit_app_api_quit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/region-agnostic-lab/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Options */
+        get: operations["options_api_region_agnostic_lab_options_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/region-agnostic-lab/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview
+         * @description What a task would send. Free: no LLM call, no simulation.
+         */
+        post: operations["preview_api_region_agnostic_lab_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/region-agnostic-lab/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Add Task */
+        post: operations["add_task_api_region_agnostic_lab_tasks_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1620,6 +1790,105 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/template-basic-lab/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Options
+         * @description The blocks this account can build with, and what a task can be set to.
+         */
+        get: operations["options_api_template_basic_lab_options_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/template-basic-lab/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview
+         * @description What a task would search. Free; queues nothing.
+         */
+        post: operations["preview_api_template_basic_lab_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/template-basic-lab/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add Task
+         * @description Add the template's search to Tasks, not started. It spends nothing until run there.
+         */
+        post: operations["add_task_api_template_basic_lab_tasks_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/template-basic-lab/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Templates
+         * @description The presets, then the user's saved templates, newest first.
+         */
+        get: operations["templates_api_template_basic_lab_templates_get"];
+        put?: never;
+        /** Create Template */
+        post: operations["create_template_api_template_basic_lab_templates_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/template-basic-lab/templates/{template_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Update Template */
+        put: operations["update_template_api_template_basic_lab_templates__template_id__put"];
+        post?: never;
+        /** Delete Template */
+        delete: operations["delete_template_api_template_basic_lab_templates__template_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2002,6 +2271,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/vault/alphas/{alpha_id}/bookmark": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set Bookmark */
+        put: operations["set_bookmark_api_vault_alphas__alpha_id__bookmark_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/vault/alphas/{alpha_id}/detail": {
         parameters: {
             query?: never;
@@ -2035,6 +2321,23 @@ export interface paths {
          * @description One alpha's cumulative PnL. Downloads the daily PnL from BRAIN the first time.
          */
         get: operations["alpha_pnl_api_vault_alphas__alpha_id__pnl_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/vault/bookmarks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Bookmarks */
+        get: operations["bookmarks_api_vault_bookmarks_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2137,6 +2440,8 @@ export interface components {
         AlphaDetail: {
             /** Alphaid */
             alphaId: string;
+            /** Bookmarked */
+            bookmarked: boolean;
             /** Brainurl */
             brainUrl: string;
             /** Checks */
@@ -2146,6 +2451,40 @@ export interface components {
             /** Expression */
             expression: string | null;
             settings: components["schemas"]["AlphaSettings"];
+        };
+        /** AlphaGroup */
+        AlphaGroup: {
+            /** Alphas */
+            alphas: components["schemas"]["GroupAlpha"][];
+            /** Bestsharpe */
+            bestSharpe: number | null;
+            /** Decay */
+            decay: number | null;
+            /** Expression */
+            expression: string | null;
+            /** Failed */
+            failed: number;
+            /** Group */
+            group: number;
+            /** Neutralization */
+            neutralization: string | null;
+            /** Passed */
+            passed: number;
+            /** Pending */
+            pending: number;
+            /** Truncation */
+            truncation: number | null;
+        };
+        /** AlphaGroups */
+        AlphaGroups: {
+            /** Calibrated */
+            calibrated: number;
+            /** Calibrating */
+            calibrating: boolean;
+            /** Complete */
+            complete: number;
+            /** Groups */
+            groups: components["schemas"]["AlphaGroup"][];
         };
         /**
          * AlphaIds
@@ -2246,6 +2585,11 @@ export interface components {
         };
         /** AlphaPageRequest */
         AlphaPageRequest: {
+            /**
+             * Bookmarked
+             * @default false
+             */
+            bookmarked: boolean;
             /** Delays */
             delays?: number[] | null;
             /**
@@ -2289,7 +2633,7 @@ export interface components {
              * Submitted
              * @default false
              */
-            submitted: boolean;
+            submitted: boolean | null;
             /** Universes */
             universes?: string[] | null;
         };
@@ -2587,6 +2931,141 @@ export interface components {
             /** Remaining */
             remaining: number;
         };
+        /** BasicTemplateBody */
+        BasicTemplateBody: {
+            /** Description */
+            description?: string | null;
+            /** Name */
+            name: string;
+            /** Tree */
+            tree: {
+                [key: string]: unknown;
+            };
+        };
+        /** BasicTemplateList */
+        BasicTemplateList: {
+            /** Templates */
+            templates: components["schemas"]["BasicTemplateSummary"][];
+        };
+        /** BasicTemplateOptions */
+        BasicTemplateOptions: {
+            /** Blocks */
+            blocks: {
+                [key: string]: unknown;
+            }[];
+            /** Datafields */
+            dataFields: string[];
+            /** Decays */
+            decays: number[];
+            /** Groupfields */
+            groupFields: string[];
+            /** Maxsimulations */
+            maxSimulations: number;
+            operators: components["schemas"]["OperatorsRead"];
+            /** Variables */
+            variables: {
+                [key: string]: (number | string)[];
+            };
+            /** Vector */
+            vector: string[];
+        };
+        /** BasicTemplatePreview */
+        BasicTemplatePreview: {
+            fields: components["schemas"]["FieldCounts"];
+            leftOut: components["schemas"]["LeftOut"];
+            /** Problems */
+            problems: string[];
+            /** Sample */
+            sample: components["schemas"]["SampleAlpha"][];
+            /** Skeleton */
+            skeleton: string;
+            /** Templateproblems */
+            templateProblems: string[];
+            /** Universes */
+            universes: string[];
+            /** Warnings */
+            warnings: string[];
+        };
+        /** BasicTemplateRemoved */
+        BasicTemplateRemoved: {
+            /** Removed */
+            removed: number;
+        };
+        /** BasicTemplateSummary */
+        BasicTemplateSummary: {
+            /** Description */
+            description: string | null;
+            /** Id */
+            id: string | number;
+            /** Missing */
+            missing: string[];
+            /** Name */
+            name: string;
+            /** Preset */
+            preset: boolean;
+            /** Skeleton */
+            skeleton: string;
+            /** Source */
+            source: string | null;
+            /** Tree */
+            tree: {
+                [key: string]: unknown;
+            };
+            /** Updatedat */
+            updatedAt: string | null;
+        };
+        /** BasicTemplateTask */
+        BasicTemplateTask: {
+            /**
+             * Cores
+             * @default 8
+             */
+            cores: number;
+            /** Dataset Ids */
+            dataset_ids?: string[];
+            /**
+             * Decay
+             * @default 0
+             */
+            decay: number;
+            /** Delay */
+            delay: number;
+            field_filter?: components["schemas"]["FieldFilter"] | null;
+            /** Field Ids */
+            field_ids?: string[];
+            /** Neutralizations */
+            neutralizations?: string[];
+            /** Region */
+            region: string;
+            /**
+             * Simulations
+             * @default 0
+             */
+            simulations: number;
+            /**
+             * Template Name
+             * @default Template
+             */
+            template_name: string;
+            /** Tree */
+            tree: {
+                [key: string]: unknown;
+            };
+            /** Universe */
+            universe?: string | null;
+            /** Vector Operators */
+            vector_operators?: string[];
+        };
+        /** BookmarkRequest */
+        BookmarkRequest: {
+            /** Bookmarked */
+            bookmarked: boolean;
+        };
+        /** Bookmarks */
+        Bookmarks: {
+            /** Alphaids */
+            alphaIds: string[];
+        };
         /**
          * BrainPayload
          * @description BRAIN's own JSON, passed through as the platform sent it.
@@ -2835,6 +3314,23 @@ export interface components {
          * @enum {string}
          */
         CheckResult: "PASS" | "FAIL" | "PENDING" | "WARNING" | "ERROR";
+        /** CloneTask */
+        CloneTask: {
+            /**
+             * Change Prompt
+             * @default false
+             */
+            change_prompt: boolean;
+            /** Prompt Id */
+            prompt_id?: number | null;
+            /**
+             * Run
+             * @default false
+             */
+            run: boolean;
+            /** Simulations */
+            simulations?: number | null;
+        };
         /** Competition */
         Competition: {
             /** Enddate */
@@ -2870,6 +3366,14 @@ export interface components {
         Competitions: {
             /** Competitions */
             competitions: components["schemas"]["Competition"][];
+        };
+        /** ContinueTask */
+        ContinueTask: {
+            /**
+             * Simulations
+             * @default 0
+             */
+            simulations: number;
         };
         /** CorrelatedPair */
         CorrelatedPair: {
@@ -3000,6 +3504,16 @@ export interface components {
         DropResult: {
             /** Dropped */
             dropped: number;
+        };
+        /**
+         * EditPrompt
+         * @description Only what is sent changes.
+         */
+        EditPrompt: {
+            /** Body */
+            body?: string | null;
+            /** Name */
+            name?: string | null;
         };
         /**
          * EngineStatus
@@ -3183,8 +3697,20 @@ export interface components {
             date_created_from?: string | null;
             /** Date Created To */
             date_created_to?: string | null;
+            /** Exclude Dataset Ids */
+            exclude_dataset_ids?: string[];
+            /** Exclude Date Max */
+            exclude_date_max?: string | null;
+            /** Exclude Date Min */
+            exclude_date_min?: string | null;
+            /** Exclude Keywords */
+            exclude_keywords?: string[];
+            /** Field Ids */
+            field_ids?: string[];
             /** Field Types */
             field_types?: string[];
+            /** Keywords */
+            keywords?: string[];
             /**
              * Limit
              * @default 100
@@ -3204,6 +3730,10 @@ export interface components {
              * @default false
              */
             region_agnostic: boolean;
+            /** Region Coverage Max */
+            region_coverage_max?: number | null;
+            /** Region Coverage Min */
+            region_coverage_min?: number | null;
             /**
              * Region Exclusive
              * @default false
@@ -3266,6 +3796,38 @@ export interface components {
             kind: "fields";
             /** Vector Operators */
             vector_operators?: string[];
+        };
+        /** GroupAlpha */
+        GroupAlpha: {
+            /** Alphaid */
+            alphaId: string | null;
+            /** Failed */
+            failed: number;
+            /** Failing */
+            failing: string[];
+            /** Fitness */
+            fitness: number | null;
+            /** Passed */
+            passed: number;
+            /** Pending */
+            pending: number;
+            /** Region */
+            region: string | null;
+            /** Returns */
+            returns: number | null;
+            /** Sharpe */
+            sharpe: number | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "waiting" | "running" | "complete" | "failed";
+            /** Trialid */
+            trialId: number;
+            /** Turnover */
+            turnover: number | null;
+            /** Universe */
+            universe: string | null;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -3451,12 +4013,19 @@ export interface components {
             best: number | null;
             /** Cached */
             cached: number;
+            /**
+             * Chosenfields
+             * @default 0
+             */
+            chosenFields: number;
             /** Cores */
             cores: number;
             /** Createdat */
             createdAt: string | null;
             /** Datasetids */
             datasetIds: string[];
+            /** Datasetnames */
+            datasetNames?: string[];
             /** Decay */
             decay: number | null;
             /** Delay */
@@ -3486,6 +4055,8 @@ export interface components {
             markets?: number | null;
             /** Message */
             message: string | null;
+            /** Model */
+            model?: string | null;
             /** Mutationrate */
             mutationRate: number | null;
             /** Name */
@@ -3496,6 +4067,8 @@ export interface components {
             objectiveLabel: string;
             /** Population */
             population: number | null;
+            /** Promptname */
+            promptName?: string | null;
             /** Queued */
             queued: number;
             /** Queuedat */
@@ -3556,6 +4129,29 @@ export interface components {
         LeftOut: {
             /** Vector */
             vector: number;
+        };
+        /** LibraryPrompt */
+        LibraryPrompt: {
+            /** Basedon */
+            basedOn: string | null;
+            /** Body */
+            body: string;
+            /** Builtin */
+            builtIn: boolean;
+            /** Characters */
+            characters: number;
+            /** Estimatedtokens */
+            estimatedTokens: number;
+            /** Id */
+            id: number | null;
+            /** Kind */
+            kind: string;
+            /** Name */
+            name: string;
+            /** Updatedat */
+            updatedAt: string | null;
+            /** Words */
+            words: number;
         };
         /** LineageSibling */
         LineageSibling: {
@@ -3643,6 +4239,20 @@ export interface components {
              * Format: date
              */
             month: string;
+        };
+        /** NewPrompt */
+        NewPrompt: {
+            /** Based On */
+            based_on?: string | null;
+            /**
+             * Body
+             * @default
+             */
+            body: string;
+            /** Kind */
+            kind: string;
+            /** Name */
+            name: string;
         };
         /** OfferedModels */
         OfferedModels: {
@@ -3969,6 +4579,8 @@ export interface components {
         };
         /** PowerPoolPrompt */
         PowerPoolPrompt: {
+            /** Name */
+            name: string;
             /** System */
             system: string;
             /** Tokens */
@@ -3988,10 +4600,16 @@ export interface components {
             /** Delay */
             delay: number;
             field_filter?: components["schemas"]["FieldFilter"] | null;
+            /** Field Ids */
+            field_ids?: string[];
             /** Model */
             model?: string | null;
             /** Neutralizations */
             neutralizations?: string[];
+            /** Prompt Id */
+            prompt_id?: number | null;
+            /** Rank By */
+            rank_by?: string | null;
             /** Region */
             region: string;
             /**
@@ -4119,14 +4737,11 @@ export interface components {
             /** Truncation */
             truncation?: number | null;
         };
-        /** PromptInfo */
-        PromptInfo: {
-            /** Body */
-            body: string;
-            /** Characters */
-            characters: number;
-            /** Estimatedtokens */
-            estimatedTokens: number;
+        /**
+         * PromptKind
+         * @description One job a prompt can do: a built-in's slug, and where it is chosen.
+         */
+        PromptKind: {
             /** Label */
             label: string;
             /** Purpose */
@@ -4134,10 +4749,12 @@ export interface components {
             /** Slug */
             slug: string;
         };
-        /** PromptList */
-        PromptList: {
+        /** PromptLibrary */
+        PromptLibrary: {
+            /** Kinds */
+            kinds: components["schemas"]["PromptKind"][];
             /** Prompts */
-            prompts: components["schemas"]["PromptInfo"][];
+            prompts: components["schemas"]["LibraryPrompt"][];
         };
         /** PyramidCategory */
         PyramidCategory: {
@@ -4312,6 +4929,96 @@ export interface components {
             /** Name */
             name: string;
         };
+        /** RegionAgnosticOptions */
+        RegionAgnosticOptions: {
+            /** Defaultmodel */
+            defaultModel: string | null;
+            /** Maxsimulations */
+            maxSimulations: number;
+            /** Models */
+            models: components["schemas"]["PowerPoolModel"][];
+            /** Regions */
+            regions: components["schemas"]["RegionChoice"][];
+            /** Sizes */
+            sizes: {
+                [key: string]: {
+                    [key: string]: string;
+                };
+            };
+        };
+        /** RegionAgnosticPreview */
+        RegionAgnosticPreview: {
+            /** Fields */
+            fields: number;
+            /** Llmcalls */
+            llmCalls: number;
+            /** Lonely */
+            lonely: number;
+            /** Neutralizations */
+            neutralizations: string[];
+            /** Perregion */
+            perRegion: components["schemas"]["RegionFieldCount"][];
+            /** Problems */
+            problems: string[];
+            prompt: components["schemas"]["PowerPoolPrompt"] | null;
+            /** Warnings */
+            warnings: string[];
+        };
+        /** RegionAgnosticRequest */
+        RegionAgnosticRequest: {
+            /**
+             * Cores
+             * @default 8
+             */
+            cores: number;
+            /** Dataset Ids */
+            dataset_ids?: string[];
+            /** Delay */
+            delay: number;
+            /** Field Ids */
+            field_ids?: string[];
+            /** Model */
+            model?: string | null;
+            /** Neutralizations */
+            neutralizations?: string[];
+            /** Prompt Id */
+            prompt_id?: number | null;
+            /** Rank By */
+            rank_by?: string | null;
+            /** Regions */
+            regions?: string[];
+            /**
+             * Simulations
+             * @default 0
+             */
+            simulations: number;
+            /**
+             * Size
+             * @default LARGE
+             * @enum {string}
+             */
+            size: "LARGE" | "MEDIUM" | "SMALL";
+            /** Universe */
+            universe?: string | null;
+        };
+        /** RegionChoice */
+        RegionChoice: {
+            /** Defaultuniverse */
+            defaultUniverse: string | null;
+            /** Neutralizations */
+            neutralizations: string[];
+            /** Region */
+            region: string;
+            /** Universes */
+            universes: string[];
+        };
+        /** RegionFieldCount */
+        RegionFieldCount: {
+            /** Fields */
+            fields: number;
+            /** Region */
+            region: string;
+        };
         /** RegionPlan */
         RegionPlan: {
             /** Cost */
@@ -4407,6 +5114,11 @@ export interface components {
             dataset_ids?: string[];
             /** Model */
             model?: string | null;
+            /**
+             * Prompt Id
+             * @description A saved Assistant prompt from LLM Prompts; omit for the built-in
+             */
+            prompt_id?: number | null;
             /** @default normal */
             reasoning: components["schemas"]["Reasoning"];
             scope: components["schemas"]["Tuple4"];
@@ -4438,6 +5150,8 @@ export interface components {
             /** Delay */
             delay: number;
             field_filter?: components["schemas"]["FieldFilter"] | null;
+            /** Field Ids */
+            field_ids?: string[];
             /** Neutralizations */
             neutralizations?: string[];
             /** Region */
@@ -5035,12 +5749,85 @@ export interface components {
             /** Value */
             value: number;
         };
+        /**
+         * TaskCall
+         * @description One LLM call of an LLM Power Pool Lab task.
+         */
+        TaskCall: {
+            /** At */
+            at: string | null;
+            /** Dataset */
+            dataset: string | null;
+            /** Error */
+            error: string | null;
+            /** Fields */
+            fields: number | null;
+            /** Model */
+            model: string | null;
+            /** Prompt */
+            prompt: string | null;
+            /** Rejected */
+            rejected: number | null;
+            /** Tokens */
+            tokens: number | null;
+            /** Valid */
+            valid: number | null;
+        };
         /** TaskChange */
         TaskChange: {
             /** Cores */
             cores?: number | null;
             /** Simulations */
             simulations?: number | null;
+        };
+        /** TaskDataset */
+        TaskDataset: {
+            /** Best */
+            best: number | null;
+            /** Complete */
+            complete: number;
+            /** Failed */
+            failed: number;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /** Simulated */
+            simulated: number;
+        };
+        /** TaskInfo */
+        TaskInfo: {
+            /** Createdat */
+            createdAt: string | null;
+            /** Datasets */
+            datasets: components["schemas"]["TaskDataset"][];
+            /** Fields */
+            fields: string[];
+            /** Finishedat */
+            finishedAt: string | null;
+            /** Id */
+            id: number;
+            /** Labname */
+            labName: string;
+            /** Llmcalls */
+            llmCalls: number;
+            /** Message */
+            message: string | null;
+            /** Name */
+            name: string;
+            /** Queuedat */
+            queuedAt: string | null;
+            /** Rankby */
+            rankBy: string | null;
+            /** Recentcalls */
+            recentCalls: components["schemas"]["TaskCall"][];
+            /** Settings */
+            settings: components["schemas"]["TaskSetting"][];
+            /** Startedat */
+            startedAt: string | null;
+            status: components["schemas"]["StudyStatus"];
+            /** Updatedat */
+            updatedAt: string | null;
         };
         /** TaskName */
         TaskName: {
@@ -5051,6 +5838,13 @@ export interface components {
         TaskRemoved: {
             /** Removed */
             removed: number;
+        };
+        /** TaskSetting */
+        TaskSetting: {
+            /** Label */
+            label: string;
+            /** Value */
+            value: string;
         };
         /** TasksSummary */
         TasksSummary: {
@@ -6840,7 +7634,9 @@ export interface operations {
     };
     remove_api_lab_tasks__task_id__delete: {
         parameters: {
-            query?: never;
+            query?: {
+                force?: boolean;
+            };
             header?: never;
             path: {
                 task_id: number;
@@ -6891,6 +7687,169 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LabTask"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    calibrate_api_lab_tasks__task_id__calibrate_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkflowStarted"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clone_api_lab_tasks__task_id__clone_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CloneTask"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddedTask"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    continue_task_api_lab_tasks__task_id__continue_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContinueTask"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LabTask"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    groups_api_lab_tasks__task_id__groups_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlphaGroups"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    info_api_lab_tasks__task_id__info_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskInfo"];
                 };
             };
             /** @description Validation Error */
@@ -6971,37 +7930,6 @@ export interface operations {
         };
     };
     run_api_lab_tasks__task_id__run_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                task_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LabTask"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    stop_api_lab_tasks__task_id__stop_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -7316,26 +8244,6 @@ export interface operations {
             };
         };
     };
-    list_prompts_api_llm_prompts_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PromptList"];
-                };
-            };
-        };
-    };
     providers_api_llm_providers_get: {
         parameters: {
             query?: never;
@@ -7599,6 +8507,123 @@ export interface operations {
             };
         };
     };
+    library_api_prompts_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PromptLibrary"];
+                };
+            };
+        };
+    };
+    create_api_prompts_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewPrompt"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryPrompt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    edit_api_prompts__prompt_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prompt_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EditPrompt"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryPrompt"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_api_prompts__prompt_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prompt_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     standing_api_quarter_get: {
         parameters: {
             query?: never;
@@ -7635,6 +8660,103 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Quitting"];
+                };
+            };
+        };
+    };
+    options_api_region_agnostic_lab_options_get: {
+        parameters: {
+            query?: {
+                delay?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegionAgnosticOptions"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_api_region_agnostic_lab_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegionAgnosticRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegionAgnosticPreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    add_task_api_region_agnostic_lab_tasks_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegionAgnosticRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddedTask"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -7909,6 +9031,222 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TasksSummary"];
+                };
+            };
+        };
+    };
+    options_api_template_basic_lab_options_get: {
+        parameters: {
+            query?: {
+                refresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BasicTemplateOptions"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_api_template_basic_lab_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BasicTemplateTask"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BasicTemplatePreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    add_task_api_template_basic_lab_tasks_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BasicTemplateTask"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddedTask"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    templates_api_template_basic_lab_templates_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BasicTemplateList"];
+                };
+            };
+        };
+    };
+    create_template_api_template_basic_lab_templates_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BasicTemplateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BasicTemplateSummary"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_template_api_template_basic_lab_templates__template_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                template_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BasicTemplateBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BasicTemplateSummary"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_template_api_template_basic_lab_templates__template_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                template_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BasicTemplateRemoved"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -8549,6 +9887,41 @@ export interface operations {
             };
         };
     };
+    set_bookmark_api_vault_alphas__alpha_id__bookmark_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                alpha_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BookmarkRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlphaDetail"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     alpha_detail_api_vault_alphas__alpha_id__detail_get: {
         parameters: {
             query?: never;
@@ -8607,6 +9980,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    bookmarks_api_vault_bookmarks_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Bookmarks"];
                 };
             };
         };

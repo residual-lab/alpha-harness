@@ -1,5 +1,6 @@
 /**
- * The assistant: providers, keys and their daily budgets, the prompts it sends, and the chat.
+ * The assistant: providers, keys and their daily budgets, and the chat. Its prompts live in
+ * `@/screens/prompts`.
  * Bodies are snake_case only. Keys never come back — only `hint`.
  */
 
@@ -39,7 +40,6 @@ export interface SetModelRequest {
 }
 
 export type KeyCheck = Schemas['KeyWorks'] | Schemas['KeyFailed']
-export type PromptInfo = Schemas['PromptInfo']
 export type Reasoning = Schemas['ChatOptions']['defaultReasoning']
 export type ChatOptions = Schemas['ChatOptions']
 export type ChatThreadSummary = Schemas['ChatThreadSummary']
@@ -71,6 +71,8 @@ export interface ChatSayRequest {
   model?: string | null
   reasoning?: Reasoning
   dataset_ids?: string[]
+  /** A saved Assistant prompt; omitted or null sends the built-in. */
+  prompt_id?: number | null
 }
 
 export type ChatReply = Omit<Schemas['ChatReply'], 'picks'> & { picks: ChatPick[] }
@@ -109,7 +111,6 @@ export const llm = {
   removeKey: (id: number) => http.del<void>(`/api/llm/keys/${id}`),
   checkKey: (id: number) => http.post<KeyCheck>(`/api/llm/keys/${id}/check`),
   checkAll: () => http.post<KeyCheck[]>('/api/llm/keys/check'),
-  prompts: () => http.get<Schemas['PromptList']>('/api/llm/prompts'),
 }
 
 export const chat = {

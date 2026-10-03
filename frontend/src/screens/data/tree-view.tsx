@@ -25,6 +25,8 @@ export function DatasetTree({
   names,
   value,
   onChange,
+  title = 'Datasets',
+  searchLabel = 'Search Categories, Subcategories and Datasets',
 }: {
   /** The market, for copying a node's fields. */
   scope: Scope
@@ -34,6 +36,9 @@ export function DatasetTree({
   names: Map<string, string>
   value: string[]
   onChange: (ids: string[]) => void
+  /** Names the tree, and tells two on one screen apart. */
+  title?: string
+  searchLabel?: string
 }) {
   const [query, setQuery] = useState('')
   const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set())
@@ -128,7 +133,7 @@ export function DatasetTree({
     <div className="flex min-w-0 flex-col gap-2">
       <div className="flex min-h-7 flex-wrap items-center justify-between gap-2">
         <h3 className="text-caption font-medium text-ink-muted">
-          Datasets
+          {title}
           {value.length > 0 && (
             <span className="num text-ink-subtle"> · {fmt.int(value.length)} selected</span>
           )}
@@ -146,14 +151,14 @@ export function DatasetTree({
         onRemove={(ids) => toggle(ids, false)}
       />
       <Input
-        placeholder="Search Categories, Subcategories and Datasets"
-        aria-label="Search Categories, Subcategories and Datasets"
+        placeholder={searchLabel}
+        aria-label={searchLabel}
         value={query}
         onChange={(e) => setQuery(e.target.value)}
       />
       <div
         role="group"
-        aria-label="Datasets by category"
+        aria-label={`${title} by category`}
         className="flex max-h-80 flex-col overflow-y-auto rounded-md border border-hairline py-1"
       >
         {tree.length === 0 ? (

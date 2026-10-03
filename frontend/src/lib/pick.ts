@@ -24,6 +24,8 @@ interface Pick<From, Extra> {
   result: PickResult<From, Extra> | null
   start: (scope: Scope, ids: string[], from: From) => void
   finish: (extra?: Extra) => void
+  /** A finished pick made without starting one: chosen here, then sent to `from`. */
+  hand: (scope: Scope, ids: string[], from: From, extra?: Extra) => void
   cancel: () => void
   /**
    * Moves the pick to `scope`. What was picked belongs to a region and delay, so only a
@@ -54,6 +56,8 @@ export function createPick<From extends string, Extra = never>(name: string, fir
             result: scope ? { scope, ids, from, extra } : null,
           })
         },
+        hand: (scope, ids, from, extra) =>
+          set({ active: false, scope: null, ids: [], result: { scope, ids, from, extra } }),
         cancel: () => set({ active: false, scope: null, ids: [], result: null }),
         follow: (scope) => {
           const { scope: current, ids } = get()

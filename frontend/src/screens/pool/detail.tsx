@@ -5,6 +5,8 @@ import { Link } from '@tanstack/react-router'
 import { MaximizeIcon } from 'lucide-react'
 import { useState } from 'react'
 import { ApiError, errorMessage } from '@/api/http'
+import type { AlphaCheck, CheckResult } from '@/api/types'
+import { cn } from '@/lib/cn'
 import { fmt, isNum } from '@/lib/format'
 import { alpha, notApplicable } from '@/screens/alpha/api'
 import { type AlphaSettings, pool } from '@/screens/pool/api'
@@ -34,6 +36,7 @@ export function DetailSheet({ alphaId, onClose }: { alphaId: string | null; onCl
     <Sheet
       open={alphaId !== null}
       onOpenChange={(o) => !o && onClose()}
+      className="max-w-none"
       title={<span className="num">{alphaId ?? 'Alpha'}</span>}
     >
       {alphaId && <Body key={alphaId} alphaId={alphaId} />}
@@ -95,63 +98,134 @@ function Body({ alphaId }: { alphaId: string }) {
         <AlphaActionsMenu alphaId={d.alphaId} />
       </div>
 
-      <PnlSection alphaId={d.alphaId} />
+      <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1.65fr)_minmax(24rem,0.9fr)]">
+        <div className="min-w-0">
+          <PnlSection alphaId={d.alphaId} />
+        </div>
+        <div className="flex min-w-0 flex-col gap-5">
+          <Section title="Settings">
+            <KV className="gap-x-5 gap-y-2.5" items={settingsItems(d.settings)} />
+          </Section>
 
-      <Section title="Settings">
-        <KV items={settingsItems(d.settings)} />
-      </Section>
+          <ChecksSection checks={d.checks} />
 
-      <Section
-        title="Submission Checks"
-        description="As BRAIN last reported them. Pending checks resolve with Re-check on BRAIN."
-      >
-        {d.checks.length === 0 ? (
-          <p className="text-body-compact text-ink-subtle">No checks stored.</p>
-        ) : (
-          <ul className="flex flex-col divide-y divide-hairline-subtle">
-            {d.checks.map((c, i) => (
-              <li
-                key={`${c.name}-${i}`}
-                className="flex flex-wrap items-baseline gap-x-3 gap-y-1 py-1.5 text-body"
+          <Section
+            title="Correlations"
+            description="BRAIN rate-limits these checks hourly, so each one loads only when you ask."
+            actions={(['self', 'prod'] as Kind[]).map((k) => (
+              <Button
+                key={k}
+                size="sm"
+                disabled={kinds.includes(k)}
+                onClick={() => setKinds([...kinds, k])}
               >
-                <Badge tone={checkTone(c.result ?? 'PENDING')}>{c.result ?? 'PENDING'}</Badge>
-                <span className="num text-ink">{c.name}</span>
-                {isNum(c.value) && (
-                  <span className="num text-body-compact text-ink-subtle">
-                    {checkFigure(c.name, c.value)}
-                    {isNum(c.limit) && ` / ${checkFigure(c.name, c.limit)}`}
-                  </span>
-                )}
-                {c.message && (
-                  <span className="basis-full text-body-compact break-words text-ink-subtle">
-                    {c.message}
-                  </span>
-                )}
-              </li>
+                {KIND_LABEL[k]}
+              </Button>
             ))}
-          </ul>
-        )}
-      </Section>
-
-      <Section
-        title="Correlations"
-        description="BRAIN rate-limits these checks hourly, so each one loads only when you ask."
-        actions={(['self', 'prod'] as Kind[]).map((k) => (
-          <Button
-            key={k}
-            size="sm"
-            disabled={kinds.includes(k)}
-            onClick={() => setKinds([...kinds, k])}
           >
-            {KIND_LABEL[k]}
-          </Button>
-        ))}
-      >
-        {kinds.map((k) => (
-          <CorrelationResult key={k} alphaId={alphaId} kind={k} />
-        ))}
-      </Section>
+            {kinds.map((k) => (
+              <CorrelationResult key={k} alphaId={alphaId} kind={k} />
+            ))}
+          </Section>
+        </div>
+      </div>
     </div>
+  )
+}
+
+const CHECK_GROUPS: {
+  result: CheckResult
+  label: string
+  empty: string
+  className: string
+}[] = [
+  {
+    result: 'PASS',
+    label: 'Passed',
+    empty: 'No checks passed.',
+    className: 'border-pnl-positive-edge bg-pnl-positive-tint',
+  },
+  {
+    result: 'FAIL',
+    label: 'Failed',
+    empty: 'No checks failed.',
+    className: 'border-pnl-negative-edge bg-pnl-negative-tint',
+  },
+  {
+    result: 'WARNING',
+    label: 'Warnings',
+    empty: 'No warnings.',
+    className: 'border-status-warning-edge bg-status-warning-tint',
+  },
+  {
+    result: 'PENDING',
+    label: 'Pending',
+    empty: 'No pending checks.',
+    className: 'border-hairline bg-surface-2',
+  },
+]
+
+function ChecksSection({ checks }: { checks: AlphaCheck[] }) {
+  return (
+    <Section
+      title="Submission Checks"
+      description="As BRAIN last reported them. Pending checks resolve with Re-check on BRAIN."
+    >
+      {checks.length === 0 ? (
+        <p className="text-body-compact text-ink-subtle">No checks stored.</p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {CHECK_GROUPS.map((group) => {
+            const groupChecks = checks.filter((check) => {
+              const result = check.result ?? 'PENDING'
+              return group.result === 'FAIL'
+                ? result === 'FAIL' || result === 'ERROR'
+                : result === group.result
+            })
+            return (
+              <div key={group.result} className={cn('rounded-md border p-2.5', group.className)}>
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <h4 className="text-body-compact font-medium text-ink">{group.label}</h4>
+                  <span className="num text-body-compact text-ink-subtle">
+                    {groupChecks.length}
+                  </span>
+                </div>
+                {groupChecks.length > 0 ? (
+                  <ul className="flex flex-col divide-y divide-black/10">
+                    {groupChecks.map((check, index) => (
+                      <CheckItem key={`${check.name}-${index}`} check={check} />
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-body-compact text-ink-subtle">{group.empty}</p>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </Section>
+  )
+}
+
+function CheckItem({ check }: { check: AlphaCheck }) {
+  const result = check.result ?? 'PENDING'
+  return (
+    <li className="flex flex-wrap items-baseline gap-x-2 gap-y-1 py-1.5 first:pt-0 last:pb-0 text-body">
+      <Badge tone={checkTone(result)}>{result}</Badge>
+      <span className="num text-ink">{check.name}</span>
+      {isNum(check.value) && (
+        <span className="num text-body-compact text-ink-subtle">
+          {checkFigure(check.name, check.value)}
+          {isNum(check.limit) && ` / ${checkFigure(check.name, check.limit)}`}
+        </span>
+      )}
+      {check.message && (
+        <span className="basis-full text-body-compact break-words text-ink-subtle">
+          {check.message}
+        </span>
+      )}
+    </li>
   )
 }
 
@@ -180,6 +254,7 @@ function PnlSection({ alphaId }: { alphaId: string }) {
             <PnlChart
               values={q.data.pnl}
               dates={q.data.dates}
+              className="h-[min(65vh,42rem)]"
               label={`Cumulative PnL of ${alphaId}`}
             />
           ) : (

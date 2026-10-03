@@ -1,10 +1,11 @@
 /** Every field in the market: server-sorted, offset-paged, filtered; a row opens its detail. */
 
 import { keepPreviousData, skipToken, useMutation, useQuery } from '@tanstack/react-query'
-import { CopyIcon, MaximizeIcon, MinimizeIcon, SparklesIcon } from 'lucide-react'
-import { type RefObject, useEffect, useMemo, useRef, useState } from 'react'
+import { CopyIcon, FlaskConicalIcon, MaximizeIcon, MinimizeIcon, SparklesIcon } from 'lucide-react'
+import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
+  type CatalogFacets,
   catalog,
   type DataFieldRow,
   type FieldAvailabilityRow,
@@ -15,21 +16,32 @@ import { errorMessage } from '@/api/http'
 import { type Scope, scopeLabel } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
+import { isRegionAgnostic } from '@/lib/scope'
 import { useDebounced } from '@/lib/use-debounced'
-import { useDatasetPick } from '@/screens/data/dataset-pick'
+import { type PickFrom, useDatasetPick } from '@/screens/data/dataset-pick'
+import {
+  exclusionCount,
+  MAX_PICKED_FIELDS,
+  rankLabel,
+  useFieldSelection,
+  useHandOver,
+  useSelectionSplit,
+  useTicked,
+} from '@/screens/data/field-pick'
 import {
   Badge,
   Button,
   Chips,
   Disclosure,
   ErrorNotice,
+  Field,
   Fieldset,
   Input,
   KV,
   Panel,
   Skeleton,
 } from '@/ui/kit'
-import { Select, Sheet } from '@/ui/overlay'
+import { Menu, Select, Sheet } from '@/ui/overlay'
 import { useMediaQuery } from '@/ui/panels'
 import { type Column, DataTable, Pager, type Sort } from '@/ui/table'
 import { AvailabilityFilters } from './availability'
@@ -218,6 +230,9 @@ const ADVANCED: (keyof FieldFilterState)[] = [
   'date_coverage_max',
   'date_created_from',
   'date_created_to',
+  'region_coverage_min',
+  'region_coverage_max',
+  'keywords',
 ]
 
 /**
@@ -278,34 +293,6 @@ export function FieldsTab({ scope }: { scope: Scope }) {
   const full = useFullscreen()
   const active: FieldFilterState = { ...filter, dataset_ids: datasetIds }
   const [openId, setOpenId] = useState<string | null>(null)
-  const [picked, setPicked] = useState<ReadonlySet<string>>(() => new Set())
-  const pick = (id: string, on: boolean) => {
-    if (on && picked.size >= MAX_PICKED) {
-      toast.error(`Select at most ${MAX_PICKED} fields at once`)
-      return
-    }
-    setPicked((prev) => {
-      const next = new Set(prev)
-      if (on) next.add(id)
-      else next.delete(id)
-      return next
-    })
-  }
-  const copy = useMutation({
-    mutationFn: async () => {
-      const outline = await catalog.outline(scope, { field_ids: [...picked] })
-      await navigator.clipboard.writeText(outline.text)
-      return outline
-    },
-    onSuccess: (outline) =>
-      toast.success(`Copied ${fmt.int(picked.size - outline.missing.length)} Data Fields`, {
-        description: outline.missing.length
-          ? `Not in this market, so left out: ${outline.missing.join(', ')}`
-          : 'Grouped by Category, Subcategory and Dataset, ready to paste into any LLM.',
-      }),
-    onError: (e) => toast.error('Could not copy the Data Fields', { description: errorMessage(e) }),
-  })
-
   // A new market starts at its first page.
   const label = scopeLabel(scope)
   const seen = useRef(label)
@@ -313,7 +300,6 @@ export function FieldsTab({ scope }: { scope: Scope }) {
     if (seen.current !== label) {
       seen.current = label
       page(0)
-      setPicked(new Set())
     }
   }, [label, page])
 
@@ -330,26 +316,52 @@ export function FieldsTab({ scope }: { scope: Scope }) {
     placeholderData: keepPreviousData,
   })
   const filtered = Object.values(active).some(isActive)
+  const rows = query.data?.results ?? []
+  const ticked = useTicked(scope)
+  const tickedIds = useMemo(() => new Set(ticked.map((f) => f.id)), [ticked])
+  const toggle = useFieldSelection((s) => s.toggle)
+  // The same selection a lab takes, copied as an outline grouped by category to paste into any LLM.
+  const copy = useMutation({
+    mutationFn: async () => {
+      const outline = await catalog.outline(scope, { field_ids: ticked.map((f) => f.id) })
+      await navigator.clipboard.writeText(outline.text)
+      return outline
+    },
+    onSuccess: (outline) =>
+      toast.success(`Copied ${fmt.int(ticked.length - outline.missing.length)} Data Fields`, {
+        description: outline.missing.length
+          ? `Not in this market, so left out: ${outline.missing.join(', ')}`
+          : 'Grouped by Category, Subcategory and Dataset, ready to paste into any LLM.',
+      }),
+    onError: (e) => toast.error('Could not copy the Data Fields', { description: errorMessage(e) }),
+  })
 
   return (
     // The fullscreen element paints its own ground: the page behind it is gone, and an
     // unpainted one shows through as the browser's default black.
-    <div ref={full.ref} className={cn(full.on && 'h-full overflow-auto bg-canvas p-4')}>
+    <div
+      ref={full.ref}
+      className={cn('flex flex-col gap-4', full.on && 'h-full overflow-auto bg-canvas p-4')}
+    >
       <Panel
         className={cn(full.on && 'rounded-none border-0')}
         title="Fields"
         actions={
           <>
-            {picked.size > 0 && (
-              <>
-                <Button variant="ghost" size="sm" onClick={() => setPicked(new Set())}>
-                  Clear
-                </Button>
-                <Button size="sm" onClick={() => copy.mutate()} disabled={copy.isPending}>
-                  <CopyIcon aria-hidden />
-                  Copy Selected Data Fields ({fmt.int(picked.size)})
-                </Button>
-              </>
+            {ticked.length > 0 && (
+              <Button
+                size="sm"
+                onClick={() => copy.mutate()}
+                disabled={copy.isPending || ticked.length > MAX_PICKED}
+                title={
+                  ticked.length > MAX_PICKED
+                    ? `Copy takes ${fmt.int(MAX_PICKED)} fields at most: untick some, or send them to a lab instead`
+                    : undefined
+                }
+              >
+                <CopyIcon aria-hidden />
+                Copy Selected Data Fields ({fmt.int(ticked.length)})
+              </Button>
             )}
             <Button variant="ghost" size="sm" onClick={full.toggle}>
               {full.on ? <MinimizeIcon /> : <MaximizeIcon />}
@@ -369,16 +381,27 @@ export function FieldsTab({ scope }: { scope: Scope }) {
           {query.isError && (query.data?.results.length ?? 0) > 0 && (
             <ErrorNotice error={query.error} title="Could not load fields" />
           )}
+          <Selection
+            scope={scope}
+            active={active}
+            sort={sort}
+            total={query.data?.total}
+            count={ticked.length}
+          />
           <DataTable
             label="Data fields"
-            rows={query.data?.results ?? []}
+            rows={rows}
             columns={columns}
             rowKey={(r) => r.field_id}
+            selected={tickedIds}
+            onSelect={(id, on) => {
+              const row = rows.find((r) => r.field_id === id)
+              if (row) toggle(scope, [row], on)
+            }}
+            onSelectAll={(on) => toggle(scope, rows, on)}
             sort={sort}
             onSort={setSort}
             onRowClick={(r) => setOpenId(r.field_id)}
-            selected={picked}
-            onSelect={pick}
             loading={query.isPending}
             error={query.error}
             maxHeight={full.on ? 'calc(100vh - 17rem)' : undefined}
@@ -399,6 +422,212 @@ export function FieldsTab({ scope }: { scope: Scope }) {
           container={full.on ? full.ref : undefined}
         />
       </Panel>
+      {ticked.length > 0 && <SelectionLists scope={scope} onOpen={setOpenId} />}
+    </div>
+  )
+}
+
+const SELECTED_COLUMNS: Column<DataFieldRow & { rank: number }>[] = [
+  {
+    key: 'rank',
+    header: '#',
+    width: '56px',
+    align: 'right',
+    cell: (r) => fmt.int(r.rank),
+  },
+  ...COLUMNS.filter((c) =>
+    [
+      'dataset_id',
+      'field_id',
+      'description',
+      'coverage',
+      'user_count',
+      'alpha_count',
+      'date_created',
+    ].includes(c.key),
+  ),
+]
+
+const EXCLUDED_COLUMNS: Column<DataFieldRow & { reason: string }>[] = [
+  ...COLUMNS.filter((c) => ['dataset_id', 'field_id', 'description'].includes(c.key)),
+  {
+    key: 'reason',
+    header: 'Excluded by',
+    width: 'minmax(140px,1.4fr)',
+    cell: (r) => <Text value={r.reason} className="text-status-warning" />,
+  },
+  ...COLUMNS.filter((c) => ['alpha_count', 'date_created'].includes(c.key)),
+]
+
+/**
+ * The selection split in two: Selected Fields, as a lab would get them and in that order, and
+ * below them the Excluded Fields an exclusion filter takes out. Unticking a row here drops it
+ * from the selection altogether.
+ */
+function SelectionLists({ scope, onOpen }: { scope: Scope; onOpen: (id: string) => void }) {
+  const split = useSelectionSplit(scope)
+  const toggle = useFieldSelection((s) => s.toggle)
+  const selected = useMemo(
+    () => split.selected.map((row, i) => ({ ...row, rank: i + 1 })),
+    [split.selected],
+  )
+  const excluded = useMemo(
+    () => split.excluded.map(({ row, reason }) => ({ ...row, reason })),
+    [split.excluded],
+  )
+  const drop = (rows: DataFieldRow[]) => (id: string, on: boolean) => {
+    const row = rows.find((r) => r.field_id === id)
+    if (row && !on) toggle(scope, [row], false)
+  }
+  const all = (rows: DataFieldRow[]) => new Set(rows.map((r) => r.field_id))
+
+  return (
+    <>
+      <Panel
+        title="Selected Fields"
+        description={`What a lab gets, in this order: ranked by ${split.rankBy}. Untick one to drop it from the selection.`}
+        actions={
+          <span className={STAT}>
+            <span className="num text-ink">{fmt.int(selected.length)}</span>
+            {selected.length === 1 ? 'field' : 'fields'}
+          </span>
+        }
+      >
+        {split.error ? (
+          <ErrorNotice error={split.error} title="Could not rank the selection" />
+        ) : null}
+        <DataTable
+          label="Selected fields"
+          rows={selected}
+          columns={SELECTED_COLUMNS}
+          rowKey={(r) => r.field_id}
+          selected={all(selected)}
+          onSelect={drop(selected)}
+          onRowClick={(r) => onOpen(r.field_id)}
+          loading={split.loading}
+          maxHeight="50vh"
+          empty="The exclusion filters take out every selected field."
+        />
+      </Panel>
+      {excluded.length > 0 && (
+        <Panel
+          title="Excluded Fields"
+          description="Selected, but left out by an exclusion filter. Loosen the filter to bring one back, or untick it to drop it."
+          actions={
+            <span className={STAT}>
+              <span className="num text-ink">{fmt.int(excluded.length)}</span>
+              {excluded.length === 1 ? 'field' : 'fields'}
+            </span>
+          }
+        >
+          <DataTable
+            label="Excluded fields"
+            rows={excluded}
+            columns={EXCLUDED_COLUMNS}
+            rowKey={(r) => r.field_id}
+            selected={all(excluded)}
+            onSelect={drop(excluded)}
+            onRowClick={(r) => onOpen(r.field_id)}
+            maxHeight="40vh"
+          />
+        </Panel>
+      )}
+    </>
+  )
+}
+
+/** The labs a selection of fields can be sent to. */
+const FIELD_LABS: { label: string; to: PickFrom }[] = [
+  { label: 'Search Lab', to: '/labs/search' },
+  { label: 'Basic Template Research', to: '/labs/template/basic' },
+  { label: 'LLM Power Pool Lab', to: '/labs/power-pool' },
+  { label: 'Region Agnostic Lab', to: '/labs/region-agnostic' },
+]
+
+/**
+ * The fields selected in this market, kept across pages and filters, and the way to send them
+ * to a lab: ranked by the table's sort as it stands when they are sent.
+ */
+function Selection({
+  scope,
+  active,
+  sort,
+  total,
+  count,
+}: {
+  scope: Scope
+  active: FieldFilterState
+  sort: Sort
+  total: number | undefined
+  count: number
+}) {
+  const picking = useDatasetPick((s) => s.active)
+  const { toggle, clear } = useFieldSelection()
+  const handOver = useHandOver()
+  const tooMany = (total ?? 0) > MAX_PICKED_FIELDS
+  const all = useMutation({
+    mutationFn: () =>
+      catalog.fields(scope, {
+        ...active,
+        sort_by: sort.key as FieldSortKey,
+        sort_desc: sort.desc,
+        limit: MAX_PICKED_FIELDS,
+        offset: 0,
+      }),
+    onSuccess: (page) => toggle(scope, page.results, true),
+  })
+
+  // The same split the pick bar and the lists below show, so all three agree.
+  const split = useSelectionSplit(scope)
+  const kept = split.loading ? count : split.selected.length
+  const excluded = count - kept
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-md border border-hairline bg-surface-2 px-3 py-2">
+      <span className={STAT}>
+        <span className="num text-ink">{fmt.int(kept)}</span>
+        {kept === 1 ? 'field' : 'fields'} selected
+      </span>
+      {excluded > 0 && (
+        <span className={cn(STAT, 'text-status-warning')}>
+          <span className="num">{fmt.int(excluded)}</span> excluded
+        </span>
+      )}
+      <Button
+        size="sm"
+        disabled={!total || tooMany}
+        loading={all.isPending}
+        title={
+          tooMany
+            ? `Narrow the filters to ${fmt.int(MAX_PICKED_FIELDS)} fields or fewer to select them all`
+            : undefined
+        }
+        onClick={() => all.mutate()}
+      >
+        Select All {fmt.int(total)} Filtered
+      </Button>
+      <Button size="sm" variant="ghost" disabled={count === 0} onClick={clear}>
+        Clear Selection
+      </Button>
+      <span className="min-w-0 flex-1 text-body-compact text-pretty text-ink-subtle">
+        {count > 0
+          ? `A lab gets only these, ranked by ${rankLabel(sort, active.search)}. Sort the table to rank them differently.`
+          : 'Tick fields to give a lab only those, ranked by how this table is sorted.'}
+      </span>
+      {!picking && count > 0 && (
+        <Menu
+          trigger={
+            <Button size="sm" variant="primary" loading={handOver.isPending}>
+              <FlaskConicalIcon />
+              Use in Lab
+            </Button>
+          }
+          items={FIELD_LABS.map((lab) => ({
+            label: lab.label,
+            onClick: () => handOver.mutate({ scope, to: lab.to, finish: false }),
+          }))}
+        />
+      )}
     </div>
   )
 }
@@ -470,7 +699,9 @@ function FieldFilters({ scope }: { scope: Scope }) {
       ...(filter.field_types ?? []),
     ]),
   ]
-  const advancedOn = ADVANCED.filter((k) => isActive(active[k])).length
+  const advancedOn = ADVANCED.filter((k) => isActive(active[k])).length + exclusionCount(filter)
+  // The exclusion half opens only beside a selection, which is all it ever acts on.
+
   const s = stats.data
 
   // A lab choosing datasets lands here: More Filters opens, lit, and scrolls into view.
@@ -578,8 +809,9 @@ function FieldFilters({ scope }: { scope: Scope }) {
             </>
           }
         >
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <div className="min-w-0 md:col-span-2 xl:col-span-3">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+            <section aria-label="Selection filters" className="flex min-w-0 flex-col gap-4">
+              <HalfTitle title="Selection filters" hint="What the table shows." />
               {tree.data ? (
                 <DatasetTree
                   scope={scope}
@@ -592,67 +824,258 @@ function FieldFilters({ scope }: { scope: Scope }) {
               ) : (
                 !tree.isError && <Skeleton className="h-40" />
               )}
-            </div>
-            {/* In the table's own column order, so a filter sits where its column does. Each
-                box shows this market's own bound until something is typed in it. */}
-            <Range
-              label="Pyramid Theme Multiplier"
-              bounds={s && [ratio(s.pyramid_multiplier_min), ratio(s.pyramid_multiplier_max)]}
-              step={0.1}
-              min={filter.pyramid_multiplier_min}
-              max={filter.pyramid_multiplier_max}
-              onChange={(pyramid_multiplier_min, pyramid_multiplier_max) =>
-                set({ pyramid_multiplier_min, pyramid_multiplier_max })
-              }
-            />
-            <Range
-              label="Instrument Coverage (%)"
-              bounds={s && [percent(s.coverage_min), percent(s.coverage_max)]}
-              scale={100}
-              min={filter.coverage_min}
-              max={filter.coverage_max}
-              onChange={(coverage_min, coverage_max) => set({ coverage_min, coverage_max })}
-            />
-            <Range
-              label="Date Coverage (%)"
-              bounds={s && [percent(s.date_coverage_min), percent(s.date_coverage_max)]}
-              scale={100}
-              min={filter.date_coverage_min}
-              max={filter.date_coverage_max}
-              onChange={(date_coverage_min, date_coverage_max) =>
-                set({ date_coverage_min, date_coverage_max })
-              }
-            />
-            <Range
-              label="Users"
-              bounds={s && [count(s.user_count_min), count(s.user_count_max)]}
-              min={filter.user_count_min}
-              max={filter.user_count_max}
-              onChange={(user_count_min, user_count_max) => set({ user_count_min, user_count_max })}
-            />
-            <Range
-              label="Alphas"
-              bounds={s && [count(s.alpha_count_min), count(s.alpha_count_max)]}
-              min={filter.alpha_count_min}
-              max={filter.alpha_count_max}
-              onChange={(alpha_count_min, alpha_count_max) =>
-                set({ alpha_count_min, alpha_count_max })
-              }
-            />
-            <MonthRange
-              label="Date Added"
-              months={s?.date_added ?? []}
-              counts={facets.data?.date_added}
-              from={filter.date_created_from}
-              to={filter.date_created_to}
-              onChange={(date_created_from, date_created_to) =>
-                set({ date_created_from, date_created_to })
-              }
-            />
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                {/* In the table's own column order, so a filter sits where its column does. Each
+                    box shows this market's own bound until something is typed in it. */}
+                <Range
+                  label="Pyramid Theme Multiplier"
+                  bounds={s && [ratio(s.pyramid_multiplier_min), ratio(s.pyramid_multiplier_max)]}
+                  step={0.1}
+                  min={filter.pyramid_multiplier_min}
+                  max={filter.pyramid_multiplier_max}
+                  onChange={(pyramid_multiplier_min, pyramid_multiplier_max) =>
+                    set({ pyramid_multiplier_min, pyramid_multiplier_max })
+                  }
+                />
+                <Range
+                  label="Instrument Coverage (%)"
+                  bounds={s && [percent(s.coverage_min), percent(s.coverage_max)]}
+                  scale={100}
+                  min={filter.coverage_min}
+                  max={filter.coverage_max}
+                  onChange={(coverage_min, coverage_max) => set({ coverage_min, coverage_max })}
+                />
+                <Range
+                  label="Date Coverage (%)"
+                  bounds={s && [percent(s.date_coverage_min), percent(s.date_coverage_max)]}
+                  scale={100}
+                  min={filter.date_coverage_min}
+                  max={filter.date_coverage_max}
+                  onChange={(date_coverage_min, date_coverage_max) =>
+                    set({ date_coverage_min, date_coverage_max })
+                  }
+                />
+                <Range
+                  label="Users"
+                  bounds={s && [count(s.user_count_min), count(s.user_count_max)]}
+                  min={filter.user_count_min}
+                  max={filter.user_count_max}
+                  onChange={(user_count_min, user_count_max) =>
+                    set({ user_count_min, user_count_max })
+                  }
+                />
+                <Range
+                  label="Alphas"
+                  bounds={s && [count(s.alpha_count_min), count(s.alpha_count_max)]}
+                  min={filter.alpha_count_min}
+                  max={filter.alpha_count_max}
+                  onChange={(alpha_count_min, alpha_count_max) =>
+                    set({ alpha_count_min, alpha_count_max })
+                  }
+                />
+                <MonthRange
+                  label="Date Added"
+                  months={s?.date_added ?? []}
+                  counts={facets.data?.date_added}
+                  from={filter.date_created_from}
+                  to={filter.date_created_to}
+                  onChange={(date_created_from, date_created_to) =>
+                    set({ date_created_from, date_created_to })
+                  }
+                />
+                {/* Only the region-agnostic market says how many regions hold a field. */}
+                {isRegionAgnostic(scope) && (
+                  <Range
+                    label="Regions per field (of 4)"
+                    min={filter.region_coverage_min}
+                    max={filter.region_coverage_max}
+                    onChange={(region_coverage_min, region_coverage_max) =>
+                      set({ region_coverage_min, region_coverage_max })
+                    }
+                  />
+                )}
+                <Keywords
+                  label="Keywords in Description"
+                  hint="Commas between words. A field shows when its Description has any of them."
+                  value={filter.keywords ?? []}
+                  onChange={(keywords) => set({ keywords })}
+                />
+              </div>
+            </section>
+            <ExclusionFilters scope={scope} names={names} market={tree.data} />
           </div>
         </Disclosure>
       </div>
     </div>
+  )
+}
+
+/** Heads one half of More filters once there are two. */
+function HalfTitle({ title, hint }: { title: string; hint: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <h3 className="text-title font-medium text-ink">{title}</h3>
+      <p className="text-body-compact text-pretty text-ink-subtle">{hint}</p>
+    </div>
+  )
+}
+
+/**
+ * The right half of More filters: what never shows, in the table or a selection. With fields
+ * selected its tree holds only the categories, subcategories and datasets they come from; with
+ * none, the whole market's, so a dataset can be kept out without selecting anything first.
+ */
+function ExclusionFilters({
+  scope,
+  names,
+  market,
+}: {
+  scope: Scope
+  names: Map<string, string>
+  /** The market's whole tree, for when nothing is selected. */
+  market: CatalogFacets | undefined
+}) {
+  const { filter, set } = useFieldFilter()
+  const ids = useTicked(scope).map((f) => f.id)
+  const picked = ids.length > 0
+  const selection = useQuery({
+    queryKey: ['catalog', 'facets', scope, 'selection', ids],
+    queryFn: () => catalog.facets(scope, { field_ids: ids }),
+    enabled: picked,
+    placeholderData: keepPreviousData,
+  })
+  const source = picked ? selection.data : market
+  return (
+    <section
+      aria-label="Exclusion filters"
+      className="flex min-w-0 flex-col gap-4 border-t border-hairline pt-6 lg:border-t-0 lg:border-l lg:pt-0 lg:pl-6"
+    >
+      <HalfTitle
+        title="Exclusion filters"
+        hint={
+          picked ? (
+            <>
+              What to leave out of the table and of your{' '}
+              <span className="num text-ink-muted">{fmt.int(ids.length)}</span> selected fields.
+              They come back when the filter goes.
+            </>
+          ) : (
+            'What never shows in the table, whatever else is chosen. It comes back when the filter goes.'
+          )
+        }
+      />
+      {picked && selection.isError && (
+        <ErrorNotice error={selection.error} title="Could not read the selected fields' datasets" />
+      )}
+      {source ? (
+        <DatasetTree
+          scope={scope}
+          title="Exclude datasets"
+          searchLabel={
+            picked
+              ? "Search the selection's categories, subcategories and datasets"
+              : 'Search categories, subcategories and datasets to exclude'
+          }
+          source={source}
+          counts={source}
+          names={names}
+          value={filter.exclude_dataset_ids ?? []}
+          onChange={(exclude_dataset_ids) => set({ exclude_dataset_ids })}
+        />
+      ) : (
+        !(picked && selection.isError) && <Skeleton className="h-40" />
+      )}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <DateRange
+          label="Exclude dates added"
+          hint="Leaves out fields added between these. Either end can be left open."
+          min={filter.exclude_date_min}
+          max={filter.exclude_date_max}
+          onChange={(exclude_date_min, exclude_date_max) =>
+            set({ exclude_date_min, exclude_date_max })
+          }
+        />
+        <Keywords
+          label="Exclude keywords in Description"
+          hint="Commas between words. Leaves out any field whose Description has one."
+          value={filter.exclude_keywords ?? []}
+          onChange={(exclude_keywords) => set({ exclude_keywords })}
+        />
+      </div>
+    </section>
+  )
+}
+
+/** A from–to pair of dates, `YYYY-MM-DD`. */
+function DateRange({
+  label,
+  hint,
+  min,
+  max,
+  onChange,
+}: {
+  label: string
+  hint: string
+  min: string | null | undefined
+  max: string | null | undefined
+  onChange: (min: string | null, max: string | null) => void
+}) {
+  return (
+    <Fieldset legend={label} hint={hint}>
+      <div className="grid grid-cols-2 gap-2">
+        <Input
+          type="date"
+          aria-label={`${label} from`}
+          value={min ?? ''}
+          max={max ?? undefined}
+          onChange={(e) => onChange(e.target.value || null, max ?? null)}
+        />
+        <Input
+          type="date"
+          aria-label={`${label} to`}
+          value={max ?? ''}
+          min={min ?? undefined}
+          onChange={(e) => onChange(min ?? null, e.target.value || null)}
+        />
+      </div>
+    </Fieldset>
+  )
+}
+
+/** Words typed freely, comma-separated, sent a beat after typing stops. */
+function Keywords({
+  label,
+  hint,
+  value,
+  onChange,
+}: {
+  label: string
+  hint: string
+  value: string[]
+  onChange: (words: string[]) => void
+}) {
+  const [text, setText] = useState(value.join(', '))
+  const words = useDebounced(text, 300)
+  const joined = value.join(',')
+  // A reset elsewhere empties the box too.
+  useEffect(() => {
+    if (joined === '') setText((t) => (t.trim() ? '' : t))
+  }, [joined])
+  useEffect(() => {
+    const next = words
+      .split(',')
+      .map((w) => w.trim())
+      .filter(Boolean)
+    if (next.join(',') !== joined) onChange(next)
+  }, [words, joined, onChange])
+  return (
+    <Field label={label} hint={hint}>
+      <Input
+        placeholder="e.g. earnings, revision"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+      />
+    </Field>
   )
 }
 

@@ -1,11 +1,14 @@
 /** The Datasets and Settings panels of a lab task, and the task settings every lab asks for. */
 
-import { DatabaseIcon, FilterIcon } from 'lucide-react'
+import { DatabaseIcon, FilterIcon, XIcon } from 'lucide-react'
+import type { ReactNode } from 'react'
 import type { Scope } from '@/api/types'
+import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useCores } from '@/lib/preferences'
 import { isRegionAgnostic, regionLabel, useScopeOptions } from '@/lib/scope'
 import { DatasetChips, useDatasetTree } from '@/screens/data/dataset-chips'
+import type { PickedField } from '@/screens/data/dataset-pick'
 import { describeFilter, type FieldFilterState } from '@/screens/data/state'
 import { NeutralizationPicker } from '@/screens/research-labs/neutralization'
 import {
@@ -84,60 +87,152 @@ export interface LabPlan {
   warnings: string[]
 }
 
+/** One removable chip: a dataset, or a ranked field. */
+function Chip({
+  label,
+  title,
+  rank,
+  mono,
+  onRemove,
+}: {
+  label: string
+  title: string
+  rank?: number
+  mono?: boolean
+  onRemove: () => void
+}) {
+  return (
+    <span
+      title={title}
+      className="inline-flex h-7 max-w-full items-center gap-1 rounded-sm border border-hairline-strong bg-surface-3 pr-1 pl-2 text-body-compact text-ink"
+    >
+      {rank !== undefined && <span className="num text-ink-subtle">{rank}</span>}
+      <span className={cn('truncate', mono && 'num', rank === undefined && 'pl-1')}>{label}</span>
+      <button
+        type="button"
+        aria-label={`Remove ${label}`}
+        className="shrink-0 rounded-xs p-0.5 text-ink-subtle transition-colors hover:text-ink"
+        onClick={onRemove}
+      >
+        <XIcon className="size-3.5" />
+      </button>
+    </span>
+  )
+}
+
 export function DatasetsPanel({
   ids,
   scope,
+  fields = [],
+  rankBy,
   onChoose,
   onRemove,
+  onRemoveField,
+  onUseDatasets,
   filter,
   onClearFilter,
+  title = 'Datasets and Fields',
+  children,
 }: {
   ids: string[]
   /** The market the datasets belong to, which places each under its category. */
   scope: Scope
+  /** Single fields chosen instead of whole datasets, in rank order; `ids` are theirs. */
+  fields?: PickedField[]
+  rankBy?: string | null
   onChoose: () => void
   onRemove: (ids: string[]) => void
+  onRemoveField?: (id: string) => void
+  /** Drops the chosen fields and keeps their datasets, whole. */
+  onUseDatasets?: () => void
   /** The Data Explorer's filter the datasets were chosen under, which narrows their fields. */
-  filter: FieldFilterState | null | undefined
-  onClearFilter: () => void
+  filter?: FieldFilterState | null | undefined
+  onClearFilter?: () => void
+  title?: string
+  /** More of what the task is given to work from, under the datasets: the LLM lab's prompt. */
+  children?: ReactNode
 }) {
-  const chosen = ids.length > 0
+  const chosen = ids.length > 0 || fields.length > 0
   const { tree, nameOf, ready } = useDatasetTree(chosen ? scope : null)
+  const chips = (
+    <DatasetChips tree={tree} value={ids} nameOf={nameOf} onRemove={onRemove} ready={ready} />
+  )
   return (
     <Panel
-      title="Datasets"
+      title={title}
       actions={
         chosen && (
           <Button size="sm" onClick={onChoose}>
             <DatabaseIcon />
-            Choose Datasets
+            Choose Datasets or Fields
           </Button>
         )
       }
     >
-      {chosen ? (
+      {fields.length > 0 ? (
         <div className="flex flex-col gap-3">
-          <DatasetChips tree={tree} value={ids} nameOf={nameOf} onRemove={onRemove} ready={ready} />
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-body-compact text-pretty text-ink-muted">
+              <span className="num text-ink">{fmt.int(fields.length)}</span> chosen{' '}
+              {fields.length === 1 ? 'field' : 'fields'}
+              {rankBy ? (
+                <>
+                  , ranked by <span className="text-ink">{rankBy}</span>
+                </>
+              ) : null}
+              . The task uses only these, in this order.
+            </p>
+            {onUseDatasets && (
+              <Button size="sm" variant="ghost" onClick={onUseDatasets}>
+                Use Whole Datasets Instead
+              </Button>
+            )}
+          </div>
+          <ol aria-label="Chosen fields" className="flex max-h-56 flex-wrap gap-1.5 overflow-auto">
+            {fields.map((f, i) => (
+              <li key={f.id} className="max-w-full">
+                <Chip
+                  rank={i + 1}
+                  label={f.id}
+                  title={`${f.id} · ${nameOf(f.dataset)}`}
+                  mono
+                  onRemove={() => onRemoveField?.(f.id)}
+                />
+              </li>
+            ))}
+          </ol>
+          <div className="flex flex-col gap-1.5">
+            <span className="text-caption font-medium text-ink-subtle">From</span>
+            {chips}
+          </div>
+        </div>
+      ) : chosen ? (
+        <div className="flex flex-col gap-3">
+          {chips}
           {filter && (
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-body-compact text-ink-subtle">
               <FilterIcon className="size-3.5 shrink-0" aria-hidden />
               <span className="min-w-0">
-                Only fields matching {describeFilter(filter, scope.region).join(' \u00b7 ')}
+                Only fields matching {describeFilter(filter, scope.region).join(' · ')}
               </span>
-              <Button size="sm" variant="ghost" onClick={onClearFilter}>
-                Use All Fields
-              </Button>
+              {onClearFilter && (
+                <Button size="sm" variant="ghost" onClick={onClearFilter}>
+                  Use All Fields
+                </Button>
+              )}
             </div>
           )}
         </div>
       ) : (
-        <Empty title="No datasets chosen" icon={<DatabaseIcon />}>
+        <Empty title="No datasets or fields chosen" icon={<DatabaseIcon />}>
+          Tick whole datasets, or single fields ranked by how you sort them, in the Data Explorer.
           <Button className="mt-2" onClick={onChoose}>
             <DatabaseIcon />
-            Choose Datasets
+            Choose Datasets or Fields
           </Button>
         </Empty>
       )}
+      {children && <div className="mt-4 border-t border-hairline pt-4">{children}</div>}
     </Panel>
   )
 }

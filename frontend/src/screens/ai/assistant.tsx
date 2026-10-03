@@ -22,6 +22,7 @@ import {
   type Reasoning,
 } from '@/screens/ai/api'
 import { DatasetChips, useDatasetTree } from '@/screens/data/dataset-chips'
+import { PromptPicker, useChosenPrompt } from '@/screens/prompts/picker'
 import {
   Button,
   Empty,
@@ -66,6 +67,8 @@ export function Assistant({ threadId }: { threadId: number | null }) {
   const [text, setText] = useState('')
   const [model, setModel] = useState<string | null>(null)
   const [reasoning, setReasoning] = useState<Reasoning | null>(null)
+  const [chosenPrompt, setPrompt] = useState<number | null>(null)
+  const promptId = useChosenPrompt('assistant', chosenPrompt)
   const [last, setLast] = useState<ChatReply | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const scroller = useRef<HTMLElement>(null)
@@ -111,6 +114,7 @@ export function Assistant({ threadId }: { threadId: number | null }) {
         model: modelValue,
         reasoning: reasoningValue,
         dataset_ids: [],
+        prompt_id: promptId,
       }),
     onSuccess: async (reply) => {
       setLast(reply)
@@ -366,6 +370,13 @@ export function Assistant({ threadId }: { threadId: number | null }) {
                 }))}
                 value={reasoningValue}
                 onChange={setReasoning}
+                disabled={say.isPending}
+              />
+              <PromptPicker
+                kind="assistant"
+                className="max-w-56"
+                value={promptId}
+                onChange={setPrompt}
                 disabled={say.isPending}
               />
               <span className="ml-auto hidden items-center gap-1 sm:inline-flex">

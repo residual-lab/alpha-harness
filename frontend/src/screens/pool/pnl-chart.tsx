@@ -15,6 +15,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import { useEffect, useMemo, useRef } from 'react'
+import { cn } from '@/lib/cn'
 
 /** A theme variable's value, since a canvas cannot read CSS variables (`@theme static` emits them all). */
 export const theme = (name: string) =>
@@ -146,10 +147,12 @@ export function PnlChart({
   values,
   dates,
   label = 'Cumulative PnL',
+  className,
 }: {
   values: number[]
   dates?: string[]
   label?: string
+  className?: string
 }) {
   const element = useRef<HTMLDivElement>(null)
 
@@ -191,5 +194,12 @@ export function PnlChart({
     return () => chart.remove()
   }, [values, dates])
 
-  return <div ref={element} role="img" aria-label={label} className="h-72 w-full min-w-0" />
+  return (
+    <div
+      ref={element}
+      role="img"
+      aria-label={label}
+      className={cn('h-72 w-full min-w-0', className)}
+    />
+  )
 }

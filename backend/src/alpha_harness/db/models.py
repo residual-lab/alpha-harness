@@ -520,6 +520,25 @@ class ChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
 
+class SavedPrompt(Base):
+    """A system prompt the user wrote or copied, for one of the built-ins' jobs.
+
+    ``kind`` is the slug of the built-in it stands in for (``llm.prompts.PROMPTS``), which is
+    where it can be chosen: a Power Pool prompt answers in a shape the Assistant cannot read.
+    """
+
+    __tablename__ = "llm_prompt"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    body: Mapped[str] = mapped_column(Text, default="")
+    #: What it was copied from: a built-in's slug, or another saved prompt's name.
+    based_on: Mapped[str | None] = mapped_column(String(160))
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
+
+
 class ApiKey(Base):
     """An assistant key. Sealed at rest; only a masked hint is ever shown.
 
