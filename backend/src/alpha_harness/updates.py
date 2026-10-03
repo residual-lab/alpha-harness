@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 
 PACKAGE = "alpha-harness"
+#: Written in by the release workflow as the repository that built the wheel, so a fork's
+#: build updates from that fork. The launcher is stamped to match and refuses any other wheel.
 REPOSITORY = "residual-lab/alpha-harness"
 RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 #: Where a person goes to fetch a release by hand, when the app cannot do it for them.

@@ -111,6 +111,23 @@ jobs:
       - name: Stamp the version into pyproject
         run: cd backend && uv version --frozen "$VERSION"
 
+      # The repository that built this wheel, so a fork's build updates from that fork rather
+      # than offering upstream's releases. The launcher job stamps the same value: it refuses
+      # any wheel URL outside its own repository.
+      - name: Stamp the repository into the updater
+        run: |
+          uv run --no-project python - <<'PY'
+          import os, pathlib
+          path = pathlib.Path("backend/src/alpha_harness/updates.py")
+          text = path.read_text(encoding="utf-8")
+          old = 'REPOSITORY = "residual-lab/alpha-harness"'
+          if old not in text:
+              raise SystemExit(f"::error::{old!r} not found — the constant was renamed")
+          new = f'REPOSITORY = "{os.environ["GITHUB_REPOSITORY"]}"'
+          path.write_text(text.replace(old, new), encoding="utf-8")
+          print(new)
+          PY
+
       - run: cd backend && uv build --wheel
       # With hashes: the launcher installs every dependency through this file, and uv refuses
       # an artefact whose hash does not match one listed here. The project's own wheel is not
@@ -185,26 +202,32 @@ jobs:
           cp "$UV_PATH" launcher/uv
           ./launcher/uv --version
 
-      # A fresh machine installs exactly the version this launcher shipped with; the in-app
-      # updater moves it on from there.
+      # A fresh machine installs exactly the version this launcher shipped with, from the
+      # repository that built it; the in-app updater moves it on from there. The repository
+      # matches the wheel job's stamp, so a fork's launcher downloads and accepts its own wheels.
       #
       # Python, not `sed -i`: Git Bash rewrites in place by renaming a temp file, which on
       # Windows contends with the checkout's own handles and mangles CRLF. And a stamp that
       # silently misses ships BUILD_VERSION = "0.0.0", whose download URL 404s on every fresh
       # install — so a miss has to fail the build, which `sed` would not do.
-      - name: Stamp the version
+      - name: Stamp the version and repository
         shell: bash
         run: |
           uv run --no-project python - <<'PY'
           import os, pathlib
           path = pathlib.Path("launcher/alpha_harness_launcher.py")
           text = path.read_text(encoding="utf-8")
-          old = 'BUILD_VERSION = "0.0.0"'
-          if old not in text:
-              raise SystemExit(f"::error::{old!r} not found — the constant was renamed")
-          new = f'BUILD_VERSION = "{os.environ["VERSION"]}"'
-          path.write_text(text.replace(old, new), encoding="utf-8")
-          print(new)
+          stamps = {
+              'BUILD_VERSION = "0.0.0"': f'BUILD_VERSION = "{os.environ["VERSION"]}"',
+              'REPOSITORY = "residual-lab/alpha-harness"':
+                  f'REPOSITORY = "{os.environ["GITHUB_REPOSITORY"]}"',
+          }
+          for old, new in stamps.items():
+              if old not in text:
+                  raise SystemExit(f"::error::{old!r} not found — the constant was renamed")
+              text = text.replace(old, new)
+              print(new)
+          path.write_text(text, encoding="utf-8")
           PY
 
       - name: Build AlphaHarness.exe

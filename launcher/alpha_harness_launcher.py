@@ -34,6 +34,7 @@ from alpha_harness.window import open_window
 
 #: Written in by the release workflow; the version a fresh machine installs.
 BUILD_VERSION = "0.0.0"
+#: Written in alongside it: the repository that built this exe, which must match the wheel's.
 REPOSITORY = "residual-lab/alpha-harness"
 DOWNLOAD = f"https://github.com/{REPOSITORY}/releases/download"
 
