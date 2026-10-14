@@ -226,26 +226,46 @@ class Backfill:
     async def _sync_submitted(self, task: Any) -> None:
         try:
             await self.tasks.update(task, detail="Listing SUBMITTED Alphas", progress=None)
-            ids: list[str] = []
+            # A dict, not a list: the window overlap below lists a few alphas twice.
+            seen: dict[str, None] = {}
             offset = 0
+            before: datetime | None = None
             while True:
+                filters = [Filter("status", "!=", "UNSUBMITTED")]
+                if before is not None:
+                    filters.append(Filter("dateSubmitted", "<", before))
                 page = await self.endpoints.list_alphas(
                     AlphaQuery(
                         limit=PAGE,
                         offset=offset,
                         order="-dateSubmitted",
-                        filters=[Filter("status", "!=", "UNSUBMITTED")],
+                        filters=filters,
                     )
                 )
                 results = page.get("results") or []
                 alphas = [Alpha.model_validate(raw) for raw in results]
                 await self.vault.save_alphas(alphas)
                 # A region-agnostic parent has no PnL of its own: its submitted children do.
-                ids.extend(a.id for a in alphas if a.type != SimulationType.RA_PARENT)
-                await self.tasks.update(task, detail=f"Listed {len(ids)} SUBMITTED Alphas")
+                seen.update(
+                    dict.fromkeys(a.id for a in alphas if a.type != SimulationType.RA_PARENT)
+                )
+                await self.tasks.update(task, detail=f"Listed {len(seen)} SUBMITTED Alphas")
                 if len(results) < PAGE:
                     break
                 offset += PAGE
+                if offset > MAX_OFFSET:
+                    # The same window step as :meth:`_import_alphas`, on ``dateSubmitted``:
+                    # newest first, so continue below the oldest submission seen, one second
+                    # past it because ``<`` is strict and the upsert makes the overlap harmless.
+                    oldest = alphas[-1].date_submitted
+                    if oldest is None:
+                        break
+                    bound = oldest + timedelta(seconds=1)
+                    if before is not None and bound >= before:
+                        log.warning("vault.submitted_window_stuck", alphas=len(seen))
+                        break
+                    before, offset = bound, 0
+            ids = list(seen)
 
             # A simulated series never changes, so one already stored is not fetched again.
             missing = await self.vault.lacking_series(ids)
