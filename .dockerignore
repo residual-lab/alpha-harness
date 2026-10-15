@@ -1,0 +1,11 @@
+*
+!backend/pyproject.toml
+!backend/uv.lock
+!backend/.python-version
+!backend/src/
+!frontend/
+
+**/node_modules
+**/__pycache__
+**/*.tsbuildinfo
+backend/src/alpha_harness/web

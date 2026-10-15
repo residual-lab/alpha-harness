@@ -1,0 +1,18 @@
+services:
+    alpha-harness:
+        image: ghcr.io/residual-lab/alpha-harness:latest
+        user: "${HARNESS_UID:-1000}:${HARNESS_GID:-1000}"
+        restart: unless-stopped
+        environment:
+            ALPHA_HARNESS_ORIGIN: ${ALPHA_HARNESS_ORIGIN:-}
+        expose:
+            - 8000
+        volumes:
+            - type: bind
+              source: ${HARNESS_DATA:-~/.alpha-harness}
+              target: /home/harness/.alpha-harness
+              bind:
+                  create_host_path: false
+
+        stop_grace_period: 30s
+

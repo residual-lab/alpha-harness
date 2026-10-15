@@ -52,6 +52,7 @@ from .api import (
 from .api.auth import Session
 from .api.deps import install_exception_handlers
 from .api.update import stop_server
+from .config import ALLOWED_HOSTS
 from .schemas import Out
 from .state import AppState
 
@@ -139,18 +140,21 @@ def create_app() -> FastAPI:
 
     # DNS rebinding: a page whose hostname resolves to 127.0.0.1 is "same-origin" to the
     # browser, so the header checks below pass. Its Host header still names that hostname.
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=sorted(ALLOWED_HOSTS))
 
     @app.middleware("http")
     async def require_client_header(request: Request, call_next: Any) -> Any:
         """Refuse requests another page started, and writes that lack the UI's custom header.
 
         CORS only hides the response of a "simple" cross-site request; it does not stop it
-        running, and some GETs spend BRAIN quota, so Sec-Fetch-Site guards every method
-        (same-origin from the Vite proxy, none from a typed URL). The custom header covers
-        writes from clients that send no Sec-Fetch-Site.
+        running, and some GETs spend BRAIN quota, so Sec-Fetch-Site guards every API method
+        (same-origin from the Vite proxy, none from a typed URL). The page itself is served to
+        any navigation, since following a link or a proxy's login redirect is never same-origin.
+        The custom header covers writes from clients that send no Sec-Fetch-Site.
         """
-        if request.headers.get("sec-fetch-site", "none") not in {"same-origin", "none"}:
+        if request.url.path.startswith("/api") and request.headers.get(
+            "sec-fetch-site", "none"
+        ) not in {"same-origin", "none"}:
             return JSONResponse(
                 {"detail": {"code": "forbidden", "message": "Requests must come from the app."}},
                 status_code=403,
