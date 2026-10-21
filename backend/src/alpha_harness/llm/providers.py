@@ -124,6 +124,16 @@ PROVIDERS: dict[str, Provider] = {
         limits_url="https://huggingface.co/docs/inference-providers/pricing",
         key_hint="hf_…",
     ),
+    # --- local, and yours alone ---
+    "ollama": Provider(
+        id="ollama",
+        label="Ollama (local)",
+        base_url="http://localhost:11434/v1",
+        onboarding_url="https://ollama.com/download",
+        limits_url="https://ollama.com/library",
+        key_hint="anything - Ollama ignores it",
+        tier_note="Runs on this machine. Nothing sent here leaves it.",
+    ),
     # --- bring your own, and your own bill ---------------------------------------------
     #
     # Everything above is free because the assistant is optional and a card turns an
