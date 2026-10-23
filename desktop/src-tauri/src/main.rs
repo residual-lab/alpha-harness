@@ -6,12 +6,17 @@
 
 mod supervisor;
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
+use tauri::webview::NewWindowResponse;
+use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+
+/// Labels for the windows the page opens, each its own: two may be open at once.
+static OPENED: AtomicU32 = AtomicU32::new(0);
 
 /// The step the supervisor is on, for a start-up page that loads after it was announced.
 #[derive(Default)]
@@ -32,6 +37,59 @@ pub fn show(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// BRAIN's own pages: its identity check, and the Alpha and competition links the app shows.
+fn on_brain(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    // The domain itself or one under it, never a name that merely ends the same way.
+    let under = host.strip_suffix("worldquantbrain.com");
+    url.scheme() == "https" && under.is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
+}
+
+/// The main window, built here rather than by the config so that it can answer `window.open`.
+///
+/// With no handler, WebView2 refuses every new window and `window.open` returns `null`: BRAIN's
+/// identity check could not open, so a sign-in that needed one never finished. BRAIN's pages
+/// open in a window of their own, kept as the page's opener so the sign-in can close it once
+/// BRAIN accepts the check; anything else is still refused, as before.
+fn main_window(app: &AppHandle) -> tauri::Result<()> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .cloned()
+        .expect("tauri.conf.json defines the main window");
+    let app_ = app.clone();
+    WebviewWindowBuilder::from_config(app, &config)?
+        .on_new_window(move |url, features| {
+            if !on_brain(&url) {
+                return NewWindowResponse::Deny;
+            }
+            let label = format!("brain-{}", OPENED.fetch_add(1, Ordering::Relaxed));
+            let built = WebviewWindowBuilder::new(
+                &app_,
+                label,
+                WebviewUrl::External("about:blank".parse().expect("a valid URL")),
+            )
+            .window_features(features)
+            .on_document_title_changed(|window, title| {
+                let _ = window.set_title(&title);
+            })
+            .title(url.as_str())
+            .build();
+            match built {
+                Ok(window) => NewWindowResponse::Create { window },
+                Err(error) => {
+                    supervisor::note(&format!("could not open {url}: {error}"));
+                    NewWindowResponse::Deny
+                }
+            }
+        })
+        .build()?;
+    Ok(())
 }
 
 fn tray(app: &AppHandle) -> tauri::Result<()> {
@@ -102,13 +160,17 @@ fn main() {
         .manage(Status::default())
         .invoke_handler(tauri::generate_handler![startup_status])
         .setup(|app| {
+            main_window(app.handle())?;
             tray(app.handle())?;
             supervisor::spawn(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing the window keeps Alpha Harness in the tray, so tasks keep simulating.
-            if let WindowEvent::CloseRequested { api, .. } = event {
+            // Closing the window keeps Alpha Harness in the tray, so tasks keep simulating. A
+            // window the page opened closes for good.
+            if let WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == "main"
+            {
                 api.prevent_close();
                 let _ = window.hide();
             }
