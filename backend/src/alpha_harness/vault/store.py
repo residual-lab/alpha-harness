@@ -336,6 +336,9 @@ def _page_row(r: dict[str, Any]) -> dict[str, Any]:
 
 def _by_alpha[T](ids: list[str], days: list[date], values: list[T]) -> dict[str, dict[date, T]]:
     """Rows sorted by Alpha, each Alpha's days made a dict in one go rather than row by row."""
+    # No rows means no starts, but ``ends`` below would still hold ``len(ids)``.
+    if not ids:
+        return {}
     starts = [i for i in range(len(ids)) if i == 0 or ids[i] != ids[i - 1]]
     ends = [*starts[1:], len(ids)]
     return {
