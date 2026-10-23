@@ -72,9 +72,12 @@ def selections(limit: int) -> list[Recipe]:
 #: Weighting schemes from BRAIN's own combo examples and their risk-aware variants.
 COMBOS = [
     Recipe("Equal weight", "1"),
+    # Rolling IR as mean / std dev: ``ts_ir`` is not offered to every account, and BRAIN
+    # rejects a combo using it ("inaccessible or unknown operator").
     Recipe(
-        "Rolling IR",
-        "stats = generate_stats(alpha);\nmax(ts_ir(stats.returns, 250), 0)",
+        "Rolling Sharpe",
+        "stats = generate_stats(alpha);\n"
+        "max(ts_mean(stats.returns, 250) / (ts_std_dev(stats.returns, 250) + 0.0001), 0)",
     ),
     Recipe(
         "Least crowded",
