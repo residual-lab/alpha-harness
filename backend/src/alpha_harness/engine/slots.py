@@ -30,8 +30,8 @@ from ..brain.errors import (
     BrainValidationError,
 )
 from ..brain.filters import platform_midnight
-from ..brain.platform import MULTI_SIMULATION_SIZE, SIMULATION_SLOTS
-from ..brain.schemas import QUICK_MODE, SimulationRequest
+from ..brain.platform import MULTI_SIMULATION_SIZE, SIMULATION_SLOTS, SUPER_ALPHA_SLOTS
+from ..brain.schemas import QUICK_MODE, SimulationRequest, SimulationType
 from ..db.models import ACTIVE, DedupEntry, SimStatus, SimulationRecord, Study, TaskQuota, utcnow
 from ..tasks import spawn
 from .awake import StayAwake
@@ -565,8 +565,18 @@ class BatchEngine:
 
         quotas = await self.quotas()
         demand = demand_by_task(items, self.max_batch)
+        # BRAIN runs three SuperAlphas at once, whatever is idle: a fourth would draw a 429,
+        # which holds every task's sends back until it clears.
+        ceilings = {
+            i.task: SUPER_ALPHA_SLOTS for i in items if i.key.sim_type == SimulationType.SUPER
+        }
         allocation = allocate_slots(
-            free, demand=demand, quotas=quotas, in_flight=in_flight, lend=self.lend_idle_cores
+            free,
+            demand=demand,
+            quotas=quotas,
+            in_flight=in_flight,
+            lend=self.lend_idle_cores,
+            ceilings=ceilings,
         )
         if not allocation:
             return 0

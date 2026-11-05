@@ -137,6 +137,9 @@ ALTER TABLE alpha ADD COLUMN IF NOT EXISTS simulation_mode VARCHAR;
 -- A submitted Alpha's own Production and Self-Correlation, as BRAIN lists it.
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS prod_correlation DOUBLE;
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS self_correlation DOUBLE;
+-- BRAIN's in-sample block as JSON in its own names: its breakdowns, such as Investability
+-- Constrained, and its checks.
+ALTER TABLE alpha ADD COLUMN IF NOT EXISTS brain VARCHAR;
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS tags VARCHAR;
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS classifications VARCHAR;
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS pyramids VARCHAR;
@@ -273,6 +276,7 @@ ALPHA_COLUMNS = (
     "language",
     "pasteurization",
     "nan_handling",
+    "brain",
 )
 
 #: Written only with an Alpha that has a ``train`` block (see ``AlphaVault.save_alphas``).
@@ -411,6 +415,9 @@ class Catalog:
         self.path = path
         self._conn: duckdb.DuckDBPyConnection | None = None
         self._lock = asyncio.Lock()
+        #: Bumped as each write finishes, so what was worked out from a read can tell when it
+        #: has gone stale without reading again.
+        self.revision = 0
         #: Reads in flight. Futures rather than a count: a cancelled caller does not stop
         #: its thread, and ``close`` must wait for the thread, not the caller.
         self._reads: set[asyncio.Future[Any]] = set()
@@ -526,6 +533,8 @@ class Catalog:
                 # again, so it is reopened here: one failed write must not fail every later one.
                 await asyncio.to_thread(self._reopen_sync)
                 raise CatalogUnusableError(str(exc)) from exc
+            finally:
+                self.revision += 1
 
     def _reopen_sync(self) -> None:
         conn, self._conn = self._conn, None

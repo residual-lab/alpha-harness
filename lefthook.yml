@@ -68,11 +68,6 @@ check:
       run: >-
         uv run ruff check . && uv run ruff format --check . && uv run pyproject-fmt --check pyproject.toml
         && uv run pyrefly check && uv run basedpyright
-    # The Windows launcher is frozen separately and imports nothing from the backend, so it
-    # sits outside the package and would otherwise be the one Python here nothing checks.
-    - name: launcher
-      root: backend/
-      run: uv run ruff check ../launcher && uv run ruff format --check ../launcher
     - name: frontend
       root: frontend/
       run: pnpm check

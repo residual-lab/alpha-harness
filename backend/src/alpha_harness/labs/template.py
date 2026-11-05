@@ -406,6 +406,43 @@ def single_dataset(
     return len(known) == len(sources) and len(frozenset[str]().union(*known)) == 1
 
 
+def most_pyramids(
+    tree: Node,
+    sized: Size,
+    typed: dict[str, list[str]],
+    categories: dict[str, str],
+    slot_categories: dict[str, frozenset[str] | None],
+) -> int | None:
+    """The most dataset categories one Alpha the template makes reads: BRAIN's pyramids, which
+    leave grouping fields out. ``None`` until every field's category is known, ``categories`` by
+    field read and ``slot_categories`` by field variable.
+
+    A variable of values reads one value at a time and a field variable one field, so each
+    adds at most what its widest choice brings beyond the template's own fields.
+    """
+    defined = assigned(tree)
+    fixed = data_names(tree, defined)
+    if any(n not in categories for n in fixed):
+        return None
+    base = {categories[n] for n in fixed}
+    written = uses(tree, lambda _: False)
+    choices: list[list[set[str]]] = []
+    for name, listed in typed.items():
+        if name in written and written[name].inputs:
+            names = [data_names(_value(v), defined) for v in listed]
+            if any(n not in categories for each in names for n in each):
+                return None
+            choices.append([{categories[n] for n in each} for each in names])
+    for slot in sized.slots:
+        found = slot_categories.get(slot)
+        if found is None:
+            return None
+        choices.append([{c} for c in found])
+    reachable = base.union(*(c for options in choices for c in options))
+    added = sum(max((len(c - base) for c in options), default=0) for options in choices)
+    return min(len(reachable), len(base) + added)
+
+
 # --- the search ---------------------------------------------------------------
 
 

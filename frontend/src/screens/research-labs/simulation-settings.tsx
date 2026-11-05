@@ -37,8 +37,11 @@ export const truncationOf = (text: string): number | null => {
 }
 
 /** BRAIN's `P{years}Y{months}M0D`, from the two boxes. */
-export const testPeriodOf = (years: string, months: string) =>
-  `P${clamp(years, MAX_TEST_PERIOD_YEARS)}Y${clamp(months, MAX_TEST_PERIOD_MONTHS)}M0D`
+export const testPeriodOf = (years: string, months: string) => {
+  const whole = clamp(years, MAX_TEST_PERIOD_YEARS)
+  // BRAIN's longest is six years exactly, so months only go with fewer years.
+  return `P${whole}Y${whole === MAX_TEST_PERIOD_YEARS ? 0 : clamp(months, MAX_TEST_PERIOD_MONTHS)}M0D`
+}
 
 /**
  * Decay, Truncation, NaN Handling and Test Period — Test Period in years *and* months, as BRAIN
@@ -158,29 +161,39 @@ export function SimulationSettingsFields({
           beside the boxes rather than above them, so this reads as one control on one line
           and its inputs share a baseline with Decay and Truncation. */}
       <Fieldset legend="Test Period" className={TILE}>
-        <div className="flex items-center gap-2">
-          <Input
-            type="number"
-            min={0}
-            max={MAX_TEST_PERIOD_YEARS}
-            step={1}
-            aria-label="Test period, years"
-            className="min-w-0 flex-1"
-            value={testYears}
-            onChange={(e) => setTestYears(e.target.value)}
-          />
-          <span className="shrink-0 text-body-compact text-ink-subtle">Years</span>
-          <Input
-            type="number"
-            min={0}
-            max={11}
-            step={1}
-            aria-label="Test period, months"
-            className="min-w-0 flex-1"
-            value={testMonths}
-            onChange={(e) => setTestMonths(e.target.value)}
-          />
-          <span className="shrink-0 text-body-compact text-ink-subtle">Months</span>
+        {/* Each box keeps room for its number: squeezed to nothing in a narrow tile, the two
+            read as empty and as if typing did nothing. Months wraps under Years instead. */}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <span className="flex min-w-0 flex-1 items-center gap-2">
+            <Input
+              type="number"
+              min={0}
+              max={MAX_TEST_PERIOD_YEARS}
+              step={1}
+              aria-label="Test period, years"
+              className="min-w-14 flex-1"
+              value={testYears}
+              onChange={(e) => setTestYears(e.target.value)}
+            />
+            <span className="shrink-0 text-body-compact text-ink-subtle">Years</span>
+          </span>
+          <span className="flex min-w-0 flex-1 items-center gap-2">
+            <Input
+              type="number"
+              min={0}
+              max={
+                clamp(testYears, MAX_TEST_PERIOD_YEARS) === MAX_TEST_PERIOD_YEARS
+                  ? 0
+                  : MAX_TEST_PERIOD_MONTHS
+              }
+              step={1}
+              aria-label="Test period, months"
+              className="min-w-14 flex-1"
+              value={testMonths}
+              onChange={(e) => setTestMonths(e.target.value)}
+            />
+            <span className="shrink-0 text-body-compact text-ink-subtle">Months</span>
+          </span>
         </div>
       </Fieldset>
     </div>

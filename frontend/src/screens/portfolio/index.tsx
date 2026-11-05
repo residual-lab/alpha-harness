@@ -6,7 +6,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CopyIcon, RefreshCwIcon } from 'lucide-react'
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { tasks } from '@/api/core'
 import { errorMessage } from '@/api/http'
@@ -53,7 +53,7 @@ import { ChartLegend, PortfolioChart } from './chart'
 import { CorrelationMatrix } from './correlation'
 import { PyramidPicker } from './pyramid-grid'
 import { compile, SelectionError } from './selection'
-import { SelectionInfo } from './selection-info'
+import { EXAMPLE, SelectionInfo } from './selection-info'
 
 /** One block of filter chips. Within a block any match keeps an Alpha; blocks combine with AND. */
 interface Facet {
@@ -350,9 +350,7 @@ export function PortfolioScreen() {
                   spellCheck={false}
                   aria-label="Selection Expression"
                   aria-invalid={ruleError !== undefined}
-                  placeholder={
-                    'information_ratio >= 0.10;\nreturns / turnover >= 1;\nreturns / drawdown >= 1'
-                  }
+                  placeholder={EXAMPLE}
                   value={selection}
                   onChange={(e) => {
                     setSelection(e.target.value)
@@ -721,7 +719,7 @@ function MembersTable({
   openId: string | null
   loading: boolean
 }) {
-  const shaped = rows.map(fromMember)
+  const shaped = useMemo(() => rows.map(fromMember), [rows])
   return (
     <AlphaTable
       view={VIEW}

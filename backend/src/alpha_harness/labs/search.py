@@ -1,8 +1,9 @@
 """Search Lab: first- and second-degree Alphas over chosen datasets, searched for Sharpe.
 
-Every field is cleaned with ``ts_backfill(field, 21)`` first. That is data cleaning, not a
-degree, and neither is the vector operator a VECTOR field needs before any other operator
-can read it. On that base ``B`` the lab writes six shapes:
+Every field is cleaned with ``ts_backfill`` first, carried as many days as its category
+needs (:data:`BACKFILL_BY_CATEGORY`). That is data cleaning, not a degree, and neither is the
+vector operator a VECTOR field needs before any other operator can read it. On that base
+``B`` the lab writes six shapes:
 
     cs(B)    ts(B, d)    group(B, g)    cs(ts(B, d))    ts(ts(B, d), d)    group(ts(B, d), g)
 
@@ -15,7 +16,7 @@ scores.
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -34,8 +35,20 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = structlog.get_logger(__name__)
 
-#: Data cleaning around every field. Not an operator in BRAIN's count, and not a degree.
+#: Data cleaning around every field: days a missing value is carried from the last one. Not an
+#: operator in BRAIN's count, and not a degree.
 BACKFILL = 21
+#: Where a month is the wrong carry. Reported a quarter apart, these would go missing for weeks
+#: between reports; BRAIN's own examples carry fundamentals 60 to 252 days. Option fields move
+#: with the live surface, and BRAIN advises "a short ts_backfill of 5 days" for them.
+BACKFILL_BY_CATEGORY = {
+    "fundamental": 63,
+    "analyst": 63,
+    "earnings": 63,
+    "institutions": 63,
+    "insiders": 63,
+    "option": 5,
+}
 #: The economic windows from the research notes: a week, a month, a quarter, half a year, a year.
 LOOKBACKS = (5, 21, 63, 126, 252)
 #: Grouping fields for group operators; they do not count as data fields.
@@ -136,15 +149,15 @@ def families(cat: Catalogue) -> tuple[str, ...]:
 # --- expressions ------------------------------------------------------------
 
 
-def base(field_id: str, vector_op: str | None = None) -> str:
+def base(field_id: str, vector_op: str | None = None, backfill: int = BACKFILL) -> str:
     """A field as every shape reads it: reduced to a matrix if it is a vector, then backfilled."""
     inner = f"{vector_op}({field_id})" if vector_op else field_id
-    return f"ts_backfill({inner}, {BACKFILL})"
+    return f"ts_backfill({inner}, {backfill})"
 
 
-def render(params: dict[str, Any]) -> str:
+def render(params: dict[str, Any], backfill: int = BACKFILL) -> str:
     """The Fast Expression for one point of the search."""
-    b = base(params["field"], params.get("vector_op"))
+    b = base(params["field"], params.get("vector_op"), backfill)
     match params["family"]:
         case "cs":
             return f"{params['cs']}({b})"
@@ -260,7 +273,8 @@ def request_for(params: dict[str, Any], run: SearchParams) -> SimulationRequest:
             decay=run.decay,
             truncation=TRUNCATION,
         ),
-        regular=render(params),
+        # A task added before backfills followed the category carries every field 21 days.
+        regular=render(params, (run.space.get("backfill") or {}).get(params["field"], BACKFILL)),
     )
 
 
@@ -297,6 +311,8 @@ class Pool:
     absent: dict[str, list[str]]
     #: Vector fields left out because no vector operator is allowed.
     vector_skipped: int
+    #: Fields carried other than :data:`BACKFILL` days, for their category.
+    backfill: dict[str, int] = field(default_factory=dict[str, int])
 
 
 async def field_pool(
@@ -342,10 +358,14 @@ async def field_pool(
         )
     )
     found: dict[str, dict[str, str]] = {}
+    carry: dict[str, int] = {}
     for universe, page in zip(universes, pages, strict=True):
         rows = page.get("results") or []
         if rows:
             found[universe] = {str(r["field_id"]): str(r["field_type"]) for r in rows}
+        for r in rows:
+            if (days := BACKFILL_BY_CATEGORY.get(str(r.get("category_id")))) is not None:
+                carry[str(r["field_id"])] = days
 
     fields: dict[str, str] = {}
     for held in found.values():
@@ -357,7 +377,13 @@ async def field_pool(
         fields = {f: t for f, t in fields.items() if t != "VECTOR"}
     kept = tuple(u for u, held in found.items() if any(f in held for f in fields))
     absent = {u: [f for f in fields if f not in found[u]] for u in kept}
-    return Pool(fields, kept, {u: ids for u, ids in absent.items() if ids}, skipped)
+    return Pool(
+        fields,
+        kept,
+        {u: ids for u, ids in absent.items() if ids},
+        skipped,
+        {f: days for f, days in carry.items() if f in fields},
+    )
 
 
 # --- drawing a point --------------------------------------------------------

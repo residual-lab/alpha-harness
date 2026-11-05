@@ -10,6 +10,15 @@ from ..vault.yields import without_quota_checks
 #: A missing number scores this: deliberately terrible, so a broken trial is never mistaken
 #: for a good one. Every objective is maximised.
 FAILURE = -10.0
+#: Checks an Alpha fails for how it trades rather than how well: more Sharpe never passes them,
+#: so a search scoring on Sharpe alone would keep spending simulations around them.
+STRUCTURAL_CHECKS = frozenset(
+    {"HIGH_TURNOVER", "LOW_TURNOVER", "CONCENTRATED_WEIGHT", "LOW_SUB_UNIVERSE_SHARPE"}
+)
+#: What each one costs a trial's score in the search, in Sharpe or Fitness points: about the
+#: distance from a passing figure to a failing one, so a trial failing one ranks below the
+#: clean trials near the cutoff without vanishing from what the sampler learns.
+STRUCTURAL_PENALTY = 1.0
 
 
 class StudyError(ValueError):
@@ -71,6 +80,12 @@ def extract(
     return values
 
 
+def searched(values: list[float], penalty: Any) -> list[float]:
+    """What the search is told a trial scored: its objectives less its structural ``penalty``.
+    Only the search reads it; the trial keeps and shows its own figures."""
+    return [v - float(penalty or 0.0) for v in values]
+
+
 def _value(stats: SampleStats | None, key: str) -> float | None:
     if stats is None:
         return None
@@ -112,5 +127,7 @@ def summarise(alpha: Alpha) -> dict[str, Any]:
         "stats": stats.model_dump(by_alias=True, exclude={"checks"}) if stats else None,
         "checks": checks,
         "failedChecks": [c["name"] for c in checks if c["result"] == "FAIL"],
+        "penalty": STRUCTURAL_PENALTY
+        * len(STRUCTURAL_CHECKS.intersection(c["name"] for c in checks if c["result"] == "FAIL")),
         "quick": alpha.settings is not None and alpha.settings.simulation_mode == QUICK_MODE,
     }

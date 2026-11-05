@@ -195,8 +195,10 @@ async def submittable(
     universe: str | None = None,
     instrument_type: str = INSTRUMENT_TYPE,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    shortlist: bool = True,
 ) -> SubmittableResponse:
-    """Alphas that passed every submission check, ready to submit on BRAIN.
+    """Alphas that passed every submission check, ready to submit on BRAIN. ``shortlist=false``
+    asks for the counts alone, without the shortlist and the PnL it reads.
 
     Each entry carries the platform's own check results, the numbers behind them, and a
     link to the alpha on BRAIN — which is where it gets submitted. This application never does.
@@ -209,6 +211,7 @@ async def submittable(
         universe=universe,
         instrument_type=instrument_type,
         limit=limit,
+        shortlist=shortlist,
     )
     # Without a series a candidate cannot be de-correlated against the others.
     state.backfill.schedule_returns(found.pop("pnlMissing"))

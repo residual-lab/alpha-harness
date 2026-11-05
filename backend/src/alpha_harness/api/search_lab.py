@@ -76,6 +76,7 @@ async def _plan(body: SearchRequest, state: Any) -> dict[str, Any]:
         "groups": list(search.GROUPS),
         "universes": list(pool.universes),
         "absent": pool.absent,
+        "backfill": pool.backfill,
         "neutralizations": market["neutralizations"],
     }
     sample: list[SampleAlpha] = []

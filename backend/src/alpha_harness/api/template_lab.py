@@ -157,6 +157,9 @@ class TemplateStats(Out):
     limits: list[int]
     #: Every Alpha it makes reads one dataset: BRAIN's single dataset Alpha.
     single_dataset: bool
+    #: Most dataset categories one of its Alphas reads, grouping fields aside: over 2, BRAIN
+    #: counts it toward no Genius pyramid. Null until every field's dataset is known.
+    pyramids: int | None = None
     #: Operators it calls that the account does not have.
     missing: list[str]
     #: Why it can't be read; the counts are zero then.
@@ -314,9 +317,14 @@ def _sized(items: list[StatsItem]) -> Sized:
 
 
 def _judged(
-    items: list[StatsItem], read: Sized, datasets: dict[str, str], known: set[str]
+    items: list[StatsItem],
+    read: Sized,
+    datasets: dict[str, str],
+    known: set[str],
+    categories: dict[str, str],
 ) -> list[dict[str, Any]]:
-    """Each counted template's kind of Alpha, its fields' datasets known."""
+    """Each counted template's kind of Alpha, its fields' datasets and their categories known."""
+    by_field = {f: categories[d] for f, d in datasets.items() if d in categories}
     found: list[dict[str, Any]] = []
     for item, entry in zip(items, read, strict=True):
         if isinstance(entry, str):
@@ -341,6 +349,17 @@ def _judged(
             for name, v in item.variables.items()
         }
         free = sized.power_pool
+        typed: dict[str, list[str]] = {}
+        for name, v in item.variables.items():
+            if isinstance(v, ValuesVariable):
+                with contextlib.suppress(ValueError):
+                    typed[name] = template.values(v.values)
+        slot_categories = {
+            name: frozenset(categories[d] for d in ids)
+            if (ids := slots.get(name)) and all(d in categories for d in ids)
+            else None
+            for name in sized.slots
+        }
         found.append(
             {
                 "operators": list(sized.operators),
@@ -349,6 +368,7 @@ def _judged(
                 "powerPool": list(free) if free is not None else None,
                 "limits": LIMITS,
                 "singleDataset": template.single_dataset(tree, sized, datasets, slots),
+                "pyramids": template.most_pyramids(tree, sized, typed, by_field, slot_categories),
                 "missing": _missing(tree, known) if known else [],
                 "problem": None,
             }
@@ -386,10 +406,18 @@ async def _stats(
     )
     # A field this market lacks still has a dataset, as long as every market agrees on it.
     datasets |= await state.queries.sole_datasets([n for n in names if n not in datasets])
+    chosen = {
+        d
+        for item in items
+        for v in item.variables.values()
+        if isinstance(v, FieldsVariable)
+        for d in v.dataset_ids
+    }
+    categories = await state.queries.dataset_categories(sorted({*datasets.values(), *chosen}))
     found: list[dict[str, Any]] = []
     for start in range(0, len(items), CHUNK):
         part = slice(start, start + CHUNK)
-        found.extend(_judged(items[part], read[part], datasets, known))
+        found.extend(_judged(items[part], read[part], datasets, known, categories))
         await asyncio.sleep(0)
     return found
 

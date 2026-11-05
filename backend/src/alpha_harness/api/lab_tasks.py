@@ -52,7 +52,7 @@ from ..labs.study import ranked
 from ..schemas import Out
 from ..tasks import Task
 from ..tools import power_pool
-from ..vault.yields import checks_of, clean, is_submitted, verdict
+from ..vault.yields import checks_of, clean, gating_results, is_submitted
 from .deps import State, refuse
 
 log = structlog.get_logger(__name__)
@@ -990,8 +990,10 @@ async def _not_refused(session: Any, ids: list[tuple[int, str | None]]) -> list[
         for trial_id, alpha_id, checks, region in raw:
             # A region-agnostic trial ran with one child's checks standing in; the family is
             # judged on all its children once read, so it is never dropped here.
+            # FAIL only: an ERROR is BRAIN failing to run the check, which a re-check can turn
+            # into a PASS, so that Alpha is judged on the vault's current checks instead.
             refused = region != REGION_AGNOSTIC_REGION and (
-                verdict(json.loads(checks) if checks else []) == "refused"
+                "FAIL" in gating_results(json.loads(checks) if checks else [])
             )
             _REFUSED[trial_id, alpha_id] = refused
 
@@ -1024,8 +1026,8 @@ async def submittable_alphas(state: State) -> list[TaskAlpha]:
                 )
             ).tuples()
         )
-        # A check that FAILed at simulation time stays failed: BRAIN's later checks only
-        # settle what was PENDING. Only the rest are read whole, about one in ten measured.
+        # A check that FAILed at simulation time stays failed: BRAIN's later checks only settle
+        # what was PENDING or ERROR. Only the rest are read whole, about one in ten measured.
         kept = await _not_refused(session, ids)
         trials: list[Trial] = []
         for chunk in itertools.batched(kept, TRIAL_CHUNK, strict=False):

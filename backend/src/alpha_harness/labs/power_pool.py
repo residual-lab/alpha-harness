@@ -31,12 +31,12 @@ from ..tasks import spawn
 from . import scheduler, search
 from .fastexpr import (
     ParseError,
+    data_fields,
     operator_count,
     operator_table,
     parse,
     render,
     validate,
-    walk,
     walk_with_parents,
 )
 from .objectives import FAILURE
@@ -198,7 +198,7 @@ def check(text: str, ctx: Context, table: dict[str, Any]) -> tuple[str, frozense
         raise Rejected(problems[0])
     if (count := operator_count(tree)) > POWER_POOL_MAX_OPERATORS:
         raise Rejected(f"{count} operators; Power Pool allows {POWER_POOL_MAX_OPERATORS}.")
-    used = frozenset(n.value for _, n in walk(tree) if n.kind == "name" and n.value in ctx.names)
+    used = frozenset(f for f in data_fields(tree, grouping=True) if f in ctx.names)
     data = sorted(used - set(GROUPING_FIELDS))
     if len(data) > POWER_POOL_MAX_FIELDS:
         raise Rejected(f"{len(data)} data fields ({', '.join(data)}); Power Pool allows 3.")
@@ -349,7 +349,17 @@ def user_prompt(
             + "\n".join(_line(f) for f in ctx.basics),
             "GROUPING_FIELDS FIELDS · not counted\n" + ", ".join(ctx.groups),
             f"YOUR EARLIER ALPHAS ON {ctx.id}\n{memory}",
-            f"Write {PER_CALL} new Power Pool Alphas that use {ctx.id}.",
+            *(
+                [
+                    "HYPOTHESIS TO TEST\n" + run.hypothesis,
+                    f"Write {PER_CALL} new Power Pool Alphas that use {ctx.id} to test this "
+                    "hypothesis: each one a different way of measuring it with these fields, "
+                    "or of trading on it. Where the dataset cannot express it, stay as close to "
+                    "it as the fields allow.",
+                ]
+                if run.hypothesis
+                else [f"Write {PER_CALL} new Power Pool Alphas that use {ctx.id}."]
+            ),
         ]
     )
     room = budget * 4 - len(POWER_POOL_LAB) - len(head) - len(tail) - 200

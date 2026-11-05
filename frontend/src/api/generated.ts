@@ -489,7 +489,9 @@ export interface paths {
         };
         /**
          * Pyramids
-         * @description Every pyramid: its multiplier, this quarter's alpha count, and download state.
+         * @description Every pyramid: its multiplier, its Alphas submitted in ``period``, and download state.
+         *
+         *     ``period`` is a quarter BRAIN names, ``all``, or left out for the quarter in progress.
          */
         get: operations["pyramids_api_catalog_pyramids_get"];
         put?: never;
@@ -1367,8 +1369,7 @@ export interface paths {
         put?: never;
         /**
          * Markdown
-         * @description These Alphas as BRAIN shows them: expression, classifications and Simulation Settings,
-         *     then a glossary of every data field they read.
+         * @description These Alphas as BRAIN shows them; see :func:`copied_alphas`.
          */
         post: operations["markdown_api_portfolio_markdown_post"];
         delete?: never;
@@ -1696,7 +1697,8 @@ export interface paths {
         put?: never;
         /**
          * Plan
-         * @description What a task with these settings would run, without running anything.
+         * @description What a task with these settings would run, without running anything. Lists the
+         *     built-in selections and combos whatever was chosen, so a screen can offer them all.
          */
         post: operations["plan_api_super_lab_plan_post"];
         delete?: never;
@@ -2016,6 +2018,67 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tools/paste-alphas/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Paste Preview
+         * @description Every Alpha in the pasted text, its settings resolved. Free: simulates nothing.
+         */
+        post: operations["paste_preview_api_tools_paste_alphas_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tools/paste-alphas/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Paste Task
+         * @description Queue every pasted Alpha that can run, ordered to finish soonest.
+         */
+        post: operations["paste_task_api_tools_paste_alphas_tasks_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tools/paste-alphas/tasks/{task_id}/copy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Paste Copy
+         * @description The task's results as Copy Alphas writes them, each with its checks, then the
+         *     simulations that failed with BRAIN's reason. No glossaries: the LLM already has them.
+         */
+        post: operations["paste_copy_api_tools_paste_alphas_tasks__task_id__copy_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tools/settings-sampler/preview": {
         parameters: {
             query?: never;
@@ -2197,7 +2260,8 @@ export interface paths {
         };
         /**
          * Submittable
-         * @description Alphas that passed every submission check, ready to submit on BRAIN.
+         * @description Alphas that passed every submission check, ready to submit on BRAIN. ``shortlist=false``
+         *     asks for the counts alone, without the shortlist and the PnL it reads.
          *
          *     Each entry carries the platform's own check results, the numbers behind them, and a
          *     link to the alpha on BRAIN — which is where it gets submitted. This application never does.
@@ -2623,6 +2687,8 @@ export interface components {
          * @description Fields each availability toggle would show if pressed, under the other filters.
          */
         AvailabilityCounts: {
+            /** Fast D1 */
+            fast_d1: number;
             /** Region Agnostic */
             region_agnostic: number;
             /** Region Exclusive */
@@ -2714,6 +2780,11 @@ export interface components {
             /** Recipes */
             recipes: components["schemas"]["BreakerRecipe"][];
             settings: components["schemas"]["AlphaSettings"];
+            /**
+             * Singledataset
+             * @default false
+             */
+            singleDataset: boolean;
         };
         /** BreakerRecipe */
         BreakerRecipe: {
@@ -2721,20 +2792,45 @@ export interface components {
             blocked: string;
             /** Caution */
             caution: string;
+            /**
+             * Custom
+             * @default false
+             */
+            custom: boolean;
             /** Datafields */
             dataFields: number;
+            /**
+             * Gaveup
+             * @default false
+             */
+            gaveUp: boolean;
             /** Id */
             id: string;
+            /**
+             * Judged
+             * @default 0
+             */
+            judged: number;
             /** Name */
             name: string;
             /** Operators */
             operators: number;
             /** Overpowerpool */
             overPowerPool: string;
+            /**
+             * Oversingledataset
+             * @default
+             */
+            overSingleDataset: string;
             /** Transform */
             transform: string;
             /** Why */
             why: string;
+            /**
+             * Worked
+             * @default 0
+             */
+            worked: number;
         };
         /** BreakerRequest */
         BreakerRequest: {
@@ -2745,6 +2841,8 @@ export interface components {
              * @default 8
              */
             cores: number;
+            /** Custom */
+            custom?: components["schemas"]["CustomReshape"][];
             /** Recipes */
             recipes?: string[];
         };
@@ -2987,6 +3085,18 @@ export interface components {
             b: string;
             /** Correlation */
             correlation: number;
+        };
+        /**
+         * CustomReshape
+         * @description A re-shape the consultant wrote around ``alpha``, or a built-in one edited.
+         */
+        CustomReshape: {
+            /** Code */
+            code: string;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
         };
         /** DataFieldDetail */
         DataFieldDetail: {
@@ -3282,6 +3392,11 @@ export interface components {
             date_created_from?: string | null;
             /** Date Created To */
             date_created_to?: string | null;
+            /**
+             * Fast D1
+             * @default false
+             */
+            fast_d1: boolean;
             /** Field Ids */
             field_ids?: string[];
             /** Field Types */
@@ -3887,6 +4002,67 @@ export interface components {
              */
             maxTrade: "ON" | "OFF";
         };
+        /** PastePlan */
+        PastePlan: {
+            /** Alphas */
+            alphas: components["schemas"]["PastedAlpha"][];
+            /** Batches */
+            batches: number;
+            /** Maxcores */
+            maxCores: number;
+            /** Problems */
+            problems: string[];
+            /** Simulations */
+            simulations: number;
+        };
+        /** PasteRequest */
+        PasteRequest: {
+            /**
+             * Cores
+             * @default 8
+             */
+            cores: number;
+            /** Text */
+            text: string;
+        };
+        /** PasteResults */
+        PasteResults: {
+            /** Alphas */
+            alphas: number;
+            /** Downloading */
+            downloading: number;
+            /** Failed */
+            failed: number;
+            /** Text */
+            text: string;
+            /** Unsynced */
+            unsynced: number;
+            /** Waiting */
+            waiting: number;
+        };
+        /** PastedAlpha */
+        PastedAlpha: {
+            /** Categories */
+            categories: string[];
+            /** Defaulted */
+            defaulted: string[];
+            /** Duplicateof */
+            duplicateOf: number | null;
+            /** Expression */
+            expression: string;
+            /** Labels */
+            labels: {
+                [key: string]: string;
+            };
+            /** Number */
+            number: number;
+            /** Problems */
+            problems: string[];
+            /** Settings */
+            settings: {
+                [key: string]: unknown;
+            };
+        };
         /** Pause */
         Pause: {
             /**
@@ -4156,6 +4332,11 @@ export interface components {
             /** Delay */
             delay: number;
             field_filter?: components["schemas"]["FieldFilter"] | null;
+            /**
+             * Hypothesis
+             * @default
+             */
+            hypothesis: string;
             /** Model */
             model?: string | null;
             /** Neutralizations */
@@ -4352,8 +4533,6 @@ export interface components {
             categoryId: string;
             /** Delay */
             delay: number;
-            /** Lit */
-            lit: boolean;
             /** Multiplier */
             multiplier: number | null;
             /** Region */
@@ -4378,19 +4557,22 @@ export interface components {
             cells: components["schemas"]["PyramidCell"][];
             /** Columns */
             columns: components["schemas"]["PyramidColumn"][];
-            quarter: components["schemas"]["Quarter"];
+            /** Period */
+            period: string;
+            /** Quarters */
+            quarters: components["schemas"]["Quarter"][];
         };
         /**
          * Quarter
-         * @description Calendar quarter in platform time; ``end`` is the next quarter's first day.
+         * @description A quarter as BRAIN names it, ``2026-Q4``, with both dates inclusive.
          */
         Quarter: {
             /** End */
             end: string;
+            /** Name */
+            name: string;
             /** Start */
             start: string;
-            /** Today */
-            today: string;
         };
         /** QuarterStanding */
         QuarterStanding: {
@@ -5040,6 +5222,8 @@ export interface components {
              * @enum {string}
              */
             activation: "IS" | "OS" | "BOTH";
+            /** Combos */
+            combos?: components["schemas"]["Recipe"][] | null;
             /**
              * Cores
              * @default 3
@@ -5061,6 +5245,8 @@ export interface components {
              * @default 30
              */
             selectionLimit: number;
+            /** Selections */
+            selections?: components["schemas"]["Recipe"][] | null;
             /** Universe */
             universe: string;
         };
@@ -5383,6 +5569,8 @@ export interface components {
             powerPool: number[] | null;
             /** Problem */
             problem: string | null;
+            /** Pyramids */
+            pyramids?: number | null;
             /** Singledataset */
             singleDataset: boolean;
         };
@@ -6489,7 +6677,9 @@ export interface operations {
     };
     pyramids_api_catalog_pyramids_get: {
         parameters: {
-            query?: never;
+            query?: {
+                period?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -6503,6 +6693,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PyramidGrid"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -8803,6 +9002,103 @@ export interface operations {
             };
         };
     };
+    paste_preview_api_tools_paste_alphas_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PastePlan"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    paste_task_api_tools_paste_alphas_tasks_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddedTask"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    paste_copy_api_tools_paste_alphas_tasks__task_id__copy_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasteResults"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     preview_api_tools_settings_sampler_preview_post: {
         parameters: {
             query?: never;
@@ -9076,6 +9372,7 @@ export interface operations {
                 universe?: string | null;
                 instrument_type?: string;
                 limit?: number;
+                shortlist?: boolean;
             };
             header?: never;
             path?: never;

@@ -11,6 +11,7 @@ from typing import Any, Literal, Self
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import select
 
 from ..brain.platform import (
     DEFAULT_TRUNCATION,
@@ -20,20 +21,24 @@ from ..brain.platform import (
     SIMULATION_SLOTS,
     TEST_PERIOD_PATTERN,
 )
-from ..db.models import utcnow
+from ..brain.schemas import QUICK_MODE
+from ..db.models import Study, Trial, TrialState, utcnow
 from ..labs.launch import NO_NEUTRALIZATION, AddedTask, add_study
 from ..labs.params import (
     CORRELATION_BREAKER,
     FIELDS_SAMPLER,
+    PASTE_ALPHAS,
     SETTINGS_SAMPLER,
     BreakerParams,
     FieldsSamplerParams,
+    PasteParams,
     SettingsParams,
 )
 from ..labs.search import MAX_SIMULATIONS
 from ..schemas import Out
-from ..tools import correlation_breaker, fields_sampler, settings_sampler
+from ..tools import correlation_breaker, fields_sampler, paste_alphas, settings_sampler
 from .deps import State, refuse
+from .portfolio import CopiedAlphas, copied_alphas
 from .vault import AlphaSettings
 
 router = APIRouter(prefix="/api/tools", tags=["tools"])
@@ -264,6 +269,8 @@ async def add_task(body: SampleRequest, state: State) -> AddedTask:
 class BreakerRecipe(Out):
     id: str
     name: str
+    #: Written by the consultant, kept on this computer, rather than built in.
+    custom: bool = False
     why: str
     #: What it costs, when it costs something worth knowing before running it.
     caution: str
@@ -276,6 +283,15 @@ class BreakerRecipe(Out):
     data_fields: int
     #: For a Power Pool Alpha, the limit this re-shape would cross; empty when none is.
     over_power_pool: str
+    #: For a single dataset Alpha, the fields of other datasets this re-shape reads, which
+    #: would cost it that classification; empty when none do.
+    over_single_dataset: str = ""
+    #: This account's runs of it whose Production Correlation BRAIN has settled, and of those
+    #: the ones that passed it and stayed submittable.
+    judged: int = 0
+    worked: int = 0
+    #: Run often enough here without once working that it starts unticked.
+    gave_up: bool = False
 
 
 class BreakerPlan(Out):
@@ -289,6 +305,9 @@ class BreakerPlan(Out):
     correlation: dict[str, Any] | None
     #: BRAIN judges it as a Power Pool Alpha, so its re-shapes are held to the pool's limits.
     power_pool: bool
+    #: BRAIN classes it a Single Data Set Alpha, so a re-shape reading another dataset is
+    #: flagged.
+    single_dataset: bool = False
     #: The source expression's own counts; null when it could not be read.
     operators: int | None
     data_fields: int | None
@@ -296,13 +315,29 @@ class BreakerPlan(Out):
     problems: list[str]
 
 
+class CustomReshape(BaseModel):
+    """A re-shape the consultant wrote around ``alpha``, or a built-in one edited."""
+
+    #: The card's own id, which the recipe is chosen by as ``custom:{id}``.
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=120)
+    code: str = Field(max_length=4000)
+
+
 class BreakerRequest(BaseModel):
     alpha_id: str = Field(min_length=1, max_length=64, alias="alphaId")
     #: Which recipes to run; empty means every one the plan offers.
-    recipes: list[str] = Field(default_factory=list, max_length=50)
+    recipes: list[str] = Field(default_factory=list, max_length=100)
+    #: Re-shapes of the consultant's own, offered beside the built-in ones.
+    custom: list[CustomReshape] = Field(default_factory=list, max_length=50)
     cores: int = Field(default=SIMULATION_SLOTS, ge=1, le=SIMULATION_SLOTS)
 
     model_config = {"populate_by_name": True}
+
+    def plan(self, state: Any) -> Any:
+        return correlation_breaker.plan(
+            state, self.alpha_id.strip(), [(c.id, c.name.strip(), c.code) for c in self.custom]
+        )
 
 
 @router.post("/correlation-breaker/preview")
@@ -311,13 +346,13 @@ async def breaker_preview(body: BreakerRequest, state: State) -> BreakerPlan:
 
     Free: reads the Alpha and the catalog, simulates nothing.
     """
-    return BreakerPlan.model_validate(await correlation_breaker.plan(state, body.alpha_id.strip()))
+    return BreakerPlan.model_validate(await body.plan(state))
 
 
 @router.post("/correlation-breaker/tasks")
 async def breaker_task(body: BreakerRequest, state: State) -> AddedTask:
     """Queue one simulation per chosen recipe, every one at the Alpha's own settings."""
-    found = await correlation_breaker.plan(state, body.alpha_id.strip())
+    found = await body.plan(state)
     if found["problems"]:
         raise refuse(422, "correlation_breaker_blocked", found["problems"][0])
 
@@ -509,4 +544,182 @@ async def fields_task(body: FieldsRequest, state: State) -> AddedTask:
         template_name=f"Fields Sampler · {body.alpha_id}"
         + (f" +{len(sources) - 1}" if len(sources) > 1 else ""),
         seeds=fields_sampler.seed_trials(chosen),
+    )
+
+
+# -- Paste Alphas --------------------------------------------------------------
+
+
+class PasteRequest(BaseModel):
+    #: An LLM's output: each Alpha an ``Alpha Expression:`` with its settings below it.
+    text: str = Field(min_length=1, max_length=2_000_000)
+    cores: int = Field(default=SIMULATION_SLOTS, ge=1, le=SIMULATION_SLOTS)
+
+
+class PastedAlpha(Out):
+    #: Its place in the pasted text, from 1.
+    number: int
+    expression: str
+    #: By BRAIN's names, as they will be sent.
+    settings: dict[str, Any]
+    #: Each chosen setting by BRAIN's label for it, e.g. ``Slow Factors`` for ``SLOW``.
+    labels: dict[str, str]
+    #: Dataset Categories it reads, grouping fields aside: over 2, BRAIN counts it toward no
+    #: Genius pyramid.
+    categories: list[str]
+    #: Titles of the settings it left out, which take BRAIN's default.
+    defaulted: list[str]
+    #: Why it cannot run; empty when it can.
+    problems: list[str]
+    #: The earlier Alpha it repeats exactly, which runs once for both.
+    duplicate_of: int | None
+
+
+class PastePlan(Out):
+    alphas: list[PastedAlpha]
+    #: Simulations it would queue: every Alpha that can run, once.
+    simulations: int
+    #: The Multi-Simulations those fill.
+    batches: int
+    max_cores: int
+    problems: list[str]
+
+
+async def _paste_plan(state: Any, text: str) -> dict[str, Any]:
+    metadata = state.metadata
+    schema = await metadata.cached_settings_schema() or await metadata.refresh_metadata()
+    found = paste_alphas.plan(schema, text)
+    problems: list[str] = []
+    if not found["alphas"]:
+        problems.append('No Alpha found. Each one starts with a line reading "Alpha Expression:".')
+    elif not found["requests"]:
+        problems.append("None of the pasted Alphas can run as written.")
+    elif len(found["requests"]) > MAX_SIMULATIONS:
+        problems.append(f"At most {MAX_SIMULATIONS:,} Alphas can run in one task.")
+    # Read where each Alpha runs: a field's dataset can differ between regions.
+    read = {a["number"]: paste_alphas.fields_of(a["expression"]) for a in found["alphas"]}
+    regions = {str(a["settings"].get("region")) for a in found["alphas"]}
+    described = {
+        region: await state.queries.described(
+            sorted(
+                {
+                    f
+                    for a in found["alphas"]
+                    if a["settings"].get("region") == region
+                    for f in read[a["number"]]
+                }
+            ),
+            region,
+        )
+        for region in regions
+    }
+    for a in found["alphas"]:
+        known = described[str(a["settings"].get("region"))]
+        a["categories"] = sorted(
+            {str(c) for f in read[a["number"]] if (c := (known.get(f) or {}).get("category_name"))}
+        )
+    return found | {"problems": problems}
+
+
+@router.post("/paste-alphas/preview")
+async def paste_preview(body: PasteRequest, state: State) -> PastePlan:
+    """Every Alpha in the pasted text, its settings resolved. Free: simulates nothing."""
+    found = await _paste_plan(state, body.text)
+    return PastePlan.model_validate(
+        found | {"simulations": len(found["requests"]), "maxCores": state.engine.slots}
+    )
+
+
+@router.post("/paste-alphas/tasks", status_code=201)
+async def paste_task(body: PasteRequest, state: State) -> AddedTask:
+    """Queue every pasted Alpha that can run, ordered to finish soonest."""
+    found = await _paste_plan(state, body.text)
+    if found["problems"]:
+        raise refuse(422, "paste_alphas_blocked", found["problems"][0])
+    requests = found["requests"]
+    first = requests[0].settings
+    return await add_study(
+        state,
+        now=utcnow(),
+        sampler=PASTE_ALPHAS,
+        params=PasteParams(
+            region=first.region,
+            delay=first.delay,
+            markets=len({markets_of(r) for r in requests}),
+            cores=body.cores,
+        ),
+        simulations=len(requests),
+        batch_size=(body.cores + 1) * MULTI_SIMULATION_SIZE,
+        # The output as pasted, so the task keeps what it was asked to run.
+        template_source=body.text,
+        template_name=f"Paste Alphas · {len(requests)} Alphas",
+        seeds=settings_sampler.seed_trials(requests),
+    )
+
+
+def markets_of(request: Any) -> tuple[str, int, str]:
+    return request.settings.region, request.settings.delay, request.settings.universe
+
+
+class PasteResults(CopiedAlphas):
+    #: Alphas in the text, simulations that failed, and ones not back yet.
+    alphas: int
+    failed: int
+    waiting: int
+    #: Alphas whose PnL is still downloading: their K-Ratio and correlations read "—".
+    downloading: int
+
+
+@router.post("/paste-alphas/tasks/{task_id}/copy")
+async def paste_copy(task_id: int, state: State) -> PasteResults:
+    """The task's results as Copy Alphas writes them, each with its checks, then the
+    simulations that failed with BRAIN's reason. No glossaries: the LLM already has them."""
+    async with state.db.session() as session:
+        row = await session.get(Study, task_id)
+        if row is None or row.sampler != PASTE_ALPHAS:
+            raise refuse(404, "not_found", "No Paste Alphas task with that id.")
+        trials = (
+            await session.scalars(
+                select(Trial).where(Trial.study_id == task_id).order_by(Trial.number)
+            )
+        ).all()
+    # A Quick Alpha that passed is run again in Full; the Full one is what BRAIN submits.
+    full_runs = {
+        int(t.params["fullOf"]): t for t in trials if (t.params or {}).get("fullOf") is not None
+    }
+    alpha_ids: list[str] = []
+    failures: list[dict[str, Any]] = []
+    waiting = 0
+    for trial in trials:
+        if (trial.params or {}).get("fullOf") is not None:
+            continue
+        full = full_runs.get(trial.number)
+        alpha_id = (full.alpha_id if full is not None else None) or trial.alpha_id
+        if alpha_id:
+            alpha_ids.append(alpha_id)
+        elif trial.state == TrialState.FAIL:
+            failures.append(
+                {"expression": trial.expression, "settings": trial.settings, "error": trial.message}
+            )
+        elif trial.state != TrialState.PRUNED or trial.message == settings_sampler.PENDING_SEND:
+            waiting += 1
+    stored = await state.alphas.by_ids(alpha_ids)
+    lacking = [
+        a
+        for a in await state.alphas.lacking_series(alpha_ids)
+        # A region-agnostic Alpha has no PnL of its own to download, and a Quick one is never
+        # downloaded: its Full run, when it passes, is the one copied.
+        if (stored.get(a) or {}).get("region") != REGION_AGNOSTIC_REGION
+        and (stored.get(a) or {}).get("simulation_mode") != QUICK_MODE
+    ]
+    state.backfill.schedule_returns(lacking)
+    # The LLM already holds both glossaries from the Alphas it was first given.
+    copied = await copied_alphas(state, alpha_ids, glossaries=False, failures=failures)
+    return PasteResults(
+        text=copied.text,
+        unsynced=copied.unsynced,
+        alphas=len(alpha_ids),
+        failed=len(failures),
+        waiting=waiting,
+        downloading=len(lacking),
     )

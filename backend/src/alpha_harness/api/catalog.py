@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from ..brain.platform import INSTRUMENT_TYPE, REGION_AGNOSTIC_REGION
 from ..brain.settings_schema import valid_values
-from ..catalog.pyramids import pyramid_grid
+from ..catalog.pyramids import UnknownPeriodError, pyramid_grid
 from ..catalog.queries import FieldFilter, Tuple4
 from ..catalog.sync import SyncTarget
 from ..schemas import Out, SyncAllRun
@@ -64,25 +64,27 @@ class PyramidCell(Out):
     region: str
     delay: int
     multiplier: float | None
+    #: Submitted in the grid's period.
     alpha_count: int
-    #: 3+ alphas this quarter.
-    lit: bool
     synced: bool
 
 
 class Quarter(Out):
-    """Calendar quarter in platform time; ``end`` is the next quarter's first day."""
+    """A quarter as BRAIN names it, ``2026-Q4``, with both dates inclusive."""
 
+    name: str
     start: str
     end: str
-    today: str
 
 
 class PyramidGrid(Out):
     columns: list[PyramidColumn]
     categories: list[PyramidCategory]
     cells: list[PyramidCell]
-    quarter: Quarter
+    #: The quarter the counts cover, or ``all`` for every Alpha ever submitted.
+    period: str
+    #: Newest first, so the first is the quarter in progress.
+    quarters: list[Quarter]
     #: Submitted Alphas a pyramid needs before BRAIN counts it as formulated.
     alphas_per_pyramid: int
 
@@ -196,6 +198,7 @@ class AvailabilityCounts(BaseModel):
 
     region_agnostic: int
     region_exclusive: int
+    fast_d1: int
 
 
 class CatalogFacets(BaseModel):
@@ -315,9 +318,16 @@ async def cancel_run(run_id: int, state: State) -> Cancelled:
 
 
 @router.get("/pyramids")
-async def pyramids(state: State) -> PyramidGrid:
-    """Every pyramid: its multiplier, this quarter's alpha count, and download state."""
-    return PyramidGrid.model_validate(await pyramid_grid(state.endpoints, state.catalog))
+async def pyramids(state: State, period: str | None = None) -> PyramidGrid:
+    """Every pyramid: its multiplier, its Alphas submitted in ``period``, and download state.
+
+    ``period`` is a quarter BRAIN names, ``all``, or left out for the quarter in progress.
+    """
+    try:
+        grid = await pyramid_grid(state.endpoints, state.catalog, period)
+    except UnknownPeriodError:
+        raise refuse(404, "unknown_period", f"BRAIN offers no quarter named {period}.") from None
+    return PyramidGrid.model_validate(grid)
 
 
 @router.get("/scopes")

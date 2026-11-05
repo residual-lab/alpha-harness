@@ -66,6 +66,9 @@ EPOCH_SECONDS = 1e9
 #: Longest gap a response is allowed to talk us into. Not a rate limit — a bound on how
 #: badly a misread header may stall a sync.
 MAX_MEASURED_GAP = 60.0
+#: Longest a paced caller sleeps before looking again, so a shorter gap measured meanwhile
+#: takes effect within a second.
+PACE_RECHECK = 1.0
 
 
 def _header_num(headers: httpx2.Headers, name: str) -> float | None:
@@ -154,7 +157,7 @@ class BrainClient:
         #: the next free slot in each. Measured: BRAIN meters each endpoint separately, and
         #: asking faster than it allows buys 429s rather than throughput.
         self._gap: dict[str, float] = {}
-        self._next_send: dict[str, float] = {}
+        self._last_send: dict[str, float] = {}
         #: Set once an endpoint's first response has reported its window, so the callers
         #: behind it pace on measurements rather than on an assumption.
         self._measured: dict[str, asyncio.Event] = {}
@@ -231,18 +234,22 @@ class BrainClient:
             measured = self._measured.get(bucket)
             if measured is None:
                 self._measured[bucket] = asyncio.Event()
+                self._last_send[bucket] = time.monotonic()
                 return
         if not measured.is_set():
             await measured.wait()
 
-        async with self._pace_lock:
-            gap = self._gap.get(bucket, 0.0)
-            if gap <= 0:
-                return
-            slot = max(time.monotonic(), self._next_send.get(bucket, 0.0))
-            self._next_send[bucket] = slot + gap
-        if (wait := slot - time.monotonic()) > 0:
-            await asyncio.sleep(wait)
+        # The next send is due a gap after the last, re-read on every wake rather than booked
+        # ahead: a queue booked while a window ran dry would keep its minute-wide spacing long
+        # after the window reset and a fresh response measured a gap of a fraction of a second.
+        while True:
+            async with self._pace_lock:
+                now = time.monotonic()
+                due = self._last_send.get(bucket, 0.0) + self._gap.get(bucket, 0.0)
+                if now >= due:
+                    self._last_send[bucket] = now
+                    return
+            await asyncio.sleep(min(due - now, PACE_RECHECK))
 
     def _measure(self, bucket: str, headers: httpx2.Headers) -> None:
         """Read this endpoint's window off the response: how many, and how long until reset."""

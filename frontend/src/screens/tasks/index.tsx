@@ -30,6 +30,7 @@ import { type LabTask, labTasks, type RankedAlpha, TOP_LIMIT } from '@/screens/t
 import { TASK_OFFER, taskStatus } from '@/screens/tasks/columns'
 import { resultsMarkdown } from '@/screens/tasks/copy'
 import { SubmittableAlphas } from '@/screens/tasks/submittable'
+import { pasteAlphas } from '@/screens/tools/paste-alphas/api'
 import {
   Badge,
   Button,
@@ -57,6 +58,7 @@ import { type Column, DataTable } from '@/ui/table'
 
 /** Matches `labs.params.SETTINGS_SAMPLER`. */
 const SETTINGS_SAMPLER = 'settings-sampler'
+const PASTE_ALPHAS = 'paste-alphas'
 
 /** What a task searches for, where that is not Sharpe, named as the task names it. */
 const objective = (task: LabTask) =>
@@ -630,7 +632,12 @@ function TaskDetail({
     task.name,
     task.labName,
     task.templateName,
-    task.lab === SETTINGS_SAMPLER ? task.alphaId : `${task.region} D${task.delay}`,
+    task.lab === SETTINGS_SAMPLER
+      ? task.alphaId
+      : // Each pasted Alpha has its own market, so no one market names the task.
+        task.lab === PASTE_ALPHAS
+        ? null
+        : `${task.region} D${task.delay}`,
   ]
     .filter(Boolean)
     .join(' · ')
@@ -640,14 +647,34 @@ function TaskDetail({
         `${fmt.int(task.markets)} Markets · Decay ${task.decay ?? DASH} · ${task.truncationAgent ? 'Truncation Agent' : `Truncation ${task.truncation ?? DASH}`} · NaN Handling ${task.nanHandling ?? DASH}`
       : task.lab === 'super-alpha'
         ? `${task.universe ?? DASH} · SuperAlphas from your submitted Alphas`
-        : task.seeds > 0
-          ? `${task.universe ?? DASH} · ${fmt.int(task.seeds)} seeds · Population ${fmt.int(task.population)} · Mutation ${fmt.pct(task.mutationRate, 0)}`
-          : `Decay ${task.decay ?? DASH} · ${fmt.int(task.fields)} fields`
+        : task.lab === PASTE_ALPHAS
+          ? `${fmt.int(task.target)} pasted Alphas · ${fmt.int(task.markets)} Markets`
+          : task.seeds > 0
+            ? `${task.universe ?? DASH} · ${fmt.int(task.seeds)} seeds · Population ${fmt.int(task.population)} · Mutation ${fmt.pct(task.mutationRate, 0)}`
+            : `Decay ${task.decay ?? DASH} · ${fmt.int(task.fields)} fields`
   const copyResults = () =>
     navigator.clipboard.writeText(resultsMarkdown(task, found)).then(
       () => toast.success(`Copied ${fmt.int(found.length)} results`),
       (e: unknown) => toast.error(errorMessage(e)),
     )
+  // Pasted Alphas go back the way they came: in Copy Alphas' shape, for the next output.
+  const copyAlphas = useMutation({
+    mutationFn: () => pasteAlphas.copy(task.id),
+    onSuccess: async ({ text, alphas, failed, waiting, downloading }) => {
+      await navigator.clipboard.writeText(text)
+      toast.success(
+        `Copied ${fmt.int(alphas)} Alpha${alphas === 1 ? '' : 's'}` +
+          (failed ? ` and ${fmt.int(failed)} failed simulation${failed === 1 ? '' : 's'}` : ''),
+      )
+      const notes = [
+        waiting > 0 && `${fmt.int(waiting)} not back from BRAIN yet, so left out.`,
+        downloading > 0 &&
+          `PnL is still downloading for ${fmt.int(downloading)}, so their K-Ratio and correlations read "—".`,
+      ].filter(Boolean)
+      if (notes.length) toast.info(`${notes.join(' ')} Copy again in a few minutes.`)
+    },
+    onError: (e: unknown) => toast.error(errorMessage(e)),
+  })
 
   return (
     <Panel
@@ -655,10 +682,23 @@ function TaskDetail({
       description={description}
       actions={
         <>
-          <Button size="sm" variant="ghost" disabled={!found.length} onClick={copyResults}>
-            <CopyIcon />
-            Copy Results
-          </Button>
+          {task.lab === PASTE_ALPHAS ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={copyAlphas.isPending}
+              disabled={task.simulated + task.cached === 0}
+              onClick={() => copyAlphas.mutate()}
+            >
+              {!copyAlphas.isPending && <CopyIcon />}
+              Copy Alphas
+            </Button>
+          ) : (
+            <Button size="sm" variant="ghost" disabled={!found.length} onClick={copyResults}>
+              <CopyIcon />
+              Copy Results
+            </Button>
+          )}
           <TaskBadge task={task} />
           <Button
             size="icon-sm"

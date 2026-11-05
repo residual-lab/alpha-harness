@@ -33,12 +33,14 @@ import {
   Chips,
   Disclosure,
   ErrorNotice,
+  Field,
   Fieldset,
   Metric,
   Notice,
   Page,
   PageHeader,
   Panel,
+  Textarea,
 } from '@/ui/kit'
 import { Select } from '@/ui/overlay'
 
@@ -57,6 +59,8 @@ interface PowerPoolDraft {
   neutralizations: string[]
   /** Empty draws from every downloaded universe of the market. */
   universes: string[]
+  /** The user's own idea for every LLM call to test; empty lets it explore. */
+  hypothesis: string
 }
 
 const useDraft = create<PowerPoolDraft>()(
@@ -73,16 +77,19 @@ const useDraft = create<PowerPoolDraft>()(
       onlyModel: false,
       neutralizations: [],
       universes: [],
+      hypothesis: '',
     }),
     {
       name: 'alpha-harness-power-pool-lab',
       // Version 1 leaves cores unchosen, so Settings' default for new tasks applies.
       // Version 2 adds universes, none chosen: every downloaded one, as before.
-      version: 2,
+      // Version 3 adds the hypothesis, empty: the LLM explores, as before.
+      version: 3,
       migrate: (stored, version) => ({
         ...(stored as PowerPoolDraft),
         ...(version < 1 ? { cores: null } : {}),
-        universes: [],
+        ...(version < 2 ? { universes: [] } : {}),
+        hypothesis: '',
       }),
     },
   ),
@@ -129,6 +136,7 @@ export function PowerPoolLabScreen() {
     universes,
     cores,
     simulations: draft.simulations ?? 0,
+    hypothesis: draft.hypothesis,
   }
   const { preview, current } = useLabPreview('power-pool-lab', body, powerPoolLab.preview)
   const plan = preview.data
@@ -208,6 +216,18 @@ export function PowerPoolLabScreen() {
               onChange={(next) => set({ simulations: next })}
             />
           </div>
+          <Field
+            label="Hypothesis · optional"
+            hint="Every LLM call writes its Alphas to test this idea on the chosen datasets. Left empty, the LLM explores on its own."
+          >
+            <Textarea
+              rows={3}
+              maxLength={2000}
+              placeholder="e.g. Stocks whose analysts keep revising estimates up outperform for the next month."
+              value={draft.hypothesis}
+              onChange={(e) => set({ hypothesis: e.target.value })}
+            />
+          </Field>
           {scopeOptions.universes.length > 0 && (
             <Fieldset legend={universes.length === 0 ? 'Universes · all downloaded' : 'Universes'}>
               <Chips

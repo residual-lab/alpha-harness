@@ -383,15 +383,30 @@ class BrainEndpoints:
         items = r.body.get("pyramids") if isinstance(r.body, dict) else None
         return items if isinstance(items, list) else []
 
-    async def pyramid_alphas(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
-        """``{category, region, delay, alphaCount}`` submitted between two ISO dates."""
+    async def pyramid_alphas(
+        self, start_date: str | None = None, end_date: str | None = None
+    ) -> list[dict[str, Any]]:
+        """``{category, region, delay, alphaCount}`` submitted between two ISO dates, or ever
+        without them."""
+        dates = {"startDate": start_date, "endDate": end_date}
         r = await self.client.request_retrying(
             "GET",
             "/users/self/activities/pyramid-alphas",
-            params={"startDate": start_date, "endDate": end_date},
+            params={k: v for k, v in dates.items() if v is not None},
         )
         items = r.body.get("pyramids") if isinstance(r.body, dict) else None
         return items if isinstance(items, list) else []
+
+    async def quarters(self) -> list[dict[str, str]]:
+        """``{name, startDate, endDate}`` for each quarter BRAIN's Genius page offers, newest
+        first. ``name`` reads ``2026-Q4``; both dates are inclusive."""
+        body = (await self.client.request_retrying("GET", "/users/self/consultant/summary")).body
+        performance = (body or {}).get("performance") or {}
+        listed = [performance.get("currentQuarter")] + [
+            h.get("quarter") for h in performance.get("history") or []
+        ]
+        unique = {q["name"]: q for q in listed if isinstance(q, dict) and q.get("name")}
+        return sorted(unique.values(), key=lambda q: q.get("startDate") or "", reverse=True)
 
     #: A region's datasets take eight to sixteen seconds, longer than the client's
     #: ordinary timeout allows for. BRAIN itself gives up at thirty with a 504.

@@ -25,6 +25,8 @@ export interface PowerPoolRequest {
   universes: string[]
   cores: number
   simulations: number
+  /** An idea of the user's own for every call to test; empty lets the LLM explore. */
+  hypothesis: string
 }
 
 const B = '/api/power-pool-lab'

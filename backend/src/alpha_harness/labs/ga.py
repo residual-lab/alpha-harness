@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import structlog
 from sqlalchemy import String, func, select, type_coerce
+from sqlalchemy.orm import aliased
 
 from ..brain.platform import (
     IGNORED_CHECKS,
@@ -124,6 +125,9 @@ UTILITY: dict[str, tuple[float, Callable[[float, float, float], float], float, f
     "drawdown": (0.10, less, 0.05, 0.20),
     "returns": (0.10, more, 0.05, 0.15),
 }
+#: The check whose limit is BRAIN's own cutoff for a metric. Where an Alpha's checks name one it
+#: replaces the curve's low anchor, which suits USA Delay 1: CHN and Delay 0 ask more.
+CUTOFFS = {"sharpe": "LOW_SHARPE", "fitness": "LOW_FITNESS"}
 #: Checks measuring the last two years, which the train/test split holds out.
 TEST_YEAR_CHECKS = frozenset({"LOW_2Y_SHARPE", "IS_LADDER_SHARPE"})
 
@@ -137,7 +141,12 @@ def train_figure(row: dict[str, Any], key: str) -> Any:
 def utility(row: dict[str, Any]) -> float:
     """The weighted utility of an Alpha's stored metrics. A missing metric leaves the weights."""
     total = weight = 0.0
+    limits = limits_of(checks_of(row.get("checks")))
     for key, (share, curve, low, high) in UTILITY.items():
+        cutoff = limits.get(CUTOFFS.get(key, ""))
+        if cutoff is not None:
+            # The whole curve moves with it, so the reward phase keeps its width.
+            low, high = cutoff, high + cutoff - low
         value = train_figure(row, key)
         if value is not None:
             total += share * curve(float(value), low, high)
@@ -367,9 +376,22 @@ def skeleton(tree: Node, genes: list[tuple[Path, str]]) -> Node:
     return relabel(tree, {path: f"?{kind}" for path, kind in genes})
 
 
+def _field_groups(tree: Node, genes: list[tuple[Path, str]]) -> dict[Path, str]:
+    """Each field gene's path, by the field it reads: a field read twice is one input."""
+    return {path: node_at(tree, path).value for path, kind in genes if kind == "field"}
+
+
 def uniform(rng: random.Random, a: Node, b: Node, genes: list[tuple[Path, str]]) -> Node:
-    """Each gene from either parent with equal chance; the parents share a skeleton."""
-    taken = {path: node_at(b, path).value for path, _ in genes if rng.random() < 0.5}
+    """Each gene from either parent with equal chance; the parents share a skeleton. Every
+    reading of one field comes from the same parent, so ``x / ts_mean(x, 20)`` stays a ratio
+    of one thing."""
+    fields = _field_groups(a, genes)
+    from_b = {name: rng.random() < 0.5 for name in dict.fromkeys(fields.values())}
+    taken = {
+        path: node_at(b, path).value
+        for path, _ in genes
+        if (from_b[fields[path]] if path in fields else rng.random() < 0.5)
+    }
     return relabel(a, taken)
 
 
@@ -419,6 +441,13 @@ def mutate(
             settings[kind] = rng.choice([d for d in search.DECAYS if d != settings["decay"]])
         else:
             values[path] = _mutated(rng, node_at(tree, path), kind, market)
+    # A field read twice is swapped everywhere it is read, to the first value drawn for it.
+    fields = _field_groups(tree, moves)
+    swapped: dict[str, str] = {}
+    for path, value in values.items():
+        if path in fields:
+            swapped.setdefault(fields[path], value)
+    values |= {path: swapped[name] for path, name in fields.items() if name in swapped}
     return relabel(tree, values), settings
 
 
@@ -700,6 +729,15 @@ async def breed(
     # The database ranks and cuts to the population: a task can hold 100,000 trials, and
     # building each one to keep a hundred held the event loop for seconds.
     score = func.json_extract(Trial.values, "$[0]")
+    # Ranked as the search scores them: a structural fail costs its penalty (labs.objectives).
+    searched = score - func.coalesce(func.json_extract(Trial.result, "$.penalty"), 0)
+    # A Quick Alpha whose Full run is back is that Full run, once: as two parents it would
+    # take two places in the population for one Alpha.
+    full = aliased(Trial)
+    rerun = func.json_extract(full.params, "$.fullOf")
+    superseded = select(rerun).where(
+        full.study_id == row.id, full.state == TrialState.COMPLETE, rerun.is_not(None)
+    )
     async with optimizer.db.session() as session:
         ranked = list(
             (
@@ -709,8 +747,9 @@ async def breed(
                         Trial.study_id == row.id,
                         Trial.state == TrialState.COMPLETE,
                         score > FAILURE,
+                        Trial.number.not_in(superseded),
                     )
-                    .order_by(score.desc(), Trial.number)
+                    .order_by(searched.desc(), Trial.number)
                     .limit(population)
                 )
             ).all()

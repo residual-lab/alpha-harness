@@ -47,6 +47,8 @@ class PowerPoolRequest(BaseModel):
     simulations: int = Field(default=0, ge=0, le=search.MAX_SIMULATIONS)
     #: The Data Explorer's filter the datasets were chosen under: only fields it shows are used.
     field_filter: FieldFilter | None = None
+    #: An idea of the consultant's own for every call to test; empty lets the LLM explore.
+    hypothesis: str = Field(default="", max_length=2000)
 
 
 class PowerPoolModel(Out):
@@ -143,6 +145,7 @@ async def _plan(body: PowerPoolRequest, state: Any) -> dict[str, Any]:
         delay=body.delay,
         universes=universes,
         neutralizations=neutralizations,
+        hypothesis=body.hypothesis.strip(),
     )
     if universes:
         for dataset in body.dataset_ids:
@@ -225,6 +228,7 @@ async def add_task(body: PowerPoolRequest, state: State) -> AddedTask:
             ),
             model=plan["model"],
             only_model=body.only_model,
+            hypothesis=body.hypothesis.strip(),
             cores=body.cores,
             llm={"calls": 0},
         ),

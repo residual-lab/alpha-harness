@@ -110,8 +110,11 @@ def candidates(
     neutralization: str,
     selection_limit: int,
     activations: list[str],
+    chosen_selections: list[Recipe] | None = None,
+    combos: list[Recipe] | None = None,
 ) -> list[Candidate]:
-    """Every selection · combo · decay · activation, as Full SUPER simulations.
+    """Every selection · combo · decay · activation, as Full SUPER simulations. The built-in
+    selections and combos unless others are given.
 
     Full mode always: only a Full simulation can be submitted, and Quick runs none of the
     correlation checks a SuperAlpha must also pass.
@@ -119,8 +122,8 @@ def candidates(
     out: list[Candidate] = []
     for activation in activations:
         for decay in DECAYS:
-            for selection in selections(selection_limit):
-                for combo in COMBOS:
+            for selection in chosen_selections or selections(selection_limit):
+                for combo in combos or COMBOS:
                     settings = SimulationSettings(
                         region=region,
                         delay=delay,

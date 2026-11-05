@@ -126,7 +126,16 @@ def alpha_row(alpha: Alpha, fetched_at: datetime) -> tuple[Any, ...]:
         settings.language if settings else None,
         settings.pasteurization if settings else None,
         settings.nan_handling if settings else None,
+        brain_json(alpha),
     )
+
+
+def brain_json(alpha: Alpha) -> str:
+    """BRAIN's in-sample block whole: the breakdowns the other columns flatten away, such as
+    Investability Constrained, and its checks. ``checks`` holds those too, as ``/check`` last
+    said, but a submitted Alpha's body can be the more settled of the two."""
+    body = alpha.model_dump(mode="json", by_alias=True)
+    return json.dumps({"is": body["is"]} if body.get("is") else {}, separators=(",", ":"))
 
 
 #: What the Simulations table may sort and filter on, as SQL over ``alpha a``. Anything
@@ -336,6 +345,9 @@ def _page_row(r: dict[str, Any]) -> dict[str, Any]:
 
 def _by_alpha[T](ids: list[str], days: list[date], values: list[T]) -> dict[str, dict[date, T]]:
     """Rows sorted by Alpha, each Alpha's days made a dict in one go rather than row by row."""
+    if not ids:
+        # An Alpha with no PnL stored yet reads no rows, and ``ends`` would still hold one.
+        return {}
     starts = [i for i in range(len(ids)) if i == 0 or ids[i] != ids[i - 1]]
     ends = [*starts[1:], len(ids)]
     return {

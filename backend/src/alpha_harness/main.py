@@ -162,7 +162,9 @@ def create_app() -> FastAPI:
                 {"detail": {"code": "forbidden", "message": "Writes must come from the app."}},
                 status_code=403,
             )
-        page_seen.set()
+        # Only the page sends this on reads too: a health check or a typed URL is not a tab.
+        if request.headers.get("x-harness-client") == "1":
+            page_seen.set()
         return await call_next(request)
 
     install_exception_handlers(app)

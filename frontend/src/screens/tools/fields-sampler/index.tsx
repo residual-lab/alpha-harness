@@ -41,6 +41,7 @@ const PER_TIER = [5, 10, 20]
 const TOP_PICKS = [5, 10, 15, 20, 30]
 
 const TIER: Record<string, string> = {
+  fast_d1: 'Fast D1 twin and overnight change',
   dataset: 'Same dataset',
   subcategory: 'Same subcategory',
   category: 'Same category',

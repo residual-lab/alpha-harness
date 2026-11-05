@@ -117,6 +117,70 @@ def highest_correlations(ids: list[str], framed: Framed) -> dict[str, float | No
     }
 
 
+def joined(left: Framed, right: Framed) -> Framed:
+    r"""Two :func:`frame`\ s side by side on the days of both: what framing their Alphas together
+    gives, since each column is laid out on its own."""
+    dates = sorted(set(left[0]) | set(right[0]))
+    at = {d: i for i, d in enumerate(dates)}
+
+    def widen(f: Framed) -> tuple[Floats, Floats, Bools]:
+        rows = [at[d] for d in f[0]]
+        width = f[1].shape[1]
+        pnl = np.full((len(dates), width), np.nan)
+        turnover = np.zeros((len(dates), width))
+        closing = np.zeros((len(dates), width), dtype=bool)
+        pnl[rows], turnover[rows], closing[rows] = f[1], f[2], f[3]
+        return pnl, turnover, closing
+
+    a, b = widen(left), widen(right)
+    return dates, np.hstack([a[0], b[0]]), np.hstack([a[1], b[1]]), np.hstack([a[2], b[2]])
+
+
+def against_pool(
+    ids: list[str], framed: Framed, pool: int
+) -> dict[str, tuple[float | None, float | None]]:
+    """Each Alpha past the first ``pool`` of ``ids``, against those ``pool``: its highest
+    correlation with any one of them, measured as :func:`highest_correlations` measures it,
+    and its correlation with their equal-weighted Portfolio, as :func:`portfolio_correlations`
+    measures it. ``framed`` is the :func:`frame` of all of ``ids``."""
+    outside = ids[pool:]
+    if not pool:
+        return dict.fromkeys(outside, (None, None))
+    dates, pnl, _, closing = framed
+    since = bisect_left(dates, metrics.window_start(dates[-1]))
+    windowed = np.where(closing, np.nan, pnl)[since:]
+    rho = metrics.correlations(windowed[:, pool:], windowed[:, :pool])
+
+    days, cut, turnover = exported(*framed)
+    filled = np.nan_to_num(cut[:, :pool])
+    started = np.maximum.accumulate((filled != 0) | (turnover[:, :pool] != 0), axis=0)
+    live = started.sum(axis=1)
+    book = np.full(len(days), np.nan)
+    np.divide(filled.sum(axis=1), live, out=book, where=live > 0)
+    start = bisect_left(days, metrics.window_start(dates[-1]))
+    together = metrics.correlations(cut[start:, pool:], book[start:, None])[:, 0]
+
+    return {
+        a: (
+            None if np.isnan(row).all() else float(np.nanmax(row)),
+            None if np.isnan(value) else float(value),
+        )
+        for a, row, value in zip(outside, rho, together.tolist(), strict=True)
+    }
+
+
+def k_ratios(ids: list[str], framed: Framed, wanted: set[str]) -> dict[str, float | None]:
+    """:func:`metrics.k_ratio` for the ``wanted`` of ``ids``, as :func:`framed_figures` works
+    it out, without the rest of its figures."""
+    _, pnl, turnover, _ = framed
+    found: dict[str, float | None] = {}
+    for col, alpha_id in enumerate(ids):
+        held = ~np.isnan(pnl[:, col])
+        if alpha_id in wanted and held.any():
+            found[alpha_id] = metrics.k_ratio(pnl[held, col], turnover[held, col])
+    return found
+
+
 #: Alphas whose series :func:`net_figures_of` holds in memory at once.
 NET_CHUNK = 200
 

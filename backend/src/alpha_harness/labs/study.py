@@ -41,7 +41,14 @@ from ..vault.yields import checks_of, clean, gating_results, limits_of, verdict
 from . import objectives as obj
 from . import scheduler
 from .objectives import StudyNotFoundError
-from .params import SEARCH_SAMPLER, TASK_SAMPLERS, TEMPLATE_SAMPLER, SearchParams, params_of
+from .params import (
+    PASTE_ALPHAS,
+    SEARCH_SAMPLER,
+    TASK_SAMPLERS,
+    TEMPLATE_SAMPLER,
+    SearchParams,
+    params_of,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Awaitable, Callable
@@ -407,6 +414,13 @@ class Optimizer:
                     stored.alpha_id = summary.get("alphaId")
             await session.commit()
 
+        if row.sampler == PASTE_ALPHAS and self.backfill is not None:
+            # Copied back with figures worked out from the PnL, so every result's is wanted,
+            # not only those nothing refused.
+            self.backfill.schedule_returns(
+                [str(s["alphaId"]) for _, _, _, s in finished if s.get("alphaId")]
+            )
+
         log.info("optimize.told", study_id=study_id, trials=len(finished))
         return len(finished)
 
@@ -465,11 +479,18 @@ class Optimizer:
                     "params": params or {},
                     "distributions": distributions or {},
                     "values": values,
+                    "penalty": penalty,
                     "state": state,
                 }
-                for params, distributions, values, state in (
+                for params, distributions, values, penalty, state in (
                     await session.execute(
-                        select(Trial.params, Trial.distributions, Trial.values, Trial.state)
+                        select(
+                            Trial.params,
+                            Trial.distributions,
+                            Trial.values,
+                            func.json_extract(Trial.result, "$.penalty"),
+                            Trial.state,
+                        )
                         .where(Trial.study_id == study_id)
                         .order_by(Trial.number)
                     )
@@ -541,13 +562,14 @@ def _tell_many(
     from optuna.trial import TrialState as OptunaState
     from optuna.trial import create_trial
 
-    for optuna_trial, stored, values, _ in finished:
+    for optuna_trial, stored, values, summary in finished:
         try:
             if optuna_trial is not None:
                 if values is None:
                     study.tell(optuna_trial, state=OptunaState.FAIL, skip_if_finished=True)
                 else:
-                    study.tell(optuna_trial, values, skip_if_finished=True)
+                    told = obj.searched(values, summary.get("penalty"))
+                    study.tell(optuna_trial, told, skip_if_finished=True)
                 continue
 
             raw = asked_over.get(stored.id) or {}
@@ -562,7 +584,7 @@ def _tell_many(
                 create_trial(
                     params=_optuna_params(stored.params or {}, distributions),
                     distributions=distributions,
-                    values=[float(v) for v in values],
+                    values=obj.searched(values, summary.get("penalty")),
                     state=OptunaState.COMPLETE,
                 )
             )
@@ -632,7 +654,9 @@ def _rebuild(sampler: Any, history: list[dict[str, Any]], loader: _Distributions
             continue
         params = _optuna_params(entry["params"] or {}, distributions)
         values = (
-            [float(v) for v in (entry["values"] or [])] if state is OptunaState.COMPLETE else None
+            obj.searched([float(v) for v in (entry["values"] or [])], entry["penalty"])
+            if state is OptunaState.COMPLETE
+            else None
         )
         if state is OptunaState.COMPLETE and not values:
             continue
@@ -768,5 +792,6 @@ def vault_summary(saved: dict[str, Any]) -> dict[str, Any]:
         "stats": {key: saved.get(key) for key in sorted(VAULT_STATS)},
         "checks": checks,
         "failedChecks": failed,
+        "penalty": obj.STRUCTURAL_PENALTY * len(obj.STRUCTURAL_CHECKS.intersection(failed)),
         "quick": saved.get("simulation_mode") == QUICK_MODE,
     }

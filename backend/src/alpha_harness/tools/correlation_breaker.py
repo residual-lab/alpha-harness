@@ -23,6 +23,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import select
+
 from ..brain.platform import (
     GROUPING_FIELDS,
     INSTRUMENT_TYPE,
@@ -30,12 +32,23 @@ from ..brain.platform import (
     POWER_POOL_MAX_FIELDS,
     POWER_POOL_MAX_OPERATORS,
     PROD_CORRELATION_CHECK,
+    SINGLE_DATASET_CLASS,
 )
 from ..brain.schemas import FULL_MODE, SimulationRequest, SimulationSettings
 from ..catalog.queries import FieldFilter, Tuple4
-from ..labs.fastexpr import Node, ParseError, data_fields, operator_count, parse, render
+from ..db.models import Study, Trial
+from ..labs.fastexpr import (
+    Node,
+    ParseError,
+    data_fields,
+    operator_count,
+    parse,
+    render,
+    walk,
+)
 from ..labs.launch import OPERATORS_UNREAD, account_operators
-from ..vault.yields import is_power_pool
+from ..labs.params import CORRELATION_BREAKER
+from ..vault.yields import checks_of, is_power_pool, verdict
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -362,6 +375,7 @@ def _grouped(id_: str, field: str, about: str) -> list[Recipe]:
             setup=(),
             tail=f"group_neutralize({ALPHA}, densify({field}))",
             operators=("group_neutralize", "densify"),
+            fields=(field,),
         ),
         Recipe(
             id=f"{id_}_sector",
@@ -373,7 +387,7 @@ def _grouped(id_: str, field: str, about: str) -> list[Recipe]:
             setup=(f"cluster = densify(group_cartesian_product(sector, {field}))",),
             tail=f"group_neutralize({ALPHA}, cluster)",
             operators=("densify", "group_cartesian_product", "group_neutralize"),
-            fields=("sector",),
+            fields=("sector", field),
             caution=(
                 f"If {field} already sits inside sectors the pair is {field} again, and this "
                 "repeats the one above."
@@ -384,6 +398,98 @@ def _grouped(id_: str, field: str, about: str) -> list[Recipe]:
 
 def _unbuilt(id_: str, name: str, missing: str) -> Recipe:
     return Recipe(id=id_, name=name, why="", setup=(), tail="", operators=(), missing=missing)
+
+
+#: What a re-shape written by hand is known by, ahead of the id its card gave it.
+CUSTOM = "custom:"
+
+
+def custom_recipe(key: str, name: str, code: str) -> Recipe:
+    """A re-shape written by hand around ``alpha``: any statements it needs, then the line
+    that runs. One that cannot run says why, as a built-in one does."""
+    id_ = CUSTOM + key
+    try:
+        tree = parse(code)
+    except ParseError as exc:
+        return _unbuilt(id_, name, f"could not be read: {exc}")
+    statements: tuple[Node, ...] = tree.args if tree.kind == "seq" else (tree,)
+    if not statements:
+        return _unbuilt(id_, name, f"empty: write it around {ALPHA}")
+    if statements[-1].kind == "assign":
+        return _unbuilt(id_, name, "its last line assigns a name: end with the expression to run")
+    if ALPHA not in {n.value for _, n in walk(tree) if n.kind == "name"}:
+        return _unbuilt(id_, name, f"never reads {ALPHA}: write it around {ALPHA}")
+    return Recipe(
+        id=id_,
+        name=name,
+        why="",
+        setup=tuple(render(s) for s in statements[:-1]),
+        tail=render(statements[-1]),
+        operators=tuple(sorted({n.value for _, n in walk(tree) if n.kind == "call"})),
+        # ``alpha`` is the Alpha itself, bound before these lines run, not a data field.
+        fields=tuple(f for f in data_fields(tree, grouping=True) if f != ALPHA),
+    )
+
+
+#: Runs without a single success after which a recipe starts unticked: tried often enough that
+#: it is this account's Alphas it does not suit, not bad luck.
+GIVE_UP_AFTER = 3
+
+
+async def history(state: Any) -> dict[str, tuple[int, int]]:
+    """Each recipe's runs on this account so far, as ``(judged, worked)``.
+
+    Worked means BRAIN's Production Correlation check passed and nothing else refused the
+    Alpha: it broke the correlation and stayed submittable. A run whose correlation check is
+    not settled yet counts for neither. A task's simulations are numbered in the order of the
+    recipes it stores, which is how each result is traced back to its recipe.
+    """
+    async with state.db.session() as session:
+        tasks = (
+            await session.execute(
+                select(Study.id, Study.sampler_params).where(Study.sampler == CORRELATION_BREAKER)
+            )
+        ).all()
+        if not tasks:
+            return {}
+        trials = (
+            await session.execute(
+                select(Trial.study_id, Trial.number, Trial.alpha_id).where(
+                    Trial.study_id.in_([t.id for t in tasks]), Trial.alpha_id.is_not(None)
+                )
+            )
+        ).all()
+    recipes = {t.id: (t.sampler_params or {}).get("recipes") or [] for t in tasks}
+    stored = await state.alphas.by_ids(list({str(t.alpha_id) for t in trials}))
+    found: dict[str, tuple[int, int]] = {}
+    for study_id, number, alpha_id in trials:
+        names = recipes.get(study_id) or []
+        row = stored.get(str(alpha_id))
+        if number >= len(names) or row is None:
+            continue
+        checks = checks_of(row.get("checks"))
+        prod = next((c for c in checks if c.get("name") == PROD_CORRELATION_CHECK), None)
+        result = str((prod or {}).get("result") or "").upper()
+        if result not in ("PASS", "FAIL"):
+            continue
+        judged, worked = found.get(names[number], (0, 0))
+        broke = result == "PASS" and verdict(checks) != "refused"
+        found[names[number]] = (judged + 1, worked + broke)
+    return found
+
+
+def ranked(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """What has worked for this account first, best rate first; then what is untried, in the
+    research's order; then what has only ever failed here."""
+
+    def key(item: tuple[int, dict[str, Any]]) -> tuple[int, float, int]:
+        place, row = item
+        judged, worked = row["judged"], row["worked"]
+        if worked:
+            return 0, -worked / judged, place
+        return (2 if judged else 1), 0.0, place
+
+    return [row for _, row in sorted(enumerate(rows), key=key)]
 
 
 def offered(
@@ -441,7 +547,9 @@ def _correlation(checks: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
+async def plan(
+    state: Any, alpha_id: str, custom: Sequence[tuple[str, str, str]] = ()
+) -> dict[str, Any]:
     """Everything the screen shows: the Alpha, its settings, and each recipe's expression.
 
     Reads BRAIN and the local catalog; simulates nothing.
@@ -482,7 +590,11 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
         most_used_group(state, scope, exclusive=False),
         most_used_group(state, scope, exclusive=True),
     )
-    recipes = (*RECIPES, *group_recipes(top, only_here, region))
+    recipes = (
+        *RECIPES,
+        *group_recipes(top, only_here, region),
+        *(custom_recipe(*c) for c in custom),
+    )
 
     # A recipe reads fields of its own; one the market does not carry is said so, not hidden.
     wanted = sorted({f for recipe in recipes for f in recipe.fields})
@@ -497,6 +609,25 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
     }
 
     power_pool = is_power_pool([c for c in checks if isinstance(c, dict)])
+    past = await history(state)
+    # BRAIN's own word on whether it is an ATOM, and each field's dataset to tell which
+    # recipes would bring in a second one. Grouping fields BRAIN exempts are never counted.
+    single = any(
+        c.get("id") == SINGLE_DATASET_CLASS
+        for c in body.get("classifications") or []
+        if isinstance(c, dict)
+    )
+    own = [f for f in data_fields(parse(expression), grouping=True) if f not in GROUPING_FIELDS]
+    extra = sorted({f for r in recipes for f in r.fields if f not in GROUPING_FIELDS})
+    dataset_of = (
+        {
+            str(r["field_id"]): str(r["dataset_id"])
+            for r in await state.queries.fields_by_id(scope, sorted({*own, *extra}))
+        }
+        if single
+        else {}
+    )
+    own_datasets = {dataset_of[f] for f in own if f in dataset_of}
     rows = []
     for recipe, blocked in offered(recipes, operators, fields, region):
         used, read = (
@@ -506,6 +637,7 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
             {
                 "id": recipe.id,
                 "name": recipe.name,
+                "custom": recipe.id.startswith(CUSTOM),
                 "why": recipe.why,
                 "caution": recipe.caution,
                 "transform": ""
@@ -515,6 +647,11 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
                 "operators": used,
                 "dataFields": read,
                 "overPowerPool": over_power_pool(used, read) if power_pool else "",
+                "overSingleDataset": over_single_dataset(recipe, dataset_of, own_datasets),
+                "judged": past.get(recipe.id, (0, 0))[0],
+                "worked": past.get(recipe.id, (0, 0))[1],
+                "gaveUp": past.get(recipe.id, (0, 0))[0] >= GIVE_UP_AFTER
+                and not past.get(recipe.id, (0, 0))[1],
             }
         )
     used, read = counted(expression)
@@ -528,9 +665,10 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
         "rawSettings": settings,
         "correlation": _correlation(checks),
         "powerPool": power_pool,
+        "singleDataset": single,
         "operators": used,
         "dataFields": read,
-        "recipes": rows,
+        "recipes": ranked(rows),
         #: What the task is built from: the fixed recipes and this market's own groupings.
         "recipeSet": recipes,
         "problems": problems,
@@ -560,6 +698,19 @@ def over_power_pool(operators: int, fields: int) -> str:
     return " and ".join(over)
 
 
+def over_single_dataset(recipe: Recipe, dataset_of: dict[str, str], own: set[str]) -> str:
+    """Which of a recipe's fields would make a single dataset Alpha read a second dataset,
+    empty when none would or the Alpha's own datasets are not known."""
+    if not own:
+        return ""
+    added = [
+        f"{f} ({dataset_of[f]})"
+        for f in recipe.fields
+        if f not in GROUPING_FIELDS and f in dataset_of and dataset_of[f] not in own
+    ]
+    return ", ".join(added)
+
+
 def held_settings(settings: dict[str, Any]) -> dict[str, Any]:
     """The settings every simulation runs at, which are the Alpha's own and are not editable."""
     return {
@@ -583,6 +734,7 @@ def _empty(
         "rawSettings": settings,
         "correlation": _correlation(checks),
         "powerPool": is_power_pool(list(checks)),
+        "singleDataset": False,
         "operators": None,
         "dataFields": None,
         "recipes": [],

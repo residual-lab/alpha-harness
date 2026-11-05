@@ -94,7 +94,7 @@ export const pool = {
   /** Every market at once: where an empty market points instead. */
   everywhere: queryOptions({
     queryKey: ['pool', 'submittable-count'],
-    queryFn: () => http.get<SubmittableResponse>('/api/vault/submittable?limit=1'),
+    queryFn: () => http.get<SubmittableResponse>('/api/vault/submittable?limit=1&shortlist=false'),
   }),
   /** Re-runs the submission checks on BRAIN without submitting. */
   check: (alphaId: string) =>

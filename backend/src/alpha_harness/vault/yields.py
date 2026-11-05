@@ -185,9 +185,11 @@ async def submittable(
     universe: str | None = None,
     instrument_type: str | None = None,
     limit: int = 50,
+    shortlist: bool = True,
 ) -> dict[str, Any]:
     """Every alpha that passed all of BRAIN's submission checks, best Sharpe first, and
-    a shortlist of the few worth submitting.
+    a shortlist of the few worth submitting. Without ``shortlist``, only the counts: no PnL is
+    read for the shortlist, which across every market is most of the work.
 
     Alphas already submitted are left out, so nobody submits the same idea twice. Best
     Sharpe first is also most overfit first, so the shortlist ignores it: only Alphas
@@ -229,18 +231,23 @@ async def submittable(
     validated = [r for r in ready if r.get("test_sharpe") is not None]
     held = [r for r in validated if held_out_ok(r)]
     chosen = ready[:limit]
+    by_id = {str(r["alpha_id"]): r for r in ready}
+    order = stability_order(held) if shortlist else []
     # One read for both the ranking and the sparklines.
-    days = await alphas.daily_pnl(list(dict.fromkeys(str(r["alpha_id"]) for r in [*held, *chosen])))
-    order = stability_order(held)
+    wanted = [*order, *(str(r["alpha_id"]) for r in chosen)] if shortlist else []
+    days = await alphas.daily_pnl(list(dict.fromkeys(wanted)))
     picks = await asyncio.to_thread(
         independent,
         order,
-        # One market here, so one region: the profile holds a single series.
-        {a: {"": pnl} for a in order if a in days and (pnl := series_of(days[a]))},
+        # Each under its own region: Alphas of two markets are never compared.
+        {
+            a: {str(by_id[a].get("region") or ""): pnl}
+            for a in order
+            if a in days and (pnl := series_of(days[a]))
+        },
         SHORTLIST,
         SHORTLIST_MAX_CORRELATION,
     )
-    by_id = {str(r["alpha_id"]): r for r in ready}
     # Everything the de-correlation walked past before the shortlist filled up.
     walked = order.index(picks[-1]) + 1 if picks else 0
 

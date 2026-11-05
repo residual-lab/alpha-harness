@@ -121,6 +121,14 @@ export function Facts({
           Single Dataset
         </Badge>
       )}
+      {stats.pyramids != null && stats.pyramids > 2 && (
+        <span
+          className="text-body-compact text-status-warning"
+          title="Since Q2 2025 an Alpha reading more than 2 Dataset Categories counts toward no Genius pyramid, though it still counts toward base payment. Grouping fields are not counted."
+        >
+          Up to {fmt.int(stats.pyramids)} Dataset Categories
+        </span>
+      )}
       {stats.holes > 0 && (
         <span
           className="text-body-compact text-ink-subtle"

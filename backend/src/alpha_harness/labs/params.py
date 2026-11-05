@@ -37,6 +37,8 @@ CORRELATION_BREAKER = "correlation-breaker"
 FIELDS_SAMPLER = "fields-sampler"
 #: Studies that combine your submitted Alphas into SuperAlphas (labs.super_alpha).
 SUPER_LAB = "super-alpha"
+#: Studies that run Alphas pasted from an LLM's answer, as given (tools.paste_alphas).
+PASTE_ALPHAS = "paste-alphas"
 #: Studies that are research-lab tasks, run only from the Tasks tab, by their lab's name.
 TASK_SAMPLERS = {
     SEARCH_SAMPLER: "Search Lab",
@@ -47,6 +49,7 @@ TASK_SAMPLERS = {
     CORRELATION_BREAKER: "Correlation Breaker",
     FIELDS_SAMPLER: "Fields Sampler",
     SUPER_LAB: "Super Alpha Lab",
+    PASTE_ALPHAS: "Paste Alphas",
 }
 
 
@@ -105,6 +108,8 @@ class PowerPoolParams(TaskParams):
     #: Off, a call ``model`` cannot make (no budget left, provider down) goes to the next model
     #: a Key can run; on, the task waits for ``model`` alone.
     only_model: bool = False
+    #: The consultant's own idea, which every call writes its Alphas to test; empty explores.
+    hypothesis: str = ""
     #: Running LLM tallies: ``calls``, ``empty``, ``failed``, ``byDataset`` and ``byModel``.
     llm: dict[str, Any] = Field(default_factory=dict)
     #: The last hundred LLM calls, for the task's detail view.
@@ -172,6 +177,14 @@ class SuperParams(TaskParams):
     recipes: list[str] = Field(default_factory=list)
 
 
+class PasteParams(TaskParams):
+    """Paste Alphas: every simulation written up front, each at the settings it was pasted
+    with. ``region`` and ``delay`` are the first Alpha's, shown on the task card."""
+
+    #: How many region/delay/universe markets they run in, for the task's detail line.
+    markets: int = 0
+
+
 BY_SAMPLER: dict[str, type[TaskParams]] = {
     SEARCH_SAMPLER: SearchParams,
     TEMPLATE_SAMPLER: TemplateParams,
@@ -181,6 +194,7 @@ BY_SAMPLER: dict[str, type[TaskParams]] = {
     CORRELATION_BREAKER: BreakerParams,
     FIELDS_SAMPLER: FieldsSamplerParams,
     SUPER_LAB: SuperParams,
+    PASTE_ALPHAS: PasteParams,
 }
 
 

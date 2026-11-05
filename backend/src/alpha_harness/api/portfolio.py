@@ -1,20 +1,44 @@
 """Portfolio: submitted Alphas combined at equal weight, as BRAIN combines its own pool."""
 
 import asyncio
+import json
 import math
-from typing import Annotated, Any, Literal
+import re
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
+import structlog
 from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from ..brain.platform import REGION_AGNOSTIC_CLASS, TRADING_DAYS
+from ..brain.errors import BrainError
+from ..brain.platform import (
+    CORRELATION_WINDOW_YEARS,
+    IGNORED_CHECKS,
+    REGION_AGNOSTIC_CLASS,
+    TRADING_DAYS,
+)
+from ..brain.schemas import QUICK_MODE, Alpha
 from ..brain.settings_schema import chosen_labels
 from ..labs.fastexpr import ParseError, data_fields, parse
 from ..schemas import Out
 from ..tools import portfolio, power_pool
 from ..vault.store import SERIES_VERSION, json_list
-from ..vault.yields import checks_of, limits_of
+from ..vault.yields import (
+    REFUSING,
+    checks_of,
+    is_submitted,
+    limits_of,
+    verdict,
+    without_quota_checks,
+)
 from .deps import State, refuse
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..state import AppState
+
+log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
 
@@ -222,23 +246,70 @@ BRAIN_METRICS = {
 
 
 def brain_metrics(row: dict[str, Any]) -> dict[str, float | None]:
-    """:data:`BRAIN_METRICS` for one stored Alpha, and its Information Ratio."""
-    found = {
+    """:data:`BRAIN_METRICS` for one stored Alpha."""
+    return {
         name: None if row.get(c) is None else float(row[c]) for name, c in BRAIN_METRICS.items()
     }
-    sharpe = found["sharpe"]
-    # BRAIN's Sharpe is its IR annualized over 250 days, so this is exact to Sharpe's two places.
-    found["information_ratio"] = None if sharpe is None else sharpe / math.sqrt(TRADING_DAYS)
-    return found
 
 
-#: What a copied Alpha lists under Metrics, and how each reads: percentages to BRAIN's two
-#: places. All from :func:`brain_metrics`.
+def _imbalance(long: float | None, short: float | None) -> float | None:
+    if long is None or short is None or not long + short:
+        return None
+    return (long - short) / (long + short)
+
+
+def _pct(v: float) -> str:
+    return f"{v:.2%}"
+
+
+def _ratio(v: float) -> str:
+    return f"{v:.2f}"
+
+
+#: What a copied Alpha lists under Metrics, and how each reads: BRAIN's own figures to its own
+#: places, and the four worked out here, which :data:`METRIC_GLOSSARY` defines.
 COPIED_METRICS = (
-    ("information_ratio", "Information Ratio", lambda v: f"{v:.4f}"),
-    ("turnover", "Turnover", lambda v: f"{v:.2%}"),
-    ("returns", "Returns", lambda v: f"{v:.2%}"),
-    ("drawdown", "Drawdown", lambda v: f"{v:.2%}"),
+    ("sharpe", "Sharpe", _ratio),
+    ("turnover", "Turnover", _pct),
+    ("fitness", "Fitness", _ratio),
+    ("returns", "Returns", _pct),
+    ("drawdown", "Drawdown", _pct),
+    ("calmar", "Calmar", _ratio),
+    ("margin", "Margin", lambda v: f"{v * 10_000:.2f}\u2031"),
+    ("k_ratio", "K-Ratio", _ratio),
+    ("long_count", "Long Count", lambda v: f"{v:,.0f}"),
+    ("short_count", "Short Count", lambda v: f"{v:,.0f}"),
+    ("imbalance", "Long/Short Imbalance", lambda v: f"{v:+.0%}"),
+    ("prod_correlation", "Production Correlation", _ratio),
+    ("max_pairwise_correlation", "Max Pairwise Correlation", _ratio),
+    ("portfolio_correlation", "Portfolio Correlation", _ratio),
+)
+
+METRIC_GLOSSARY = "\n".join(
+    (
+        "# Metric Glossary",
+        "",
+        "Every figure is over the in-sample period on BRAIN's $20,000,000 book. Sharpe, "
+        "Turnover, Fitness, Returns, Drawdown, Margin, Long Count, Short Count, Production "
+        "Correlation, the Sub-Universe, Cluster, 2Y, regional and Robust Universe figures, the "
+        "Investability Constrained Metrics (the same Alpha within BRAIN's liquidity limits on "
+        "positions and trades) and the Checks are BRAIN's own. The rest are worked out locally "
+        "from each Alpha's daily PnL, before cost:",
+        "",
+        "- **K-Ratio**: Kestner's K-ratio (2013 form). Fit a line to cumulative PnL against the "
+        "day number, from the first day traded; "
+        f"K = slope / (standard error of the slope * number of days) * sqrt({TRADING_DAYS}).",
+        "- **Calmar**: Returns / Drawdown, from BRAIN's own two figures.",
+        "- **Long/Short Imbalance**: (Long Count - Short Count) / (Long Count + Short Count). "
+        "+100% is all long, -100% all short.",
+        "- **Max Pairwise Correlation**: the highest Pearson correlation of daily PnL with any "
+        "other submitted Alpha, on the days both traded, over the last "
+        f"{CORRELATION_WINDOW_YEARS} calendar years of data, the latest included, as BRAIN "
+        "measures its correlations.",
+        "- **Portfolio Correlation**: the Pearson correlation of daily PnL with the "
+        "equal-weighted portfolio of every other submitted Alpha (their daily PnL averaged over "
+        "those trading that day), over the same window.",
+    )
 )
 
 
@@ -302,6 +373,36 @@ def _pnl_version(row: dict[str, Any]) -> Any:
     return row.get("series_version") if version is None else version
 
 
+type Framing = tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[str], portfolio.Framed]
+
+#: The last :func:`_framed_submitted` at each cost, with the catalog revision it was read at.
+#: Two at most: the Portfolio at no cost and at the cost being looked at.
+_FRAMED: dict[float, tuple[int, Framing]] = {}
+
+
+async def _framed_submitted(state: AppState, cost_bps: float | None) -> Framing:
+    """Every submitted Alpha stored, its row, and the :func:`portfolio.frame` of those with a
+    series. Laid out once for every figure worked out from it, it was each one's slowest step,
+    and kept until the catalog is next written to: the Portfolio, its copy and a cost change
+    read the same Alphas."""
+    cost = cost_bps or 0.0
+    revision = state.catalog.revision
+    kept = _FRAMED.get(cost)
+    if kept is not None and kept[0] == revision:
+        return kept[1]
+    rows = await state.alphas.submitted_members()
+    ids = [str(r["alpha_id"]) for r in rows]
+    series = await state.alphas.series(ids)
+    meta = await state.alphas.by_ids(ids)
+    with_series = [a for a in dict.fromkeys(ids) if series.get(a)]
+    framed = await asyncio.to_thread(portfolio.frame, series, meta, with_series, cost)
+    found: Framing = (rows, meta, with_series, framed)
+    for stale in [c for c, (r, _) in _FRAMED.items() if r != revision or c not in (0.0, cost)]:
+        del _FRAMED[stale]
+    _FRAMED[cost] = (revision, found)
+    return found
+
+
 @router.get("/members")
 async def members(
     state: State,
@@ -309,13 +410,7 @@ async def members(
 ) -> PortfolioMembers:
     """Every submitted Alpha stored locally. With ``costBps``, its figures and correlations are
     worked out on its daily PnL net of that cost instead of read from BRAIN."""
-    rows = await state.alphas.submitted_members()
-    ids = [str(r["alpha_id"]) for r in rows]
-    series = await state.alphas.series(ids)
-    meta = await state.alphas.by_ids(ids)
-    # Laid out once for everything below: it was each one's slowest step.
-    with_series = [a for a in dict.fromkeys(ids) if series.get(a)]
-    framed = await asyncio.to_thread(portfolio.frame, series, meta, with_series, cost_bps or 0.0)
+    rows, meta, with_series, framed = await _framed_submitted(state, cost_bps)
     # Worked out even at no cost: some figures, like the K-ratio, BRAIN does not report.
     net = await asyncio.to_thread(portfolio.framed_figures, with_series, framed, meta)
     if cost_bps is None:
@@ -400,46 +495,250 @@ async def sync(state: State) -> PortfolioSyncStarted:
         raise refuse(409, "already_running", str(exc)) from exc
 
 
-@router.post("/markdown")
-async def markdown(body: CopyRequest, state: State) -> CopiedAlphas:
-    """These Alphas as BRAIN shows them: expression, classifications and Simulation Settings,
-    then a glossary of every data field they read."""
-    ids = list(dict.fromkeys(body.alpha_ids))
+async def _local_figures(state: AppState, alpha_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """K-Ratio, Max Pairwise Correlation and Portfolio Correlation for these Alphas, before
+    cost. A submitted Alpha is measured against every other one, as the Portfolio table
+    measures it; any other Alpha against every submitted one."""
+    _, _, members, framed = await _framed_submitted(state, None)
+    wanted = list(dict.fromkeys(alpha_ids))
+    found: dict[str, dict[str, Any]] = {}
+    inside = set(wanted) & set(members)
+    if inside:
+        highest = await asyncio.to_thread(portfolio.highest_correlations, members, framed)
+        together = await asyncio.to_thread(portfolio.portfolio_correlations, members, framed)
+        k_ratios = await asyncio.to_thread(portfolio.k_ratios, members, framed, inside)
+        for a in inside:
+            found[a] = {
+                "k_ratio": k_ratios.get(a),
+                "max_pairwise_correlation": highest.get(a),
+                "portfolio_correlation": together.get(a),
+            }
+    outside = [a for a in wanted if a not in set(members)]
+    own = await state.alphas.series(outside) if outside else {}
+    held = [a for a in outside if own.get(a)]
+    if held:
+        ids = members + held
+        alone = await asyncio.to_thread(portfolio.frame, own, await state.alphas.by_ids(held), held)
+        combined = await asyncio.to_thread(portfolio.joined, framed, alone)
+        against = await asyncio.to_thread(portfolio.against_pool, ids, combined, len(members))
+        k_ratios = await asyncio.to_thread(portfolio.k_ratios, ids, combined, set(held))
+        for a in held:
+            highest, together = against[a]
+            found[a] = {
+                "k_ratio": k_ratios.get(a),
+                "max_pairwise_correlation": highest,
+                "portfolio_correlation": together,
+            }
+    return found
+
+
+async def _read_bodies(state: AppState, alpha_ids: list[str]) -> None:
+    """Read these Alphas from BRAIN and store them whole. One BRAIN will not give is left as
+    stored: the copy goes ahead with what is known."""
+    gate = asyncio.Semaphore(4)
+
+    async def one(alpha_id: str) -> Alpha | None:
+        async with gate:
+            try:
+                return Alpha.model_validate(await state.endpoints.alpha_body(alpha_id))
+            except (BrainError, ValidationError) as exc:
+                log.warning("portfolio.body_unread", alpha_id=alpha_id, error=str(exc)[:160])
+                return None
+
+    found = [a for a in await asyncio.gather(*(one(a) for a in alpha_ids)) if a is not None]
+    if found:
+        await state.alphas.save_alphas(found)
+
+
+def _brain_of(row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        found = json.loads(row.get("brain") or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+#: The eight figures of BRAIN's Investability Constrained block, in BRAIN's order.
+CONSTRAINED_FIGURES = (
+    ("sharpe", "Sharpe", _ratio),
+    ("turnover", "Turnover", _pct),
+    ("fitness", "Fitness", _ratio),
+    ("returns", "Returns", _pct),
+    ("drawdown", "Drawdown", _pct),
+    ("margin", "Margin", lambda v: f"{v * 10_000:.2f}\u2031"),
+    ("longCount", "Long Count", lambda v: f"{v:,.0f}"),
+    ("shortCount", "Short Count", lambda v: f"{v:,.0f}"),
+)
+#: A check's value read as a metric, where the check measures something the Metrics do not
+#: already show, listed in this order right after the metric it belongs with. The value is
+#: the figure; whether it passed is BRAIN's business at submission.
+CHECK_METRICS = {
+    "LOW_SUB_UNIVERSE_SHARPE": ("sharpe", "Sub-Universe Sharpe", _ratio),
+    "CLUSTER_TEST": ("sharpe", "Cluster Sharpe", _ratio),
+    "LOW_2Y_SHARPE": ("sharpe", "2Y Sharpe", _ratio),
+    "LOW_GLB_AMER_SHARPE": ("sharpe", "GLB AMER Sharpe", _ratio),
+    "LOW_GLB_APAC_SHARPE": ("sharpe", "GLB APAC Sharpe", _ratio),
+    "LOW_GLB_EMEA_SHARPE": ("sharpe", "GLB EMEA Sharpe", _ratio),
+    "LOW_ASI_JPN_SHARPE": ("sharpe", "ASI JPN Sharpe", _ratio),
+    "LOW_ROBUST_UNIVERSE_SHARPE": ("sharpe", "Robust Universe Sharpe", _ratio),
+    "LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO": ("sharpe", "Robust Universe Sharpe", _ratio),
+    "LOW_ROBUST_UNIVERSE_RETURNS": ("returns", "Robust Universe Returns", _pct),
+}
+#: The checks copied as checks: what they report has no single figure to stand for it.
+COPIED_CHECKS = ("IS_LADDER_SHARPE", "CONCENTRATED_WEIGHT")
+
+
+def _check_text(check: dict[str, Any]) -> str:
+    """One check as BRAIN reports it: its result, then every figure it gives."""
+    parts = [
+        f"{re.sub(r'(?<!^)(?=[A-Z])', ' ', key).lower()} {value}"
+        for key, value in check.items()
+        if key not in ("name", "result") and value is not None
+    ]
+    detail = f" ({', '.join(parts)})" if parts else ""
+    return f"{check.get('name')}: {check.get('result')}{detail}"
+
+
+def _settings_lines(schema: dict[str, Any] | None, settings: dict[str, Any]) -> list[str]:
+    """Simulation Settings as BRAIN labels them, from settings keyed by BRAIN's names."""
+    labels = chosen_labels(schema, settings)
+    return [
+        f"{title}: {labels.get(name) or ('—' if settings.get(name) is None else settings[name])}"
+        for name, _, title in COPIED_SETTINGS
+    ]
+
+
+def _settled_checks(row: dict[str, Any], brain: dict[str, Any]) -> list[dict[str, Any]]:
+    """The more settled of the stored checks and the body's: fewer still PENDING, the stored
+    ones on a tie, as ``/check`` may have spoken since the body was read."""
+    stored = checks_of(row.get("checks"))
+    body = without_quota_checks(
+        [c for c in (brain.get("is") or {}).get("checks") or [] if isinstance(c, dict)]
+    )
+
+    def pending(checks: list[dict[str, Any]]) -> int:
+        return sum(str(c.get("result", "")).upper() == "PENDING" for c in checks)
+
+    return body if body and pending(body) < pending(stored) else stored
+
+
+def _checks_line(checks: list[dict[str, Any]], row: dict[str, Any]) -> str:
+    """BRAIN's verdict, and the checks behind a refusal."""
+    if is_submitted(row):
+        # Submitted says it all, and past submission some checks stay PENDING for good.
+        return "Checks:"
+    failed = [
+        str(c.get("name"))
+        for c in checks
+        if str(c.get("result", "")).upper() in REFUSING
+        and str(c.get("name", "")).upper() not in IGNORED_CHECKS
+    ]
+    if failed:
+        return f"Checks: FAIL ({', '.join(failed)})"
+    found = verdict(checks, row.get("simulation_mode"))
+    if row.get("simulation_mode") == QUICK_MODE:
+        return "Checks: QUICK (Quick mode runs no submission checks)"
+    return {"submittable": "Checks: PASS", "pending": "Checks: PENDING"}.get(
+        str(found), "Checks: —"
+    )
+
+
+async def copied_alphas(
+    state: AppState,
+    alpha_ids: list[str],
+    *,
+    glossaries: bool = True,
+    failures: Sequence[dict[str, Any]] = (),
+) -> CopiedAlphas:
+    """These Alphas with everything BRAIN reports for them, highest Sharpe first: expression,
+    description, classifications, Simulation Settings, Metrics, every period's figures with
+    their breakdowns, every check, themes and pyramids. Then the Metric Glossary and every data
+    field they read.
+
+    An Alpha stored before its whole body was kept is read from BRAIN once. Without
+    ``glossaries``, the Metric Glossary and the data fields are left out. ``failures`` are
+    simulations that made no Alpha, each an ``expression``, its ``settings`` and BRAIN's
+    ``error``, listed after the Alphas so a reader learns from those too.
+    """
+    ids = list(dict.fromkeys(alpha_ids))
     rows = await state.alphas.by_ids(ids)
+    if missing := [a for a, row in rows.items() if not row.get("brain")]:
+        await _read_bodies(state, missing)
+        rows |= await state.alphas.by_ids(missing)
     schema = await state.metadata.cached_settings_schema()
+    local = await _local_figures(state, [a for a in ids if a in rows])
     blocks: list[str] = []
     #: Each field read, by the region of the first Alpha reading it: where it is described.
     regions: dict[str, str] = {}
     unsynced = 0
 
-    # Highest Information Ratio first; an Alpha without one last.
-    def by_ir(row: dict[str, Any]) -> float:
-        ir = brain_metrics(row)["information_ratio"]
-        return math.inf if ir is None else -ir
+    # Highest Sharpe first; an Alpha without one last.
+    def by_sharpe(row: dict[str, Any]) -> float:
+        sharpe = row.get("sharpe")
+        return math.inf if sharpe is None else -float(sharpe)
 
-    for row in sorted((rows[a] for a in ids if a in rows), key=by_ir):
+    for row in sorted((rows[a] for a in ids if a in rows), key=by_sharpe):
+        alpha_id = str(row["alpha_id"])
         settings = {name: row.get(column) for name, column, _ in COPIED_SETTINGS}
-        labels = chosen_labels(schema, settings | {"instrumentType": row.get("instrument_type")})
         unsynced += row.get("language") is None
         expression = str(row.get("expression") or "")
+        brain = _brain_of(row)
         lines = [
             "Alpha Expression:",
             expression,
             "Classifications:",
             ", ".join(sorted(json_list(row.get("classifications")), key=str.casefold)) or "None",
             "Simulation Settings:",
+            *_settings_lines(schema, settings | {"instrumentType": row.get("instrument_type")}),
         ]
-        for name, _, title in COPIED_SETTINGS:
-            value = settings[name]
-            lines.append(f"{title}: {labels.get(name) or ('—' if value is None else value)}")
-        figures = brain_metrics(row)
+        figures = brain_metrics(row) | local.get(alpha_id, {})
+        figures["imbalance"] = _imbalance(figures["long_count"], figures["short_count"])
+        returns, drawdown = figures["returns"], figures["drawdown"]
+        # As the Alpha tables work it out: no ratio over a Drawdown of nothing.
+        figures["calmar"] = returns / drawdown if returns is not None and drawdown else None
         lines.append("Metrics:")
+        checks = _settled_checks(row, brain)
+        measured = {
+            str(c.get("name")): v for c in checks if isinstance(v := c.get("value"), int | float)
+        }
         for key, title, shown in COPIED_METRICS:
             value = figures.get(key)
             lines.append(f"{title}: {'—' if value is None else shown(value)}")
+            added: set[str] = set()
+            for name, (after, label, form) in CHECK_METRICS.items():
+                if after == key and name in measured and label not in added:
+                    added.add(label)
+                    lines.append(f"{label}: {form(measured[name])}")
+        constrained = (brain.get("is") or {}).get("investabilityConstrained")
+        if isinstance(constrained, dict) and constrained.get("sharpe") is not None:
+            lines.append("Investability Constrained Metrics:")
+            for key, title, shown in CONSTRAINED_FIGURES:
+                value = constrained.get(key)
+                lines.append(f"{title}: {shown(value) if isinstance(value, int | float) else '—'}")
+        listed = [f"- {_check_text(c)}" for c in checks if c.get("name") in COPIED_CHECKS]
+        verdict_line = _checks_line(checks, row)
+        if listed or verdict_line != "Checks:":
+            lines += [verdict_line, *listed]
         blocks.append("\n".join(lines))
         for field in _fields_in(expression):
             regions.setdefault(field, str(row.get("region")))
+    for failure in failures:
+        expression = str(failure.get("expression") or "")
+        blocks.append(
+            "\n".join(
+                [
+                    "Alpha Expression:",
+                    expression,
+                    "Simulation Settings:",
+                    *_settings_lines(schema, failure.get("settings") or {}),
+                    f"Simulation Error: {failure.get('error') or 'BRAIN gave no reason.'}",
+                ]
+            )
+        )
+        for field in _fields_in(expression):
+            regions.setdefault(field, str((failure.get("settings") or {}).get("region")))
+    if not glossaries:
+        return CopiedAlphas(text="\n\n---\n\n".join(blocks), unsynced=unsynced)
     described: dict[str, dict[str, Any]] = {}
     for region in set(regions.values()):
         wanted = [f for f, r in regions.items() if r == region]
@@ -447,9 +746,16 @@ async def markdown(body: CopyRequest, state: State) -> CopiedAlphas:
     datasets = await state.queries.datasets_described(
         sorted({str(d["dataset_id"]) for d in described.values() if d.get("dataset_id")})
     )
+    blocks.append(METRIC_GLOSSARY)
     if regions:
         blocks.append(_glossary(list(regions), described, datasets))
     return CopiedAlphas(text="\n\n---\n\n".join(blocks), unsynced=unsynced)
+
+
+@router.post("/markdown")
+async def markdown(body: CopyRequest, state: State) -> CopiedAlphas:
+    """These Alphas as BRAIN shows them; see :func:`copied_alphas`."""
+    return await copied_alphas(state, body.alpha_ids)
 
 
 @router.post("/compute")

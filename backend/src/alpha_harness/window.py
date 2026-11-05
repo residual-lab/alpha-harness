@@ -6,8 +6,6 @@ page and a desktop app to the person using it. Only the *default* browser is eve
 in its ordinary profile: a different browser, or a private profile, would start the app with
 none of the drafts and settings the reader's browser already keeps for it. Anything else —
 Firefox, Safari, a browser that cannot be found — gets a tab, exactly as before.
-
-Standard library only: the launcher keeps a copy of this, and must run with no venv at all.
 """
 
 import os

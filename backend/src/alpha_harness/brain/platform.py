@@ -27,9 +27,10 @@ MAX_DECAY = 512
 #: The last two of the ten simulated years are held out.
 TEST_PERIOD_YEARS = 2
 TEST_PERIOD = f"P{TEST_PERIOD_YEARS}Y0M0D"
-#: BRAIN's bounds on the test period: ``P0Y0M0D`` to ``P6Y0M0D``, months 0 to 11.
+#: BRAIN's bounds on the test period: ``P0Y0M0D`` to ``P6Y0M0D``, months 0 to 11. Six years is
+#: the whole of it: ``P6Y1M0D`` is refused, "Must be less than or equal to P6Y0M0D".
 MAX_TEST_PERIOD_YEARS, MAX_TEST_PERIOD_MONTHS = 6, 11
-TEST_PERIOD_PATTERN = r"^P[0-6]Y(?:[0-9]|1[01])M0D$"
+TEST_PERIOD_PATTERN = r"^P(?:[0-5]Y(?:[0-9]|1[01])|6Y0)M0D$"
 #: The history BRAIN simulates.
 SIMULATION_YEARS = 10
 
@@ -86,7 +87,12 @@ RA_UNIVERSES: dict[str, dict[str, str]] = {
 
 # --- expressions -----------------------------------------------------------------------
 
-#: Left out of BRAIN's operator count.
+#: What names a Fast D1 field: its regular Delay 1 field's data as of today's open, "every Fast
+#: D1 field has a regular D1 equivalent (just without the _fast_d1 suffix)".
+FAST_D1_SUFFIX = "_fast_d1"
+#: Where BRAIN offers Fast D1: "currently available only in the USA region", at Delay 1.
+FAST_D1_MARKET = ("USA", 1)
+#: Left out of Power Pool's operator count, though BRAIN's stored ``operatorCount`` has them.
 UNCOUNTED_OPERATORS = frozenset({"ts_backfill", "group_backfill"})
 #: A Power Pool Alpha's most operators and unique data fields.
 POWER_POOL_MAX_OPERATORS = 8
@@ -161,6 +167,8 @@ RA_MIN_PASSING_CHILDREN = 2
 REGULAR_CLASS = "Regular Alpha"
 POWER_POOL_CLASS = "Power Pool Alpha"
 REGION_AGNOSTIC_CLASS = "Region Agnostic"
+#: BRAIN's classification id for a single dataset Alpha, an ATOM.
+SINGLE_DATASET_CLASS = "DATA_USAGE:SINGLE_DATA_SET"
 
 #: ARC2026's Sharpe steps: one point from the first, two from the second.
 ARC_ONE_POINT_SHARPE, ARC_TWO_POINTS_SHARPE = 1.58, 2.0
