@@ -37,6 +37,8 @@ class PowerPoolRequest(BaseModel):
     universe: str
     dataset_ids: list[str] = Field(default_factory=list, max_length=50)
     model: str | None = None
+    #: Never switch to another model when ``model`` cannot answer: wait for it instead.
+    only_model: bool = False
     #: What the LLM draws from. Empty is refused: see ``NO_NEUTRALIZATION``.
     neutralizations: list[str] = Field(default_factory=list, max_length=20)
     #: The universes each Alpha is drawn from. Empty means every downloaded one.
@@ -77,27 +79,9 @@ class PowerPoolPreview(Out):
     warnings: list[str]
 
 
-async def _models(state: Any) -> list[dict[str, Any]]:
-    """Set-up models whose provider has an enabled Key, most requests left today first."""
-    keys = [k for k in await state.llm.keys.list_keys() if k.enabled]
-    out = []
-    for m in state.llm.registry.all():
-        mine = [k for k in keys if k.provider == m.provider]
-        if not mine:
-            continue
-        left = sum(
-            [
-                (await state.llm.ledger.headroom(k.id, m, cap=k.daily_limit)).daily_remaining
-                for k in mine
-            ]
-        )
-        out.append({"id": m.id, "ref": m.ref, "provider": m.provider, "remainingToday": left})
-    return sorted(out, key=lambda m: -m["remainingToday"])
-
-
 @router.get("/options")
 async def options(state: State) -> PowerPoolOptions:
-    models = await _models(state)
+    models = await state.llm.runnable()
     return PowerPoolOptions.model_validate(
         {
             "models": models,
@@ -115,7 +99,7 @@ async def _plan(body: PowerPoolRequest, state: Any) -> dict[str, Any]:
         problems.append(OPERATORS_UNREAD)
     if not body.dataset_ids:
         problems.append("Choose at least one dataset.")
-    models = {m["ref"]: m for m in await _models(state)}
+    models = {m["ref"]: m for m in await state.llm.runnable()}
     ref = body.model or next(iter(models), "")
     info = state.llm.registry.get(ref)
     if not ref:
@@ -240,6 +224,7 @@ async def add_task(body: PowerPoolRequest, state: State) -> AddedTask:
                 else None
             ),
             model=plan["model"],
+            only_model=body.only_model,
             cores=body.cores,
             llm={"calls": 0},
         ),

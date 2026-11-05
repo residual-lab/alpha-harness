@@ -3,6 +3,8 @@
  * precision is fixed per measure. A genuinely absent value is an em dash, never 0.
  */
 
+import { PLATFORM_TIMEZONE } from '@/api/platform'
+
 export const DASH = '—'
 
 export const isNum = (value: unknown): value is number =>
@@ -17,6 +19,8 @@ const DATE = new Intl.DateTimeFormat('en-US', DAY)
 // A bare YYYY-MM-DD is a calendar day, parsed as UTC midnight: read it in UTC, or west of
 // UTC it shows the day before.
 const DATE_UTC = new Intl.DateTimeFormat('en-US', { ...DAY, timeZone: 'UTC' })
+// en-CA writes YYYY-MM-DD.
+const PLATFORM_DAY = new Intl.DateTimeFormat('en-CA', { timeZone: PLATFORM_TIMEZONE })
 const MONTH_UTC = new Intl.DateTimeFormat('en-US', {
   month: 'short',
   year: 'numeric',
@@ -31,24 +35,31 @@ const DATE_TIME = new Intl.DateTimeFormat('en-US', {
 })
 
 /** The moment an ISO string names, or null when it is not one. */
-function moment(iso: string | null | undefined): Date | null {
+/** An ISO time as a Date, an offset-less one read as UTC; `null` when it is not one. */
+export function moment(iso: string | null | undefined): Date | null {
   if (!iso) return null
   const parsed = new Date(normaliseIso(iso))
   // Formatting an Invalid Date throws, which would blank the screen over one bad field.
   return Number.isNaN(parsed.getTime()) ? null : parsed
 }
 
+/** `toFixed` without the `-0.00` a tiny negative rounds to. */
+const fixed = (v: number, digits: number) => {
+  const text = v.toFixed(digits)
+  return /^-[0.]+$/.test(text) ? text.slice(1) : text
+}
+
 export const fmt = {
   /** 5,000 */
   int: (v: number | null | undefined) => (isNum(v) ? INT.format(Math.round(v)) : DASH),
   /** 1.58 — Sharpe and Fitness. */
-  ratio: (v: number | null | undefined, digits = 2) => (isNum(v) ? v.toFixed(digits) : DASH),
+  ratio: (v: number | null | undefined, digits = 2) => (isNum(v) ? fixed(v, digits) : DASH),
   /** A fraction as a percent: 0.643 → 64.3% */
   pct: (v: number | null | undefined, digits = 1) =>
-    isNum(v) ? `${(v * 100).toFixed(digits)}%` : DASH,
+    isNum(v) ? `${fixed(v * 100, digits)}%` : DASH,
   /** A fraction as basis points: 0.0005 → 5.0 bps */
   bps: (v: number | null | undefined, digits = 1) =>
-    isNum(v) ? `${(v * 10_000).toFixed(digits)} bps` : DASH,
+    isNum(v) ? `${fixed(v * 10_000, digits)} bps` : DASH,
   /** 12.4K */
   compact: (v: number | null | undefined) => (isNum(v) ? COMPACT.format(v) : DASH),
   /** 2h 05m, 4m 12s, 9s */
@@ -72,6 +83,11 @@ export const fmt = {
     const at = moment(iso)
     if (!at) return DASH
     return ((iso?.length ?? 0) <= 10 ? DATE_UTC : DATE).format(at)
+  },
+  /** 2026-10-08: the day on BRAIN's clock, which counts days in New York, not UTC. */
+  platformDay: (iso: string | null | undefined) => {
+    const at = moment(iso)
+    return at ? PLATFORM_DAY.format(at) : DASH
   },
   /** Sep 2026: for a date known only to the month, such as a Data Field's Date Added. */
   month: (iso: string | null | undefined) => {
@@ -99,16 +115,17 @@ type Figure = (v: number | null | undefined) => string
 
 /** BRAIN's six core figures, named and written the same wherever they appear. `signed`: the
  *  sign means gain or loss, so the figure takes profit or loss colour. */
+/** Each figure's tone is `figureTone` in the kit. */
 export const CORE_METRICS: Record<
   'sharpe' | 'turnover' | 'fitness' | 'returns' | 'drawdown' | 'margin',
-  { label: string; show: Figure; signed: boolean }
+  { label: string; show: Figure }
 > = {
-  sharpe: { label: 'Sharpe', show: (v) => fmt.ratio(v), signed: true },
-  turnover: { label: 'Turnover', show: (v) => fmt.pct(v, 2), signed: false },
-  fitness: { label: 'Fitness', show: (v) => fmt.ratio(v), signed: true },
-  returns: { label: 'Returns', show: (v) => fmt.pct(v, 2), signed: true },
-  drawdown: { label: 'Drawdown', show: (v) => fmt.pct(v, 2), signed: false },
-  margin: { label: 'Margin', show: (v) => fmt.bps(v, 2), signed: true },
+  sharpe: { label: 'Sharpe', show: (v) => fmt.ratio(v) },
+  turnover: { label: 'Turnover', show: (v) => fmt.pct(v, 2) },
+  fitness: { label: 'Fitness', show: (v) => fmt.ratio(v) },
+  returns: { label: 'Returns', show: (v) => fmt.pct(v, 2) },
+  drawdown: { label: 'Drawdown', show: (v) => fmt.pct(v, 2) },
+  margin: { label: 'Margin', show: (v) => fmt.bps(v, 2) },
 }
 
 /** The order figures are read in, Sharpe first. */
@@ -129,5 +146,5 @@ export function secondsSince(iso: string | null | undefined, now = Date.now()): 
 
 /** Some backend timestamps carry no offset; they are UTC. */
 function normaliseIso(iso: string): string {
-  return /[zZ]|[+-]\d\d:\d\d$/.test(iso) || iso.length <= 10 ? iso : `${iso}Z`
+  return /[zZ]|[+-]\d\d:?\d\d$/.test(iso) || iso.length <= 10 ? iso : `${iso}Z`
 }

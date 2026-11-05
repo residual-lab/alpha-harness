@@ -11,41 +11,40 @@ import { Link, useParams } from '@tanstack/react-router'
 import { ArrowLeftIcon } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { cn } from '@/lib/cn'
-import { DASH, fmt } from '@/lib/format'
+import { CORE_ORDER, DASH, fmt } from '@/lib/format'
 import { useRefetchOn } from '@/lib/ws'
-import { DetailSheet } from '@/screens/pool/detail'
+import { useDetailSheet } from '@/screens/pool/detail'
 import { AstInspector } from '@/screens/pool/shared'
 import { AlphaPane } from '@/screens/tasks/alpha-pane'
-import { labTasks, type RankedAlpha } from '@/screens/tasks/api'
+import { labTasks, type RankedAlpha, TOP_LIMIT } from '@/screens/tasks/api'
 import {
-  ALPHA_ID,
-  compareAlphas,
-  FAILED_CHECKS,
   Figure,
-  METRIC_COLUMNS,
   METRICS,
   metricHeader,
-  PROD_CORRELATION,
-  SETTING_COLUMNS,
   setting,
-  TRUNCATION,
+  TASK_OFFER,
   taskStatus,
 } from '@/screens/tasks/columns'
 import { Button, Empty, ErrorNotice, KV, Metric, Page, PageHeader, Panel, Skeleton } from '@/ui/kit'
 import { type Column, DataTable, type Sort } from '@/ui/table'
 
-/** The sweep's whole result set, not a page of it: the comparison needs every row. */
-const LIMIT = 2000
-
 const market = (r: RankedAlpha) => setting(r, 'region') || DASH
 
-const columns = (agent: boolean): Column<RankedAlpha>[] => [
-  ALPHA_ID,
-  ...SETTING_COLUMNS,
-  ...(agent ? [TRUNCATION] : []),
-  PROD_CORRELATION,
-  FAILED_CHECKS,
-  ...METRIC_COLUMNS,
+const everyAlphaDefaults = (agent: boolean) => [
+  'alphaId',
+  'region',
+  'delay',
+  'universe',
+  'neutralization',
+  'investability',
+  ...(agent ? ['truncation'] : []),
+  'powerPoolCorrelation',
+  'prodCorrelation',
+  'failedChecks',
+  ...CORE_ORDER,
+  'afterCostSharpe',
+  'testSharpe',
+  'testFitness',
 ]
 
 /**
@@ -171,14 +170,15 @@ export function TaskResultsScreen() {
   const { taskId } = useParams({ from: '/tasks/$taskId' })
   const id = Number(taskId)
   const [sort, setSort] = useState<Sort>({ key: 'sharpe', desc: true })
-  const [alphaId, setAlphaId] = useState<string | null>(null)
+  const detail = useDetailSheet()
 
   const tasks = useQuery({ queryKey: ['lab-tasks'], queryFn: labTasks.list })
   const task = tasks.data?.tasks.find((t) => t.id === id)
 
   const top = useQuery({
     queryKey: ['lab-tasks', id, 'results'],
-    queryFn: () => labTasks.top(id, LIMIT),
+    // The sweep's whole result set, not a page of it: the comparison needs every row.
+    queryFn: () => labTasks.top(id, TOP_LIMIT),
     enabled: Number.isFinite(id),
   })
   const rows = useMemo(() => top.data ?? [], [top.data])
@@ -227,6 +227,13 @@ export function TaskResultsScreen() {
           ['Truncation', task.truncationAgent ? 'Truncation Agent' : task.truncation],
           ['NaN Handling', task.nanHandling],
           ['Test Period', task.testPeriod],
+          // Which models answered, when a Power Pool task moved between them.
+          [
+            'Models',
+            Object.entries(task.llmModels ?? {})
+              .map(([model, calls]) => `${model} × ${fmt.int(calls)}`)
+              .join(', '),
+          ],
         ].filter(([, v]) => v != null && v !== '') as [string, string | number][]
       ).map(([label, value]) => [label, String(value)])
     : []
@@ -234,6 +241,8 @@ export function TaskResultsScreen() {
   // The download reports progress through the task registry, so the rows refresh as its
   // broadcasts land rather than on a timer of their own.
   useRefetchOn('tasks', ['lab-tasks', id, 'results'], 5000)
+  // The lab itself reports on its own topic: the task's status, and the rows with it.
+  useRefetchOn('studies', ['lab-tasks'], 10_000)
 
   const green = rows.filter((r) => r.submittable || r.pending).length
   const pending = rows.filter((r) => r.pending).length
@@ -250,7 +259,7 @@ export function TaskResultsScreen() {
             : 'Every Alpha this task produced'
         }
         actions={
-          <Button variant="ghost" render={<Link to="/tasks" />}>
+          <Button variant="ghost" render={<Link to="/tasks" search={{ task: id }} />}>
             <ArrowLeftIcon />
             Back to Tasks
           </Button>
@@ -277,7 +286,16 @@ export function TaskResultsScreen() {
       )}
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Metric boxed label="Alphas" value={fmt.int(rows.length)} />
+        <Metric
+          boxed
+          label="Alphas"
+          value={fmt.int(rows.length)}
+          hint={
+            rows.length >= TOP_LIMIT && task
+              ? `The best ${fmt.int(TOP_LIMIT)} of ${fmt.int(task.simulated)} simulated`
+              : ''
+          }
+        />
         <Metric
           boxed
           tone="profit"
@@ -360,20 +378,22 @@ export function TaskResultsScreen() {
 
       <AlphaPane
         title="Every Alpha"
+        initial="all"
+        view="every-alpha"
         rows={rows}
-        columns={() => columns(Boolean(task?.truncationAgent))}
-        compare={compareAlphas}
-        poolColumnAfter="investability"
+        offer={TASK_OFFER}
+        defaults={everyAlphaDefaults(Boolean(task?.truncationAgent))}
         sort={sort}
         onSort={setSort}
         loading={top.isPending}
         error={top.error}
         onRefresh={() => top.refetch()}
-        onOpenAlpha={setAlphaId}
+        onOpenAlpha={detail.open}
+        openAlpha={detail.openId}
       />
 
       <CheckSets rows={rows} />
-      <DetailSheet alphaId={alphaId} onClose={() => setAlphaId(null)} />
+      {detail.sheet}
     </Page>
   )
 }

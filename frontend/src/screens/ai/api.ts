@@ -75,15 +75,6 @@ export interface ChatSayRequest {
 
 export type ChatReply = Omit<Schemas['ChatReply'], 'picks'> & { picks: ChatPick[] }
 
-/** A downloaded catalog scope. Raw row, snake_case. */
-export interface DownloadedScope {
-  instrument_type: string
-  region: string
-  delay: number
-  universe: string
-  fields: number
-}
-
 export const llm = {
   providers: () => http.get<LLMProvidersResponse>('/api/llm/providers'),
   models: () => http.get<LLMModels>('/api/llm/models'),
@@ -120,7 +111,6 @@ export const chat = {
   deleteThread: (id: number) => http.del<void>(`/api/chat/threads/${id}`),
   /** Spends one assistant request. An undownloaded scope fails with a plain 500. */
   say: (body: ChatSayRequest) => http.post<ChatReply>('/api/chat', body),
-  downloadedScopes: () => http.get<DownloadedScope[]>('/api/catalog/scopes'),
 }
 
 /** The extra facts a 429 llm_budget_exhausted carries: when to retry, and what is left. */

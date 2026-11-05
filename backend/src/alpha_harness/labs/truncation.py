@@ -9,11 +9,12 @@ tighter so a few names cannot carry the book.
 
 import re
 
-#: The consultant Weight test: largest weight in one stock below 8% in USA, 10% elsewhere.
-CEILING = 0.08
+from ..brain.platform import MAX_STOCK_WEIGHT_USA, MULTI_COUNTRY_REGIONS, REGION_AGNOSTIC_REGION
+
+CEILING = MAX_STOCK_WEIGHT_USA
 BROAD, MID, NARROW = 0.08, 0.06, 0.05
-#: Regions spanning several countries, where one country's shock lands on a few names.
-MULTI_COUNTRY = frozenset({"GLB", "EUR", "ASI", "AMR", "ALL"})
+#: All Regions spans every country at once.
+MULTI_COUNTRY = MULTI_COUNTRY_REGIONS | {REGION_AGNOSTIC_REGION}
 TIGHT = 0.05
 
 

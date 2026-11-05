@@ -1,0 +1,5 @@
+# The Rust the desktop app is built and released with, locally and in CI alike.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

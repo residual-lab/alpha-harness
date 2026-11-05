@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from sqlalchemy import case, update
 
 from ..brain.errors import BrainError
+from ..brain.platform import GLB_REGION, GLB_SLOTS, RA_CHILDREN, RA_SLOTS
 from ..brain.schemas import FULL_MODE, SimulationRequest, SimulationStatus, SimulationType
 from ..db.models import ACTIVE, DedupEntry, QuotaSnapshot, SimStatus, SimulationRecord, utcnow
 
@@ -27,41 +28,12 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from datetime import datetime
 
-#: Most regions a region-agnostic simulation is translated into, and so the most cores and
-#: daily simulations one can cost ("Concurrent simulation quota: counts the sum of RA Child
-#: Alphas' concurrent quota").
-#:
-#: A ceiling rather than the figure: the expression runs on the *intersection* of the regions
-#: its fields cover, and one measured here made two children, not four. Nothing says which
-#: before it is sent, so reserving four spends the day a little early rather than asking BRAIN
-#: for capacity it has already given away.
-RA_CHILDREN = 4
-
 #: What one row costs off the day's allowance. BRAIN charges a region-agnostic row per
 #: region it is translated into rather than per request. GLB is *not* doubled here: its
 #: rule is about concurrency, not the allowance — see :data:`SLOT_COST`.
 SIMULATION_COST = case(
     (SimulationRecord.sim_type == SimulationType.REGION_AGNOSTIC, RA_CHILDREN), else_=1
 )
-
-#: The region BRAIN meters at double rate.
-GLB_REGION = "GLB"
-#: Concurrent slots one GLB simulation holds. "4 concurrent simulations for GLB Alphas (each
-#: simulation now takes 2 slots out of the available 8 slots)" — BRAIN announcement,
-#: 2025-09-23. A multi-simulation is one simulation to BRAIN, so a GLB batch holds two slots
-#: however many children it carries.
-GLB_SLOTS = 2
-
-#: Concurrent cores a region-agnostic simulation holds: "the sum of RA Child Alphas'
-#: concurrent quota". So it is not one number — it is however many regions the expression's
-#: fields intersect, with GLB counting twice. Measured over this account's own RA Alphas:
-#: ten cost three (USA, EUR, ASI), two cost two, one cost five because it reached GLB.
-#:
-#: Three is the typical figure rather than the worst case, so two run at once. Guessing low
-#: is the cheap direction: going over answers ``429`` on the *post*, and a throttled
-#: simulation goes back in the queue without starting, so nothing is spent. Guessing high
-#: idles cores that are genuinely free, every time, which nothing gives back.
-RA_SLOTS = 3
 
 #: What one row costs in *concurrent cores*, which is not the same as what it costs off the
 #: day's allowance. Counting GLB as one would let the engine keep eight GLB simulations out
@@ -424,25 +396,15 @@ def extract_simulation_id(location: str | None) -> str | None:
 
 
 class SubmissionFailed(RuntimeError):
-    """A simulation could not be started. ``record_id`` is the row that recorded it.
+    """A simulation could not be started.
 
     ``message`` carries the platform's own words wherever it gave any — a researcher
-    needs "TOP9000 is not a valid choice", not "rejected". ``fields`` keeps the
-    structured form so the UI can mark the offending input.
+    needs "TOP9000 is not a valid choice", not "rejected".
     """
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        record_id: int | None,
-        cause: Exception | None = None,
-        fields: dict[str, Any] | None = None,
-    ) -> None:
+    def __init__(self, message: str, *, cause: Exception | None = None) -> None:
         super().__init__(message)
-        self.record_id = record_id
         self.cause = cause
-        self.fields = fields or {}
 
 
 # -- wire shape --------------------------------------------------------------

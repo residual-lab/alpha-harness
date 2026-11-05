@@ -31,6 +31,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from ..brain.platform import INSTRUMENT_TYPE
+
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
@@ -78,6 +80,10 @@ class Credential(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
     last_login_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
+    #: Set when BRAIN refused this login or the person signed out: the app does not sign in
+    #: with it by itself again until the person does. Each refused sign-in spends BRAIN's
+    #: lockout budget.
+    silent_off_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
 
 
 class BrainSessionRow(Base):
@@ -91,9 +97,9 @@ class BrainSessionRow(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     credential_id: Mapped[int] = mapped_column(ForeignKey("credential.id", ondelete="CASCADE"))
     cookies_sealed: Mapped[bytes] = mapped_column(LargeBinary)
-    user_id: Mapped[str | None] = mapped_column(String(64))
+    #: Never read. Kept because it is NOT NULL with no server default: dropped here, a previous
+    #: build the launcher falls back to could not add it again, and would not start.
     permissions: Mapped[list[Any]] = mapped_column(JSON, default=list)
-    expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)
 
@@ -174,7 +180,7 @@ class SimulationRecord(Base):
 
     # Batch-packing key: children of one multi-simulation must agree on all of these.
     sim_type: Mapped[str] = mapped_column(String(16), default="REGULAR")
-    instrument_type: Mapped[str] = mapped_column(String(16), default="EQUITY")
+    instrument_type: Mapped[str] = mapped_column(String(16), default=INSTRUMENT_TYPE)
     region: Mapped[str] = mapped_column(String(16))
     delay: Mapped[int] = mapped_column(Integer)
     language: Mapped[str] = mapped_column(String(16), default="FASTEXPR")
@@ -202,6 +208,10 @@ class SimulationRecord(Base):
     __table_args__ = (
         Index("ix_sim_active", "status", "created_at"),
         Index("ix_sim_batch_key", "sim_type", "instrument_type", "region", "delay", "language"),
+        # For the engine's every-tick reads, which otherwise scan every row ever simulated.
+        Index("ix_sim_unexpanded", "is_batch", "children_expanded"),
+        Index("ix_sim_finished", "status", "finished_at"),
+        Index("ix_sim_sent_day", "is_batch", "submitted_at"),
     )
 
     @property
@@ -301,7 +311,7 @@ class SyncRun(Base):
     __tablename__ = "sync_run"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    instrument_type: Mapped[str] = mapped_column(String(16), default="EQUITY")
+    instrument_type: Mapped[str] = mapped_column(String(16), default=INSTRUMENT_TYPE)
     region: Mapped[str] = mapped_column(String(16))
     delay: Mapped[int] = mapped_column(Integer)
     universe: Mapped[str] = mapped_column(String(32))
@@ -315,6 +325,8 @@ class SyncRun(Base):
 
     datasets_synced: Mapped[int] = mapped_column(Integer, default=0)
     fields_synced: Mapped[int] = mapped_column(Integer, default=0)
+    #: No longer counted. Kept because it is NOT NULL with no server default: dropped here, a
+    #: previous build the launcher falls back to could not add it again, and would not start.
     categories_synced: Mapped[int] = mapped_column(Integer, default=0)
 
     error: Mapped[str | None] = mapped_column(Text)
@@ -457,10 +469,6 @@ class Trial(Base):
 
     state: Mapped[str] = mapped_column(String(16), default=TrialState.QUEUED, index=True)
     values: Mapped[list[Any] | None] = mapped_column(JSON)
-    #: Submission-check violations, keyed by the platform's own check name. Zero or
-    #: less is feasible, following Optuna's convention.
-    constraint: Mapped[dict[str, Any] | None] = mapped_column(JSON)
-    feasible: Mapped[bool | None] = mapped_column()
     result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     message: Mapped[str | None] = mapped_column(Text)
 
@@ -495,7 +503,7 @@ class ChatThread(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(160))
-    instrument_type: Mapped[str] = mapped_column(String(16), default="EQUITY")
+    instrument_type: Mapped[str] = mapped_column(String(16), default=INSTRUMENT_TYPE)
     region: Mapped[str] = mapped_column(String(16))
     delay: Mapped[int] = mapped_column(Integer)
     universe: Mapped[str] = mapped_column(String(32))
@@ -591,17 +599,3 @@ class LLMModel(Base):
     # An index rather than a table constraint, so a database that already has the table
     # gains it on startup: SQLite cannot add a constraint to a live table.
     __table_args__ = (Index("uq_llm_model_provider_model", "provider", "model", unique=True),)
-
-
-class Submission(Base):
-    """An Alpha the consultant has told us they submitted on BRAIN.
-
-    Submission happens by hand on the platform, so nothing here can observe it. The row is
-    the user's own record, and the Submission Planner treats it as a permanent pool member
-    every later candidate has to clear.
-    """
-
-    __tablename__ = "submission"
-
-    alpha_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    submitted_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)

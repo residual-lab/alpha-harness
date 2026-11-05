@@ -14,6 +14,19 @@ import msgspec
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 
+from .platform import (
+    DEFAULT_DECAY,
+    DEFAULT_NAN_HANDLING,
+    DEFAULT_NEUTRALIZATION,
+    DEFAULT_PASTEURIZATION,
+    DEFAULT_TRUNCATION,
+    DEFAULT_UNIT_HANDLING,
+    INSTRUMENT_TYPE,
+    LANGUAGE,
+    REGION_AGNOSTIC_REGION,
+    TEST_PERIOD,
+)
+
 
 class BrainModel(BaseModel):
     model_config = ConfigDict(
@@ -41,11 +54,6 @@ class SimulationType(StrEnum):
     REGION_AGNOSTIC = "REGION_AGNOSTIC"
     RA_PARENT = "RA_PARENT"
     RA_CHILD = "RA_CHILD"
-
-
-#: The region that means "all of them at once". BRAIN offers it only under the
-#: ``REGION_AGNOSTIC`` simulation type, so choosing it *is* choosing that type.
-REGION_AGNOSTIC_REGION = "ALL"
 
 
 #: The simulation mode whose Alphas BRAIN refuses to submit — and refuses even to check:
@@ -137,18 +145,18 @@ class SimulationSettings(BrainModel):
     ``OPTIONS /simulations`` rather than trusting these types.
     """
 
-    instrument_type: str = "EQUITY"
+    instrument_type: str = INSTRUMENT_TYPE
     region: str
     universe: str
     delay: int
-    decay: int = 0
-    neutralization: str = "NONE"
-    truncation: float = 0.08
-    pasteurization: str = "ON"
-    unit_handling: str = "VERIFY"
+    decay: int = DEFAULT_DECAY
+    neutralization: str = DEFAULT_NEUTRALIZATION
+    truncation: float = DEFAULT_TRUNCATION
+    pasteurization: str = DEFAULT_PASTEURIZATION
+    unit_handling: str = DEFAULT_UNIT_HANDLING
     #: Always ``ON`` in what this application sends; see :class:`SimulationRequest`.
-    nan_handling: str = "ON"
-    language: str = "FASTEXPR"
+    nan_handling: str = DEFAULT_NAN_HANDLING
+    language: str = LANGUAGE
     visualization: bool = False
     test_period: str | None = None
     max_trade: str | None = None
@@ -162,10 +170,6 @@ class SimulationSettings(BrainModel):
     selection_handling: str | None = None
     selection_limit: int | None = None
     component_activation: str | None = None
-
-
-#: BRAIN's test period: the last two of the ten years are held out.
-TEST_PERIOD = "P2Y0M0D"
 
 
 class SimulationRequest(BrainModel):
@@ -444,17 +448,6 @@ class BulkFields(msgspec.Struct):
 #: Reused: building the decoders once is most of their cost.
 BULK_FIELDS = msgspec.json.Decoder(list[BulkField])
 BULK_FIELDS_ENVELOPE = msgspec.json.Decoder(BulkFields)
-
-
-class DataCategory(BrainModel):
-    """An entry of ``GET /data-categories``. Categories nest one level."""
-
-    id: str
-    name: str | None = None
-    subcategories: list[DataCategory] = Field(default_factory=list)
-    dataset_count: int | None = None
-    field_count: int | None = None
-    value_score: float | None = None
 
 
 class Operator(BrainModel):

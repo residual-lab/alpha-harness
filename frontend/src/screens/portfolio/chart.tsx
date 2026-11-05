@@ -2,14 +2,23 @@
 
 import { LineSeries, TickMarkType, type Time } from 'lightweight-charts'
 import { useEffect, useRef } from 'react'
-import { underwater } from '@/screens/alpha/analysis'
+import { BOOK_SIZE } from '@/api/platform'
 import { addUnderwater, baseChart, color, compact, zeroLine } from '@/screens/pool/pnl-chart'
 
 /** Drawdown is stated as BRAIN states it, over half this book. */
-const BOOK = 20_000_000
+const BOOK = BOOK_SIZE
 
 export const TRAIN_COLOR = 'color-status-running'
 export const TEST_COLOR = 'color-status-warning'
+
+/** Distance below the running peak each day, as a fraction of half the book. */
+function underwater(points: { date: string; value: number }[], bookSize: number) {
+  let peak = Number.NEGATIVE_INFINITY
+  return points.map((p) => {
+    peak = Math.max(peak, p.value)
+    return { date: p.date, value: (p.value - peak) / (bookSize / 2) }
+  })
+}
 
 const yearOf = (time: Time) =>
   typeof time === 'object' ? String(time.year) : String(time).slice(0, 4)

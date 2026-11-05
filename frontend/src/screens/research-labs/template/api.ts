@@ -86,9 +86,11 @@ export const templateLab = {
   stats: (body: { region: string; delay: number; templates: Sizing[] }) =>
     http.post<{ stats: TemplateStats[] }>(`${B}/stats`, body),
   /** The template as the Blocks view draws it, or why it can't be read. */
-  tree: (text: string) => http.post<Schemas['TemplateTree']>(`${B}/tree`, { text }),
+  tree: (text: string, signal?: AbortSignal) =>
+    http.post<Schemas['TemplateTree']>(`${B}/tree`, { text }, signal),
   /** Free; queues nothing. */
-  preview: (body: TemplateLabRequest) => http.post<TemplateLabPreview>(`${B}/preview`, body),
+  preview: (body: TemplateLabRequest, signal?: AbortSignal) =>
+    http.post<TemplateLabPreview>(`${B}/preview`, body, signal),
   /** Adds the template's search to Tasks, not started. Spends nothing until it is run there. */
   addTask: (body: TemplateLabRequest & { simulations: number }) =>
     http.post<Schemas['AddedTask']>(`${B}/tasks`, body),

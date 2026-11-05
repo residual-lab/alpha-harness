@@ -6,21 +6,31 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CopyIcon, RefreshCwIcon } from 'lucide-react'
-import { Fragment, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { tasks } from '@/api/core'
 import { errorMessage } from '@/api/http'
+import { REGION_AGNOSTIC_CLASS } from '@/api/platform'
 import { cn } from '@/lib/cn'
 import { CORE_METRICS, CORE_ORDER, DASH, fmt } from '@/lib/format'
 import { useLive } from '@/lib/live'
 import { useDebounced } from '@/lib/use-debounced'
-import { useRefetchOn } from '@/lib/ws'
-import { DetailSheet } from '@/screens/pool/detail'
+import {
+  AlphaTable,
+  type AlphaTableRow,
+  CostInput,
+  fromMember,
+  useCostBps,
+  useNetBps,
+} from '@/screens/alpha-table'
+import { INVESTABILITY } from '@/screens/alpha-table/columns'
+import { alphaIds, useDetailSheet } from '@/screens/pool/detail'
 import {
   Button,
   Chips,
+  Disclosure,
   ErrorNotice,
-  Input,
+  figureTone,
   Notice,
   Page,
   PageHeader,
@@ -29,10 +39,10 @@ import {
   Skeleton,
   signTone,
   TEXT_TONE,
+  Textarea,
 } from '@/ui/kit'
-import { type Column, DataTable, type Sort } from '@/ui/table'
+import { type Column, DataTable } from '@/ui/table'
 import {
-  type Investability,
   type PortfolioMember,
   type PortfolioResult,
   type PortfolioStats,
@@ -42,12 +52,8 @@ import {
 import { ChartLegend, PortfolioChart } from './chart'
 import { CorrelationMatrix } from './correlation'
 import { PyramidPicker } from './pyramid-grid'
-
-const INVESTABILITY: Record<Investability, string> = {
-  max_trade: 'Max Trade',
-  max_position: 'Max Position',
-  none: 'None',
-}
+import { compile, SelectionError } from './selection'
+import { SelectionInfo } from './selection-info'
 
 /** One block of filter chips. Within a block any match keeps an Alpha; blocks combine with AND. */
 interface Facet {
@@ -71,32 +77,28 @@ const FACETS: Facet[] = [
 
 const facetOf = (key: string) => FACETS.find((f) => f.key === key) as Facet
 
-type MetricKey = (typeof CORE_ORDER)[number]
-
-const METRICS = CORE_ORDER.map((key) => ({ key, ...CORE_METRICS[key] }))
+/** Where the table's choice of columns and its cost are kept. */
+const VIEW = 'portfolio'
 
 function metricColumns<T>(
-  get: (row: T) => Partial<Record<MetricKey, number | null>> | null,
-  width = 'minmax(84px,1fr)',
+  get: (row: T) => Partial<Record<(typeof CORE_ORDER)[number], number | null>> | null,
 ) {
-  return METRICS.map(
-    (m): Column<T> => ({
-      key: m.key,
+  return CORE_ORDER.map((key): Column<T> => {
+    const m = CORE_METRICS[key]
+    return {
+      key,
       header: m.label,
       align: 'right',
       // "39.23 bps" is the widest figure; at the shared width it wrapped onto two lines.
-      width: m.key === 'margin' ? 'minmax(100px,1fr)' : width,
+      width: key === 'margin' ? 'minmax(100px,1fr)' : 'minmax(84px,1fr)',
       cell: (row) => {
-        const value = get(row)?.[m.key]
-        return (
-          <span className={cn('num', m.signed && TEXT_TONE[signTone(value)])}>{m.show(value)}</span>
-        )
+        const value = get(row)?.[key]
+        return <span className={cn('num', TEXT_TONE[figureTone(key, value)])}>{m.show(value)}</span>
       },
-    }),
-  )
+    }
+  })
 }
 
-/** The running Portfolio sync, from the live feed or, without one, a poll. */
 /** The latest Portfolio sync, running or just finished. */
 function useLastSync() {
   const live = useLive((s) => s.tasks)
@@ -107,6 +109,20 @@ function useLastSync() {
     refetchInterval: 3000,
   })
   return ((live ?? polled.data)?.tasks ?? []).filter((t) => t.kind === 'portfolio-sync').at(-1)
+}
+
+/** Refreshes the page as a Portfolio sync lands PnL, and when it ends: no other job changes it,
+ *  and every recompute reads every submitted Alpha's series. */
+function useRefreshOnSync() {
+  const queryClient = useQueryClient()
+  const sync = useLastSync()
+  const at = sync ? `${sync.id} ${sync.state} ${sync.progress}` : ''
+  const seen = useRef(at)
+  useEffect(() => {
+    if (seen.current === at) return
+    seen.current = at
+    void queryClient.invalidateQueries({ queryKey: ['portfolio'] })
+  }, [at, queryClient])
 }
 
 function useSyncTask() {
@@ -127,7 +143,7 @@ function SyncProgress() {
       </Notice>
     )
   if (task.state !== 'running')
-    return <p className="text-body-compact text-ink-muted">{task.detail}</p>
+    return task.detail ? <p className="text-body-compact text-ink-muted">{task.detail}</p> : null
   return (
     <div className="flex flex-col gap-1.5">
       <span className="text-body-compact text-ink-muted">{task.detail ?? task.label}</span>
@@ -156,22 +172,40 @@ function SyncButton() {
 }
 
 export function PortfolioScreen() {
-  const members = useQuery({ queryKey: ['portfolio', 'members'], queryFn: portfolio.members })
-  useRefetchOn('tasks', ['portfolio'], 2000)
+  const netNow = useNetBps(VIEW)
+  const charged = useDebounced(netNow, 400)
+  const members = useQuery({
+    queryKey: ['portfolio', 'members', charged ?? null],
+    queryFn: () => portfolio.members(charged),
+    placeholderData: keepPreviousData,
+  })
+  useRefreshOnSync()
 
   const [picked, setPicked] = useState<Record<string, string[]>>({})
+  const [selection, setSelection] = useState('')
+  const quietSelection = useDebounced(selection, 300)
   /** Ticked or unticked by hand, over what the filters pick. A filter change clears it. */
   const [overrides, setOverrides] = useState<ReadonlyMap<string, boolean>>(new Map())
-  const [openAlpha, setOpenAlpha] = useState<string | null>(null)
-  const [costText, setCostText] = useState('5')
-  const cost = useDebounced(Math.min(100, Math.max(0, Number(costText) || 0)), 400)
+  const detail = useDetailSheet()
+  const costNow = useCostBps(VIEW)
+  const cost = useDebounced(costNow, 400)
 
   const all = members.data?.members ?? []
+  const metricNames = Object.keys(all[0]?.metrics ?? {}).sort()
+  let rule: ReturnType<typeof compile> | undefined
+  let ruleError: string | undefined
+  try {
+    rule = compile(quietSelection, metricNames)
+  } catch (e) {
+    if (!(e instanceof SelectionError)) throw e
+    ruleError = e.message
+  }
   const matches = (m: PortfolioMember) =>
     FACETS.every((f) => {
       const want = picked[f.key] ?? []
       return !want.length || f.values(m).some((v) => want.includes(v))
-    })
+    }) &&
+    (rule?.test(m.metrics) ?? true)
   const choose = (key: string, value: string[]) => {
     setPicked((prev) => ({ ...prev, [key]: value }))
     setOverrides(new Map())
@@ -190,6 +224,18 @@ export function PortfolioScreen() {
   const rows = [...all.filter(isIncluded), ...all.filter((m) => !isIncluded(m))]
   const included = all.filter(isIncluded).map((m) => m.alphaId)
   const ids = [...included].sort()
+  const copy = useMutation({
+    mutationFn: () => portfolio.markdown(included),
+    onSuccess: async ({ text, unsynced }) => {
+      await navigator.clipboard.writeText(text)
+      toast.success(`Copied ${included.length} Alpha${included.length === 1 ? '' : 's'}`)
+      if (unsynced > 0)
+        toast.warning(
+          `Language, Pasteurization and NaN Handling are not stored yet for ${unsynced} of them. Sync from BRAIN, then copy again.`,
+        )
+    },
+    onError: (e: unknown) => toast.error(errorMessage(e)),
+  })
 
   const computed = useQuery({
     queryKey: ['portfolio', 'compute', ids, cost],
@@ -200,6 +246,9 @@ export function PortfolioScreen() {
   // A disabled query keeps its last answer, which would outlive deselecting every Alpha.
   const result = ids.length ? computed.data : undefined
   const unlabelled = all.filter((m) => !m.labelled).length
+  // Shown while newer figures are on their way, so an old answer never reads as the new one.
+  const membersStale = members.isPlaceholderData || netNow !== charged
+  const combinedStale = computed.isPlaceholderData || costNow !== cost
   const syncing = useSyncTask() !== undefined
 
   return (
@@ -242,36 +291,33 @@ export function PortfolioScreen() {
               <span className="num text-ink">{included.length}</span> of{' '}
               <span className="num">{all.length}</span> SUBMITTED selected
             </span>
+            {/* Back to every Alpha: filters, Selection Expression and hand ticks all cleared, so
+                no chip stays pressed over a selection it no longer makes. Ticking all or none
+                by hand is the table's own header box. */}
+            {(Object.values(picked).some((v) => v.length > 0) ||
+              selection.trim() !== '' ||
+              overrides.size > 0) && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  setPicked({})
+                  setSelection('')
+                  setOverrides(new Map())
+                }}
+              >
+                Reset Filters
+              </Button>
+            )}
             <Button
               size="sm"
               variant="ghost"
-              onClick={() => setOverrides(new Map(all.map((m) => [m.alphaId, true])))}
-            >
-              Select All
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => setOverrides(new Map(all.map((m) => [m.alphaId, false])))}
-            >
-              Deselect All
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
+              loading={copy.isPending}
               disabled={!included.length}
-              onClick={() =>
-                navigator.clipboard.writeText(included.join(', ')).then(
-                  () =>
-                    toast.success(
-                      `Copied ${included.length} Alpha ID${included.length === 1 ? '' : 's'}`,
-                    ),
-                  (e: unknown) => toast.error(errorMessage(e)),
-                )
-              }
+              onClick={() => copy.mutate()}
             >
-              <CopyIcon />
-              Copy IDs
+              {!copy.isPending && <CopyIcon />}
+              Copy Alphas
             </Button>
           </div>
         }
@@ -289,29 +335,76 @@ export function PortfolioScreen() {
               onChange={(v) => choose('pyramid', v)}
             />
           </div>
+          <Disclosure
+            summary={
+              rule?.conditions
+                ? `Selection Expression (${rule.conditions} condition${rule.conditions === 1 ? '' : 's'})`
+                : 'Selection Expression'
+            }
+          >
+            <div className="flex items-start gap-2">
+              <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                <Textarea
+                  className="font-mono"
+                  rows={4}
+                  spellCheck={false}
+                  aria-label="Selection Expression"
+                  aria-invalid={ruleError !== undefined}
+                  placeholder={
+                    'information_ratio >= 0.10;\nreturns / turnover >= 1;\nreturns / drawdown >= 1'
+                  }
+                  value={selection}
+                  onChange={(e) => {
+                    setSelection(e.target.value)
+                    setOverrides(new Map())
+                  }}
+                />
+                {ruleError && (
+                  <span
+                    role="alert"
+                    className="text-body-compact break-words text-pnl-negative-text"
+                  >
+                    {ruleError}. Not applied until it reads.
+                  </span>
+                )}
+              </div>
+              <SelectionInfo metrics={metricNames} />
+            </div>
+          </Disclosure>
         </div>
-        <MembersTable
-          rows={rows}
-          selected={new Set(included)}
-          onSelect={(id, on) => setOverrides((prev) => new Map(prev).set(id, on))}
-          onOpen={setOpenAlpha}
-          loading={members.isPending}
-        />
+        <div className={cn('transition-opacity', membersStale && 'opacity-50')}>
+          <MembersTable
+            rows={rows}
+            selected={new Set(included)}
+            onSelect={(ids, on) =>
+              setOverrides((prev) => new Map([...prev, ...ids.map((id) => [id, on] as const)]))
+            }
+            onOpen={detail.open}
+            openId={detail.openId}
+            loading={members.isPending}
+          />
+        </div>
       </Panel>
-      <DetailSheet alphaId={openAlpha} onClose={() => setOpenAlpha(null)} />
+      {detail.sheet}
 
       {ids.length > 0 && !result ? (
-        <Skeleton className="h-96" label="Combining Alphas" />
+        computed.error ? null : (
+          <Skeleton className="h-96" label="Combining Alphas" />
+        )
       ) : !result || result.alphas === 0 ? (
         <Panel>
           <p className="text-body text-ink-subtle">
             {all.length === 0
               ? 'No SUBMITTED Alphas stored yet. Sync from BRAIN to fetch them.'
-              : 'Select at least one Alpha.'}
+              : ids.length > 0
+                ? `None of the ${fmt.int(ids.length)} selected Alphas has PnL stored yet. Sync from BRAIN to download it.`
+                : 'Select at least one Alpha.'}
           </p>
         </Panel>
       ) : (
-        <>
+        <div
+          className={cn('flex flex-col gap-4 transition-opacity', combinedStale && 'opacity-50')}
+        >
           <Panel
             title="Combined In-Sample Performance"
             actions={<ChartLegend testStart={result.testStart} />}
@@ -329,19 +422,11 @@ export function PortfolioScreen() {
           <Panel
             title="Estimated After-Cost Performance"
             actions={
-              <label className="flex items-center gap-2 text-body text-ink-muted">
+              <span className="flex items-center gap-2 text-body text-ink-muted">
                 Cost
-                <Input
-                  type="number"
-                  min={0}
-                  max={100}
-                  step={0.5}
-                  value={costText}
-                  onChange={(e) => setCostText(e.target.value)}
-                  className="w-20"
-                />
+                <CostInput view={VIEW} />
                 bps
-              </label>
+              </span>
             }
             bodyClassName="flex flex-col gap-4"
           >
@@ -388,7 +473,7 @@ export function PortfolioScreen() {
                         <Fragment key={label}>
                           <span>{label}</span>
                           <span className="num text-right text-ink">
-                            {fmt.ratio(pair.correlation)}
+                            {fmt.ratio(pair.correlation, 4)}
                           </span>
                           <span className="mono-metric text-ink-subtle">
                             {pair.a} · {pair.b}
@@ -399,17 +484,14 @@ export function PortfolioScreen() {
                 </div>
               }
             >
-              <CorrelationMatrix result={result} />
+              <CorrelationMatrix result={result} onOpen={detail.open} />
             </Panel>
           )}
-        </>
+        </div>
       )}
     </Page>
   )
 }
-
-/** The classification the backend gives a region-agnostic child. */
-const RA_CLASS = 'Region Agnostic'
 
 function FacetBlock({
   facet,
@@ -428,14 +510,14 @@ function FacetBlock({
   for (const m of members) for (const v of facet.values(m)) counts.set(v, (counts.get(v) ?? 0) + 1)
   // Region Agnostic counts what was submitted: one parent, however many of its children
   // passed. Choosing it still selects every child, the Alphas that carry the class.
-  const children = counts.get(RA_CLASS)
+  const children = counts.get(REGION_AGNOSTIC_CLASS)
   const parents = new Set(members.flatMap((m) => (m.raParent ? [m.raParent] : []))).size
-  if (children !== undefined) counts.set(RA_CLASS, parents)
+  if (children !== undefined) counts.set(REGION_AGNOSTIC_CLASS, parents)
   const items = [...counts.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([v, n]) => ({
       value: v,
-      ...(v === RA_CLASS && children !== undefined
+      ...(v === REGION_AGNOSTIC_CLASS && children !== undefined
         ? {
             title: `${parents} Region Agnostic Alpha${parents === 1 ? '' : 's'} · ${children} child Alpha${children === 1 ? '' : 's'}`,
           }
@@ -537,21 +619,6 @@ const YEARLY_COLUMNS: Column<YearRow>[] = [
   },
 ]
 
-/** (Long − Short) ÷ (Long + Short) in stocks held, or null without both counts. */
-function imbalanceOf(m: PortfolioMember): number | null {
-  const { longCount: long, shortCount: short } = m
-  if (long == null || short == null || long + short === 0) return null
-  return (long - short) / (long + short)
-}
-
-function sortValue(m: PortfolioMember, key: string): number | null {
-  // The Alpha column sorts by when it was submitted.
-  if (key === 'id') return m.dateSubmitted ? Date.parse(m.dateSubmitted) : null
-  if (key === 'imbalance') return imbalanceOf(m)
-  const value = (m as unknown as Record<string, unknown>)[key]
-  return typeof value === 'number' ? value : null
-}
-
 interface FamilyShape {
   parent: string
   /** Where the row sits in a run of its family's rows, as the table shows them. */
@@ -564,11 +631,11 @@ interface FamilyShape {
  * so they share a parent and a submission time and sit next to each other. A sort that
  * splits them gives each piece its own block.
  */
-function familyShapes(rows: PortfolioMember[]): Map<string, FamilyShape> {
+function familyShapes(rows: AlphaTableRow[]): Map<string, FamilyShape> {
   const shapes = new Map<string, FamilyShape>()
   rows.forEach((m, i) => {
     if (!m.raParent) return
-    shapes.set(m.alphaId, {
+    shapes.set(m.key, {
       parent: m.raParent,
       first: rows[i - 1]?.raParent !== m.raParent,
       last: rows[i + 1]?.raParent !== m.raParent,
@@ -594,158 +661,83 @@ function familyRow(shape: FamilyShape | undefined): string | undefined {
   )
 }
 
+/** What the Portfolio's Alphas have: every column but a task's own. */
+const OFFER = [
+  'alphaId',
+  'name',
+  'dateSubmitted',
+  'classifications',
+  'tags',
+  'pyramids',
+  'categories',
+  'expression',
+  'operatorCount',
+  'region',
+  'delay',
+  'universe',
+  'investability',
+  'neutralization',
+  'decay',
+  'truncation',
+  ...CORE_ORDER,
+  'trainSharpe',
+  'testSharpe',
+  'kRatio',
+  'incrementalSharpe',
+  'longCount',
+  'shortCount',
+  'imbalance',
+  'prodCorrelation',
+  'selfCorrelation',
+  'powerPoolCorrelation',
+  'portfolioCorrelation',
+  'maxPairwiseCorrelation',
+]
+
+const DEFAULTS = [
+  'alphaId',
+  'classifications',
+  'region',
+  'delay',
+  'universe',
+  'investability',
+  ...CORE_ORDER,
+  'prodCorrelation',
+]
+
 function MembersTable({
   rows,
   selected,
   onSelect,
   onOpen,
+  openId,
   loading,
 }: {
   rows: PortfolioMember[]
   selected: ReadonlySet<string>
-  onSelect: (id: string, on: boolean) => void
+  onSelect: (ids: string[], on: boolean) => void
   /** Show the row's Alpha in the side pane. */
-  onOpen: (alphaId: string) => void
+  onOpen: (alphaId: string, ids?: string[]) => void
+  openId: string | null
   loading: boolean
 }) {
-  const [sort, setSort] = useState<Sort | null>(null)
-  const sorted = sort
-    ? [...rows].sort((a, b) => {
-        const x = sortValue(a, sort.key)
-        const y = sortValue(b, sort.key)
-        // Blank last whichever way: an Alpha with no figure is not the lowest.
-        if (x === null) return y === null ? 0 : 1
-        if (y === null) return -1
-        return sort.desc ? y - x : x - y
-      })
-    : rows
-  const families = familyShapes(sorted)
-  const columns: Column<PortfolioMember>[] = [
-    {
-      key: 'id',
-      header: <span title="Sorts by the date it was submitted">Alpha</span>,
-      width: '104px',
-      sortable: true,
-      // Plain text: the row itself opens the Alpha, as every Alpha table does.
-      cell: (m) => <span className="num text-ink">{m.alphaId}</span>,
-    },
-    {
-      key: 'classifications',
-      header: 'Classifications',
-      width: 'minmax(112px,2fr)',
-      cell: (m) => {
-        const names = m.classifications.join(', ')
-        return (
-          <span className="truncate text-body-compact text-ink-muted" title={names}>
-            {names || DASH}
-          </span>
-        )
-      },
-    },
-    { key: 'region', header: 'Region', width: '72px', cell: (m) => m.region ?? DASH },
-    {
-      key: 'delay',
-      header: 'Delay',
-      width: '64px',
-      cell: (m) => <span className="num">{m.delay == null ? DASH : `D${m.delay}`}</span>,
-    },
-    {
-      key: 'investability',
-      header: 'Investability',
-      width: '112px',
-      cell: (m) => INVESTABILITY[m.investability],
-    },
-    ...metricColumns<PortfolioMember>((m) => m).map((c) => ({ ...c, sortable: true })),
-    {
-      key: 'imbalance',
-      sortable: true,
-      header: (
-        <span title="(Long − Short) ÷ (Long + Short), in stocks held. 0% is balanced; +20% holds more stocks long, −20% more short.">
-          Long/Short Imbalance
-        </span>
-      ),
-      width: 'minmax(112px,1fr)',
-      align: 'right',
-      cell: (m) => {
-        const share = imbalanceOf(m)
-        if (share === null) return DASH
-        const imbalance = Math.round(share * 100)
-        return (
-          <span
-            className="num"
-            title={`${fmt.int(m.longCount ?? 0)} long · ${fmt.int(m.shortCount ?? 0)} short`}
-          >
-            {imbalance > 0 ? '+' : ''}
-            {imbalance}%
-          </span>
-        )
-      },
-    },
-    {
-      key: 'correlation',
-      sortable: true,
-      header: (
-        <span title="Highest daily PnL correlation with any other Alpha in your portfolio, over the last 4 years">
-          Portfolio Correlation
-        </span>
-      ),
-      width: 'minmax(96px,1fr)',
-      align: 'right',
-      cell: (m) =>
-        m.correlation == null ? (
-          DASH
-        ) : (
-          <span
-            className={cn(
-              'num',
-              m.correlation >= 0.7
-                ? 'text-pnl-negative-text'
-                : m.correlation >= 0.5
-                  ? 'text-status-warning'
-                  : 'text-pnl-positive-text',
-            )}
-          >
-            {fmt.ratio(m.correlation)}
-          </span>
-        ),
-    },
-    {
-      key: 'prodCorrelation',
-      sortable: true,
-      header: (
-        <span title="BRAIN's Production Correlation for the Alpha, as its Submitted Alphas page shows it">
-          Production Correlation
-        </span>
-      ),
-      width: 'minmax(112px,1fr)',
-      align: 'right',
-      cell: (m) =>
-        m.prodCorrelation == null ? (
-          DASH
-        ) : (
-          <span
-            className={cn(
-              'num',
-              m.prodCorrelation >= 0.7 ? 'text-status-warning' : 'text-pnl-positive-text',
-            )}
-          >
-            {fmt.ratio(m.prodCorrelation, 4)}
-          </span>
-        ),
-    },
-  ]
+  const shaped = rows.map(fromMember)
   return (
-    <DataTable
+    <AlphaTable
+      view={VIEW}
       label="SUBMITTED Alphas"
-      rows={sorted}
-      rowKey={(m) => m.alphaId}
-      columns={columns}
-      {...(sort ? { sort } : {})}
-      onSort={setSort}
+      rows={shaped}
+      offer={OFFER}
+      defaults={DEFAULTS}
+      afterCost="screen"
       selected={selected}
       onSelect={onSelect}
-      onRowClick={(m) => onOpen(m.alphaId)}
-      rowClass={(m) => familyRow(families.get(m.alphaId))}
+      onRowClick={(m, _event, shown) => m.alphaId && onOpen(m.alphaId, alphaIds(shown))}
+      openAlpha={openId}
+      rowClass={(shown) => {
+        const families = familyShapes(shown)
+        return (m) => familyRow(families.get(m.key))
+      }}
       loading={loading}
       maxHeight="28rem"
       empty="No SUBMITTED Alpha matches these filters."

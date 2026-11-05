@@ -18,18 +18,23 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
+from ..brain.platform import (
+    INVESTABILITY,
+    POWER_POOL_MAX_FIELDS,
+    POWER_POOL_MAX_OPERATORS,
+    PV1_OPERATORS,
+    REGION_INVESTABILITY,
+    UNCOUNTED_OPERATORS,
+)
 from ..brain.schemas import SimulationRequest, SimulationSettings
 from .fastexpr import (
-    MAX_FIELDS,
-    MAX_OPERATORS,
-    UNCOUNTED,
     Node,
     OperatorInfo,
     ParseError,
-    node_at,
     operator_count,
     parse,
     walk,
+    walk_with_parents,
 )
 from .fastexpr import data_fields as names_read
 from .fastexpr import render as write
@@ -50,31 +55,6 @@ PRESETS: dict[str, str] = {
     "ts_op": "ts_rank, ts_zscore, ts_delta, ts_av_diff",
     "group_op": "group_rank, group_zscore, group_neutralize",
 }
-#: maxTrade and maxPosition for each Investability a task can search. BRAIN refuses both ON.
-INVESTABILITY: dict[str, tuple[str, str]] = {
-    "none": ("OFF", "OFF"),
-    "max_trade": ("ON", "OFF"),
-    "max_position": ("OFF", "ON"),
-}
-#: Where an Alpha without Max Trade has to keep 70% of its Sharpe under investability
-#: constraints to be submitted: BRAIN's Investability Sharpe test.
-MAX_TRADE_REGIONS = frozenset({"ASI", "JPN", "HKG", "TWN", "KOR"})
-#: The Investability each region takes. BRAIN's settings schema offers Max Position everywhere
-#: but refuses it outside the first five, for every delay and universe. A region missing here
-#: is offered no Max Position.
-REGION_INVESTABILITY: dict[str, tuple[str, ...]] = {
-    "USA": ("none", "max_trade", "max_position"),
-    "EUR": ("none", "max_trade", "max_position"),
-    "GLB": ("none", "max_trade", "max_position"),
-    "ASI": ("none", "max_trade", "max_position"),
-    "ALL": ("none", "max_trade", "max_position"),
-    "JPN": ("none", "max_trade"),
-    "CHN": ("none", "max_trade"),
-    "DEU": ("none", "max_trade"),
-    "GBR": ("none", "max_trade"),
-    "IND": ("none", "max_trade"),
-    "AMR": ("none", "max_trade"),
-}
 
 
 def takes_max_position(region: str) -> bool:
@@ -86,13 +66,12 @@ MAX_VARIABLES = 16
 MAX_VALUES = 64
 #: Where a template's signal goes. A template holding one can be read and counted, not run.
 HOLE = "..."
-#: Operators that read pv1 whatever they are given, so BRAIN counts them as using it.
-PV1_OPERATORS = frozenset({"inst_pnl", "convert"})
 #: Wraps a typed list so the parser reads it as one call's inputs.
 _LIST = "values"
 
 
-@functools.lru_cache(maxsize=256)
+# Above the 2,000 templates a stats request may carry, so one request never evicts its own.
+@functools.lru_cache(maxsize=4096)
 def program(text: str) -> Node:
     """The template as a tree. Raises :class:`ParseError`."""
     return parse(text)
@@ -154,14 +133,13 @@ def uses(tree: Node, vector: Callable[[str], bool]) -> dict[str, Use]:
     vector operators, or a variable whose every value is one.
     """
     found: dict[str, Use] = {}
-    for path, node in walk(tree):
+    for path, node, parent in walk_with_parents(tree):
         if node.kind not in ("name", "call") or not node.value.startswith("$"):
             continue
         use = found.setdefault(node.value[1:], Use(node.value[1:]))
         if node.kind == "call":
             use.calls.append(len(node.args))
             continue
-        parent = node_at(tree, path[:-1]) if path else None
         if parent is not None and path[-1] >= len(parent.args):
             use.options += 1
             continue
@@ -341,7 +319,10 @@ class Size:
     def power_pool(self) -> tuple[int, int] | None:
         """Operators and fields every Alpha still has free under Power Pool's limits; ``None``
         once some Alpha is over them."""
-        free = (MAX_OPERATORS - self.operators[1], MAX_FIELDS - self.fields[1])
+        free = (
+            POWER_POOL_MAX_OPERATORS - self.operators[1],
+            POWER_POOL_MAX_FIELDS - self.fields[1],
+        )
         return free if min(free) >= 0 else None
 
 
@@ -360,7 +341,7 @@ def size(tree: Node, typed: dict[str, list[str]]) -> Size:
 
     def weight(name: str, text: str) -> tuple[int, int]:
         if name in calls:
-            return int(text not in UNCOUNTED), 0
+            return int(text not in UNCOUNTED_OPERATORS), 0
         value = fold(_value(text))
         return operator_count(value), len(fields_of(value))
 
@@ -428,23 +409,32 @@ def single_dataset(
 # --- the search ---------------------------------------------------------------
 
 
-def field_choices(space: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
+def field_choices(space: dict[str, Any]) -> dict[str, dict[str, tuple[str, ...]]]:
     """Per variable of fields, per universe, the fields it can take there.
 
-    Frozen with the task, so every ``$name@universe`` slot keeps one distribution.
+    Frozen with the task, so every ``$name@universe`` slot keeps one distribution. Tuples,
+    which Optuna keeps as given rather than copying for every trial it asks.
     """
-    found: dict[str, dict[str, list[str]]] = {}
+    found: dict[str, dict[str, tuple[str, ...]]] = {}
     for variable in space["variables"]:
         if variable["kind"] != "fields":
             continue
         absent = variable.get("absent") or {}
-        found[variable["name"]] = {
-            universe: [
-                f for f in variable["fields"] if f not in set[str](absent.get(universe) or ())
-            ]
-            for universe in space["universes"]
-        }
+        by_universe: dict[str, tuple[str, ...]] = {}
+        for universe in space["universes"]:
+            missing = set[str](absent.get(universe) or ())
+            by_universe[universe] = tuple(f for f in variable["fields"] if f not in missing)
+        found[variable["name"]] = by_universe
     return found
+
+
+def slots(space: dict[str, Any]) -> dict[str, tuple[str, ...]]:
+    """Every field slot, by the name :func:`suggest` asks it under, with its choices."""
+    return {
+        f"${name}@{universe}": choices
+        for name, by_universe in field_choices(space).items()
+        for universe, choices in by_universe.items()
+    }
 
 
 def _first_fields(space: dict[str, Any]) -> dict[str, Any] | None:
@@ -452,9 +442,18 @@ def _first_fields(space: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def coverage(space: dict[str, Any]) -> tuple[str, list[str]]:
-    """The first variable of fields, whose every field the first pass tries once."""
+    """The first variable of fields, whose every field the first pass tries once.
+
+    Only fields a searched universe holds: the pool was read before universes lacking a fixed
+    field were left out, and a field found only in one of those cannot be asked anywhere.
+    """
     first = _first_fields(space)
-    return (f"${first['name']}", list(first["fields"])) if first else ("", [])
+    if not first:
+        return "", []
+    absent = first.get("absent") or {}
+    missing = [set[str](absent.get(u) or ()) for u in space["universes"]]
+    held = [f for f in first["fields"] if any(f not in m for m in missing)]
+    return f"${first['name']}", held
 
 
 def first_pass(space: dict[str, Any], field_id: str) -> dict[str, Any]:
@@ -474,7 +473,7 @@ def _ask(trial: Any, name: str, choices: list[Any]) -> Any:
 
 
 def suggest(
-    trial: Any, run: TemplateParams, choices: dict[str, dict[str, list[str]]]
+    trial: Any, run: TemplateParams, choices: dict[str, dict[str, tuple[str, ...]]]
 ) -> dict[str, Any]:
     """One point, asked define-by-run in a fixed order so every name keeps one distribution.
 
@@ -557,7 +556,7 @@ def request_for(params: dict[str, Any], run: TemplateParams) -> SimulationReques
 
 
 def draw(
-    trial: Any, run: TemplateParams, choices: dict[str, dict[str, list[str]]]
+    trial: Any, run: TemplateParams, choices: dict[str, dict[str, tuple[str, ...]]]
 ) -> tuple[dict[str, Any], SimulationRequest | None]:
     """One point and its simulation; none when two variables of fields landed on one field.
 

@@ -23,6 +23,9 @@ export type PowerPoolRow = Schemas['PowerPoolRow']
 
 const B = '/api/lab-tasks'
 
+/** The most Alphas one task's results come back with: the backend's own ceiling. */
+export const TOP_LIMIT = 5000
+
 export const labTasks = {
   list: () => http.get<LabTasks>(B),
   /** Spends simulation quota. */
@@ -42,6 +45,9 @@ export const labTasks = {
   /** Measured locally against the submitted Power Pool, from the PnL already stored. */
   powerPoolFor: (alphaIds: string[]) =>
     http.post<PowerPoolCorrelation>(`${B}/power-pool-correlation`, { alphaIds }),
+  /** Greedy submission, best After-Cost Sharpe first, worked out without submitting. */
+  powerPoolOrder: (alphaIds: string[]) =>
+    http.post<Schemas['SubmissionOrder']>(`${B}/power-pool-order`, { alphaIds }),
   /** Downloads PnL, then turnover for the Alphas that satisfy Power Pool Correlation. */
   powerPoolWorkflow: (alphaIds: string[]) =>
     http.post<Schemas['WorkflowStarted']>(`${B}/power-pool-workflow`, { alphaIds }),
@@ -50,4 +56,5 @@ export const labTasks = {
     http.post<Schemas['WorkflowStarted']>(`${B}/prod-correlation`, { alphaIds }),
   /** Stops that check; the answers already back stay. */
   stopProdCorrelation: () => http.post<void>(`${B}/prod-correlation/stop`),
+  stopPowerPoolWorkflow: () => http.post<void>(`${B}/power-pool-workflow/stop`),
 }

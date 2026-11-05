@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ..brain.filters import AlphaQuery, Filter
+from ..brain.platform import ALPHA_LIST_MAX_OFFSET, ALPHA_LIST_PAGE
 from ..brain.schemas import QUICK_MODE, Alpha, RecordSet, SimulationType
 from .store import checks_json
 from .yields import checks_of, gating_results
@@ -27,11 +28,6 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
-#: The alpha list's largest page: a bigger ``limit`` is served as 100 anyway.
-PAGE = 100
-#: The alpha list refuses offsets past 1,000. Beyond it the listing continues by
-#: ``dateCreated`` instead.
-MAX_OFFSET = 1_000
 
 #: Captures landing within this long of each other share one alpha-list request. A batch's
 #: children land within a second or two of each other, and one list page carries the same
@@ -50,19 +46,16 @@ CAPTURE_CONCURRENCY = 4
 #: Alphas whose returns are downloaded at once by :meth:`Backfill.fetch_each`.
 #:
 #: Four, not eight. The client's ``429`` gate is not a private limiter for this job -- it
-#: pauses *every* caller of the shared client for the ``Retry-After`` BRAIN sends, which is
-#: up to a minute and stalls simulation dispatch and polling with it. Measured at eight:
-#: 922 Alphas in 5m16s on a quiet account, but ``Retry-After`` of 61-75s once anything else
-#: was in flight. Going wider buys a stall, not throughput; each Alpha is three reads.
+#: pauses every read of an Alpha, captures included, for the ``Retry-After`` BRAIN sends,
+#: which is up to a minute. Measured at eight: 922 Alphas in 5m16s on a quiet account, but
+#: ``Retry-After`` of 61-75s once anything else was in flight. Going wider buys a stall, not
+#: throughput; each Alpha is three reads.
 RETURNS_CONCURRENCY = 4
 #: Most progress broadcasts a returns job will send. One per Alpha puts a thousand messages
 #: on the socket to move a bar the width of a hair; a fixed stride of ten leaves a job of
 #: fifteen reading "0 of 15" until it is two thirds done, which looks like a hang -- and a
 #: rate-limited job *is* slow enough to be mistaken for one.
 RETURNS_PROGRESS_STEPS = 50
-
-#: Most alphas one sync lists: past any account's real count, so it is a guard, not a cap.
-IMPORT_LIMIT = 100_000
 
 
 def worth_downloading(alpha: Alpha, allowed: frozenset[str]) -> bool:
@@ -116,9 +109,6 @@ class Backfill:
         #: Alphas waiting for the next shared list read, each with what its caller awaits.
         self._landed: dict[str, asyncio.Future[None]] = {}
         self._drainer: asyncio.Task[None] | None = None
-        #: How captures were read: from a shared list page, or one request each. If
-        #: ``fetched`` rivals ``listed``, the list read is not saving anything.
-        self.capture_counts = {"lists": 0, "listed": 0, "fetched": 0}
         #: How the last backfill ended. Kept past the task registry's short linger, so a
         #: sync that stopped early is still reported when someone looks.
         self.last: dict[str, Any] | None = None
@@ -205,7 +195,9 @@ class Backfill:
             nonlocal done
             async with gate:
                 try:
-                    await fetch(alpha_id)
+                    # Nothing stored is as much a failure as an error: BRAIN gave no rows.
+                    if not await fetch(alpha_id):
+                        failed.append(alpha_id)
                 # One Alpha's series failing must not abandon the rest.
                 except Exception as exc:  # noqa: BLE001
                     log.warning("vault.returns_failed", alpha_id=alpha_id, error=str(exc)[:160])
@@ -228,13 +220,19 @@ class Backfill:
             await self.tasks.update(task, detail="Listing SUBMITTED Alphas", progress=None)
             ids: list[str] = []
             offset = 0
+            before: datetime | None = None
             while True:
+                filters = [Filter("status", "!=", "UNSUBMITTED")]
+                if before is not None:
+                    filters.append(Filter("dateSubmitted", "<", before))
                 page = await self.endpoints.list_alphas(
                     AlphaQuery(
-                        limit=PAGE,
+                        limit=ALPHA_LIST_PAGE,
                         offset=offset,
                         order="-dateSubmitted",
-                        filters=[Filter("status", "!=", "UNSUBMITTED")],
+                        filters=filters,
+                        # A submitted Alpha you hid still counts in BRAIN's pools.
+                        hidden=None,
                     )
                 )
                 results = page.get("results") or []
@@ -242,10 +240,28 @@ class Backfill:
                 await self.vault.save_alphas(alphas)
                 # A region-agnostic parent has no PnL of its own: its submitted children do.
                 ids.extend(a.id for a in alphas if a.type != SimulationType.RA_PARENT)
-                await self.tasks.update(task, detail=f"Listed {len(ids)} SUBMITTED Alphas")
-                if len(results) < PAGE:
+                await self.tasks.update(
+                    task, detail=f"Listed {len(dict.fromkeys(ids))} SUBMITTED Alphas"
+                )
+                if len(results) < ALPHA_LIST_PAGE:
                     break
-                offset += PAGE
+                offset += ALPHA_LIST_PAGE
+                if offset > ALPHA_LIST_MAX_OFFSET:
+                    # BRAIN refuses offsets past 1,000, so carry on below the oldest Alpha seen,
+                    # newest first as before. One second past it: a multi-simulation submits
+                    # several in the same second and ``dateSubmitted<`` is strict; the overlap
+                    # is listed twice and counted once.
+                    oldest = alphas[-1].date_submitted
+                    if oldest is None:
+                        raise RuntimeError("BRAIN listed a SUBMITTED Alpha with no submit date.")
+                    bound = oldest + timedelta(seconds=1)
+                    if before is not None and bound >= before:
+                        raise RuntimeError(
+                            f"More than {ALPHA_LIST_PAGE} Alphas share a submit second; the "
+                            "listing cannot go past them."
+                        )
+                    before, offset = bound, 0
+            ids = list(dict.fromkeys(ids))
 
             # A simulated series never changes, so one already stored is not fetched again.
             missing = await self.vault.lacking_series(ids)
@@ -300,20 +316,24 @@ class Backfill:
             }
 
     async def _import_alphas(self, task: Any, *, since: datetime | None) -> int:
-        """Page the pool into the vault, newest first, up to :data:`IMPORT_LIMIT` alphas."""
+        """Page the pool into the vault, newest first, until BRAIN lists no older Alphas.
+
+        Ends on a short page, or when the date window below the oldest Alpha seen stops
+        moving; an account at 5,000 simulations a day passes any fixed count within weeks.
+        """
         await self.tasks.update(task, detail="Listing your Alphas", progress=0.0)
         offset = 0
         imported = 0
         before: datetime | None = None
         total: int | None = None
 
-        while imported < IMPORT_LIMIT:
+        while True:
             # hidden=None: an alpha you hid is still an alpha, and still has returns
             # worth correlating. Excluding them by default is a UI nicety, not a
             # property of the data.
             page = await self.endpoints.list_alphas(
                 AlphaQuery(
-                    limit=PAGE,
+                    limit=ALPHA_LIST_PAGE,
                     offset=offset,
                     hidden=None,
                     created_after=since,
@@ -336,10 +356,10 @@ class Backfill:
                 detail=f"Imported {imported} of {total} Alphas",
                 alphas=imported,
             )
-            if len(results) < PAGE:
+            if len(results) < ALPHA_LIST_PAGE:
                 break
-            offset += PAGE
-            if offset > MAX_OFFSET:
+            offset += ALPHA_LIST_PAGE
+            if offset > ALPHA_LIST_MAX_OFFSET:
                 # Newest first, so continue below the oldest alpha seen. One second past
                 # it, because a multi-simulation creates several alphas in the same second
                 # and ``dateCreated<`` is strict; the upsert makes the overlap harmless.
@@ -448,16 +468,17 @@ class Backfill:
         try:
             for page_number in range(CAPTURE_PAGES):
                 page = await self.endpoints.list_alphas(
-                    AlphaQuery(limit=PAGE, offset=page_number * PAGE, hidden=None)
+                    AlphaQuery(
+                        limit=ALPHA_LIST_PAGE, offset=page_number * ALPHA_LIST_PAGE, hidden=None
+                    )
                 )
-                self.capture_counts["lists"] += 1
                 results = page.get("results") or []
                 for raw in results:
                     listed = Alpha.model_validate(raw)
                     if listed.id in missing:
                         missing.discard(listed.id)
                         found[listed.id] = listed
-                if not missing or len(results) < PAGE:
+                if not missing or len(results) < ALPHA_LIST_PAGE:
                     break
             complete = list(found.values())
             if complete:
@@ -471,8 +492,6 @@ class Backfill:
             await self._captured(alpha)
         stored = {a.id for a in complete}
         fetch = [a for a in alpha_ids if a not in stored]
-        self.capture_counts["listed"] += len(complete)
-        self.capture_counts["fetched"] += len(fetch)
         log.info("vault.captured", listed=len(complete), fetched=len(fetch))
         gate = asyncio.Semaphore(CAPTURE_CONCURRENCY)
 

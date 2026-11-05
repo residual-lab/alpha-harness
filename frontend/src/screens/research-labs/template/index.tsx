@@ -10,12 +10,13 @@ import { CopyPlusIcon, EllipsisIcon, RotateCcwIcon, SaveIcon } from 'lucide-reac
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { catalog } from '@/api/catalog'
+import { DEFAULT_TRUNCATION, MAX_DECAY } from '@/api/platform'
 import type { Scope } from '@/api/types'
 import { DASH, fmt } from '@/lib/format'
 import { useCores } from '@/lib/preferences'
 import { isRegionAgnostic, regionLabel, useScope, useScopeOptions } from '@/lib/scope'
 import { useDatasetPick } from '@/screens/data/dataset-pick'
-import { useFieldFilter } from '@/screens/data/state'
+import { startDatasetPick } from '@/screens/data/state'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
 import { MAX_SIMULATIONS, simulationsValid, useLabPreview } from '@/screens/research-labs/lab-task'
 import { NeutralizationPicker } from '@/screens/research-labs/neutralization'
@@ -23,6 +24,7 @@ import {
   clamp,
   SimulationSettingsFields,
   testPeriodOf,
+  truncationOf,
 } from '@/screens/research-labs/simulation-settings'
 import { CoresSetting, SimulationsSetting } from '@/screens/research-labs/task-settings'
 import {
@@ -214,14 +216,14 @@ export function TemplateLabScreen() {
     if (!scope) return
     set({ picking: name, variables: { ...draft.variables, [name]: variable }, dirty: true })
     // The Explorer opens on this variable's own filter, so it shows the fields it will use.
-    useFieldFilter.getState().replace({ ...(variable.filter ?? {}) })
-    useDatasetPick.getState().start(scope, variable.dataset_ids, '/labs/template')
+    startDatasetPick(scope, variable.dataset_ids, '/labs/template', variable.filter ?? null)
     setDataScope(scope)
     void navigate({ to: '/data' })
   }
 
   const cores = useCores(draft.cores)
-  const truncation = Number(draft.truncation)
+  // Said on the Truncation box itself; the preview runs on the default meanwhile.
+  const truncation = truncationOf(draft.truncation)
   const body: TemplateLabRequest = {
     region: draft.region,
     delay: draft.delay,
@@ -230,8 +232,8 @@ export function TemplateLabScreen() {
     universes: draft.universes,
     neutralizations: draft.neutralizations,
     investability: draft.investability,
-    decay: clamp(draft.decay, 512),
-    truncation: Number.isFinite(truncation) ? Math.min(1, Math.max(0, truncation)) : 0.08,
+    decay: clamp(draft.decay, MAX_DECAY),
+    truncation: truncation ?? DEFAULT_TRUNCATION,
     pasteurization: draft.pasteurization,
     nan_handling: draft.nanHandling,
     test_period: testPeriodOf(draft.testYears, draft.testMonths),
@@ -239,8 +241,8 @@ export function TemplateLabScreen() {
     template_name: '',
   }
   // Each plan carries the text it was made for, so its problems are never drawn on newer text.
-  const previewed = (sent: TemplateLabRequest) =>
-    templateLab.preview(sent).then((plan) => ({ ...plan, text: sent.template }))
+  const previewed = (sent: TemplateLabRequest, signal: AbortSignal) =>
+    templateLab.preview(sent, signal).then((plan) => ({ ...plan, text: sent.template }))
   const { preview, current: planned } = useLabPreview('template-lab', body, previewed, {
     // Only once every default can be read, so a name never shows as undefined in passing.
     enabled: options.isSuccess && known !== undefined && (scope === null || datasets.isFetched),
@@ -267,7 +269,16 @@ export function TemplateLabScreen() {
     plan !== undefined &&
     planned &&
     plan.problems.length === 0 &&
+    truncation !== null &&
     simulationsValid(draft.simulations, maxSimulations)
+  // Beside the buttons, since Truncation and Simulations sit at the bottom of the page.
+  const blocked =
+    plan?.problems[0] ??
+    (truncation === null
+      ? 'Set a valid Truncation.'
+      : draft.simulations === null
+        ? 'Enter the simulations to run.'
+        : null)
   const toSave = () => ({
     text: draft.text,
     variables: Object.fromEntries(
@@ -357,7 +368,11 @@ export function TemplateLabScreen() {
 
   return (
     <Page>
-      <PageHeader title="Template Lab" actions={<AddTaskButtons add={add} disabled={!ready} />} />
+      <PageHeader
+        sticky
+        title="Template Lab"
+        actions={<AddTaskButtons add={add} disabled={!ready} blocked={blocked} />}
+      />
       {options.isError && (
         <ErrorNotice error={options.error} title="Could not read your operators" />
       )}
@@ -422,6 +437,7 @@ export function TemplateLabScreen() {
           openTemplate({ id: t.id, name: t.name, text: t.text, variables: t.variables })
         }
         onNew={() => openTemplate(BLANK)}
+        writing={draft.text.trim() !== ''}
       />
 
       <Panel
@@ -509,7 +525,6 @@ export function TemplateLabScreen() {
               variables={defs}
               infos={infos}
               problems={placed}
-              scope={scope}
             />
           )}
           {draft.text.trim() && <Facts stats={plan?.stats} />}
@@ -633,12 +648,6 @@ export function TemplateLabScreen() {
             />
             <Metric boxed label="Variables" value={fmt.int(names.length)} />
           </div>
-          {draft.simulations !== null && draft.simulations > maxSimulations && (
-            <Notice
-              tone="error"
-              title={`A task takes at most ${fmt.int(maxSimulations)} simulations.`}
-            />
-          )}
           {preview.isError && <ErrorNotice error={preview.error} title="Could not plan the task" />}
           {plan?.warnings.map((m) => (
             <Notice key={m} tone="warn" title={m} />

@@ -13,17 +13,13 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 from ..brain.filters import PLATFORM_TZ
+from ..brain.platform import PYRAMID_MIN_ALPHAS
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from ..brain.endpoints import BrainEndpoints
     from ..db.duck import Catalog
-
-#: Alphas submitted in a pyramid this quarter before it counts as formulated: "A consultant
-#: is considered to have formulated a pyramid if they have submitted a minimum of 3 Alphas in
-#: it" — BRAIN Genius.
-LIT_AT = 3
 
 MULTIPLIERS_TTL = 6 * 3600
 COUNTS_TTL = 600
@@ -99,7 +95,7 @@ def assemble(
             found["alphaCount"] = int(item.get("alphaCount") or 0)
 
     for key, found in cells.items():
-        found["lit"] = found["alphaCount"] >= LIT_AT
+        found["lit"] = found["alphaCount"] >= PYRAMID_MIN_ALPHAS
         found["synced"] = key in synced
 
     # Both axes rank on the multiplier they average, richest first, ties alphabetical. A
@@ -124,7 +120,7 @@ def assemble(
         "columns": [{"region": region, "delay": delay} for region, delay in columns],
         "categories": [{"id": cid, "name": name} for cid, name in ordered],
         "cells": list(cells.values()),
-        "alphasPerPyramid": LIT_AT,
+        "alphasPerPyramid": PYRAMID_MIN_ALPHAS,
     }
 
 

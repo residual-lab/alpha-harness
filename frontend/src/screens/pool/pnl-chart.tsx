@@ -25,13 +25,23 @@ export const theme = (name: string) =>
  * parse, so the browser paints one pixel and the pixel is read back as sRGB.
  */
 export const color = (name: string, alpha = 1) => {
-  const context = document.createElement('canvas').getContext('2d', { willReadFrequently: true })
-  if (!context) return theme(name)
-  context.fillStyle = theme(name)
-  context.fillRect(0, 0, 1, 1)
-  const [r, g, b] = context.getImageData(0, 0, 1, 1).data
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+  let rgb = RGB.get(name)
+  if (rgb === undefined) {
+    pixel ??= document.createElement('canvas').getContext('2d', { willReadFrequently: true })
+    if (!pixel) return theme(name)
+    pixel.clearRect(0, 0, 1, 1)
+    pixel.fillStyle = theme(name)
+    pixel.fillRect(0, 0, 1, 1)
+    const [r, g, b] = pixel.getImageData(0, 0, 1, 1).data
+    rgb = `${r}, ${g}, ${b}`
+    RGB.set(name, rgb)
+  }
+  return `rgba(${rgb}, ${alpha})`
 }
+
+// One pixel to paint on, and each token read once: the tokens are fixed for the session.
+let pixel: CanvasRenderingContext2D | null | undefined
+const RGB = new Map<string, string>()
 
 const COMPACT = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 2 })
 

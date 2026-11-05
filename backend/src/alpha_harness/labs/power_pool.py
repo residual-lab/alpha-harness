@@ -15,26 +15,29 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from sqlalchemy import func, or_, select
 
-from ..brain.schemas import REGION_AGNOSTIC_REGION, SimulationSettings
+from ..brain.platform import (
+    GROUPING_FIELDS,
+    POWER_POOL_MAX_FIELDS,
+    POWER_POOL_MAX_OPERATORS,
+    REGION_AGNOSTIC_REGION,
+)
+from ..brain.schemas import SimulationSettings
 from ..catalog.queries import CatalogQueries, FieldFilter, Tuple4
 from ..db.models import Study, StudyStatus, Trial, TrialState, utcnow
-from ..llm.keys import BudgetExhaustedError, LLMError
+from ..llm.keys import BudgetExhaustedError, LLMError, LLMUnavailable
 from ..llm.prompts import POWER_POOL_LAB
 from ..llm.text import FENCE
 from ..tasks import spawn
 from . import scheduler, search
 from .fastexpr import (
-    GROUPING,
-    MAX_FIELDS,
-    MAX_OPERATORS,
     ParseError,
-    node_at,
     operator_count,
     operator_table,
     parse,
     render,
     validate,
     walk,
+    walk_with_parents,
 )
 from .objectives import FAILURE
 from .params import PowerPoolParams, params_of
@@ -112,7 +115,7 @@ async def context_for(
     narrow: FieldFilter | None = None,
 ) -> Context | None:
     marks = ", ".join("?" for _ in universes)
-    extra = (*DATA_FIELDS, *GROUPING)
+    extra = (*DATA_FIELDS, *GROUPING_FIELDS)
     rows = await catalog.query(
         f"""
         SELECT field_id, dataset_id, field_type, universe, coverage, description,
@@ -164,7 +167,9 @@ async def context_for(
             r["region_coverage"],
         )
 
-    fields = sorted((field(f) for f in own if f not in GROUPING), key=lambda x: -(x.coverage or 0))
+    fields = sorted(
+        (field(f) for f in own if f not in GROUPING_FIELDS), key=lambda x: -(x.coverage or 0)
+    )
     m = meta[0] if meta else {}
     return Context(
         id=dataset,
@@ -175,7 +180,7 @@ async def context_for(
         description=str(m.get("description") or "")[:800],
         fields=tuple(fields),
         basics=tuple(field(f) for f in DATA_FIELDS if f in info and f not in own),
-        groups=tuple(g for g in GROUPING if g in info),
+        groups=tuple(g for g in GROUPING_FIELDS if g in info),
         types={f: str(r["field_type"]) for f, r in info.items()},
         own=frozenset(own),
         names=frozenset(info),
@@ -191,21 +196,23 @@ def check(text: str, ctx: Context, table: dict[str, Any]) -> tuple[str, frozense
         raise Rejected(f"Could not be read: {exc}") from exc
     if problems := validate(tree, table, set(ctx.names)):
         raise Rejected(problems[0])
-    if (count := operator_count(tree)) > MAX_OPERATORS:
-        raise Rejected(f"{count} operators; Power Pool allows 8.")
+    if (count := operator_count(tree)) > POWER_POOL_MAX_OPERATORS:
+        raise Rejected(f"{count} operators; Power Pool allows {POWER_POOL_MAX_OPERATORS}.")
     used = frozenset(n.value for _, n in walk(tree) if n.kind == "name" and n.value in ctx.names)
-    data = sorted(used - set(GROUPING))
-    if len(data) > MAX_FIELDS:
+    data = sorted(used - set(GROUPING_FIELDS))
+    if len(data) > POWER_POOL_MAX_FIELDS:
         raise Rejected(f"{len(data)} data fields ({', '.join(data)}); Power Pool allows 3.")
-    if not used & (ctx.own - set(GROUPING)):
+    if not used & (ctx.own - set(GROUPING_FIELDS)):
         raise Rejected(f"Uses no field of {ctx.id}.")
-    for path, node in walk(tree):
-        if node.kind == "name" and ctx.types.get(node.value) == "VECTOR":
-            parent = node_at(tree, path[:-1]) if path else None
-            if parent is None or parent.kind != "call" or not parent.value.startswith("vec_"):
-                raise Rejected(
-                    f"{node.value} is a VECTOR field: put it straight inside a vec_ operator."
-                )
+    for _, node, parent in walk_with_parents(tree):
+        if (
+            node.kind == "name"
+            and ctx.types.get(node.value) == "VECTOR"
+            and (parent is None or parent.kind != "call" or not parent.value.startswith("vec_"))
+        ):
+            raise Rejected(
+                f"{node.value} is a VECTOR field: put it straight inside a vec_ operator."
+            )
     return render(tree), used
 
 
@@ -340,7 +347,7 @@ def user_prompt(
         [
             "PRICE AND VOLUME FIELDS · count as data fields\n"
             + "\n".join(_line(f) for f in ctx.basics),
-            "GROUPING FIELDS · not counted\n" + ", ".join(ctx.groups),
+            "GROUPING_FIELDS FIELDS · not counted\n" + ", ".join(ctx.groups),
             f"YOUR EARLIER ALPHAS ON {ctx.id}\n{memory}",
             f"Write {PER_CALL} new Power Pool Alphas that use {ctx.id}.",
         ]
@@ -425,7 +432,12 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
         by = dict(llm.get("byDataset") or {})
         ids = run.dataset_ids
         dataset = min(ids, key=lambda d: (by.get(d, {}).get("calls", 0), ids.index(d)))
-        model = optimizer.llm.registry.get(run.model)
+        # The task's model first; with it out of budget or its provider down, the next one a
+        # Key can run, most requests left first, so the run never sits waiting for a reset.
+        refs = [run.model]
+        if not run.only_model:
+            refs += [str(m["ref"]) for m in await optimizer.llm.runnable()]
+        models = [m for ref in dict.fromkeys(refs) if (m := optimizer.llm.registry.get(ref))]
         operators = await optimizer.metadata.cached_operators() or []
         ctx = await context_for(
             optimizer.alphas.catalog,
@@ -435,7 +447,7 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
             dataset,
             FieldFilter.model_validate(run.field_filter) if run.field_filter else None,
         )
-        if model is None:
+        if not models:
             return await _pause(
                 optimizer,
                 study_id,
@@ -457,40 +469,67 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
 
         memory = await memory_of(optimizer, study_id, dataset)
         offset = int(by.get(dataset, {}).get("offset", 0))
-        user, shown = user_prompt(ctx, operators, run, memory, offset, model.prompt_tokens)
-        entry: dict[str, Any] = {
-            "at": utcnow().isoformat(),
-            "dataset": dataset,
-            "model": model.id,
-            "fields": shown,
-        }
         items: list[dict[str, Any]] = []
         answered = False
-        try:
-            answer = await optimizer.llm.generate(
-                system=POWER_POOL_LAB,
-                user=user,
-                model_ref=model.ref,
-                response_schema=SCHEMA,
-                temperature=1.0,
-            )
+        failing: str | None = None
+        spent: list[BudgetExhaustedError] = []
+        down: LLMUnavailable | None = None
+        entry: dict[str, Any] = {}
+        model = models[0]
+        shown = 0
+        for model in models:
+            user, shown = user_prompt(ctx, operators, run, memory, offset, model.prompt_tokens)
+            entry = {
+                "at": utcnow().isoformat(),
+                "dataset": dataset,
+                "model": model.id,
+                "fields": shown,
+            }
+            try:
+                answer = await optimizer.llm.generate(
+                    system=POWER_POOL_LAB,
+                    user=user,
+                    model_ref=model.ref,
+                    response_schema=SCHEMA,
+                    temperature=1.0,
+                )
+            except BudgetExhaustedError as exc:
+                spent.append(exc)
+                continue
+            except LLMUnavailable as exc:
+                down = exc
+                continue
+            except LLMError as exc:
+                _retry[study_id] = time.monotonic() + 60.0
+                entry["error"] = str(exc)[:300]
+                llm["failed"] = int(llm.get("failed") or 0) + 1
+                if llm["failed"] >= 3:
+                    # Saved as none, so a resumed task counts its failures afresh.
+                    llm["failed"] = 0
+                    failing = f"The LLM failed 3 times in a row: {exc}"
+                break
             answered = True
             items = parse_alphas(answer.text)[:40]
             entry["tokens"] = answer.total_tokens
             if not items:
                 entry["error"] = "The answer was not the JSON asked for: " + answer.text[:200]
-        except BudgetExhaustedError as exc:
-            _retry[study_id] = time.monotonic() + max(5.0, exc.retry_after)
-            if exc.daily:
-                await _note(optimizer, study_id, f"Waiting for LLM budget: {exc}")
-            return None
-        except LLMError as exc:
-            _retry[study_id] = time.monotonic() + 60.0
-            entry["error"] = str(exc)[:300]
-            llm["failed"] = int(llm.get("failed") or 0) + 1
-            if llm["failed"] >= 3:
-                await _pause(optimizer, study_id, f"The LLM failed 3 times in a row: {exc}")
+            break
+        else:
+            if down is None:
+                # Every model is out of budget: wait for the soonest to come back.
+                _retry[study_id] = time.monotonic() + max(5.0, min(e.retry_after for e in spent))
+                if any(e.daily for e in spent):
+                    reason = (
+                        str(spent[0])
+                        if len(spent) == 1
+                        else f"all {len(spent)} models a Key can run have used their daily "
+                        "allowance. The task carries on when the first one resets."
+                    )
+                    await _note(optimizer, study_id, f"Waiting for LLM budget: {reason}")
                 return None
+            # A busy provider passes: tried again in a minute, never counted toward a pause.
+            _retry[study_id] = time.monotonic() + 60.0
+            entry["error"] = str(down)[:300]
 
         table = operator_table(operators)
         rng = random.Random()
@@ -498,11 +537,19 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
             stored = await session.get(Study, study_id)
             if stored is None:
                 return None
-            existing = list(
-                (await session.scalars(select(Trial).where(Trial.study_id == study_id))).all()
+            # The two columns alone: whole rows carry each trial's JSON, and a long task has
+            # thousands of them.
+            seen = set(
+                (
+                    await session.scalars(
+                        select(Trial.expression).where(Trial.study_id == study_id)
+                    )
+                ).all()
             )
-            seen = {t.expression for t in existing}
-            number = max((t.number for t in existing), default=-1)
+            last = await session.scalar(
+                select(func.max(Trial.number)).where(Trial.study_id == study_id)
+            )
+            number = -1 if last is None else last
             valid = rejected = 0
             for item in items:
                 text = str(item.get("expression") or "").strip()
@@ -518,7 +565,7 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
                         Trial(
                             study_id=study_id,
                             number=number,
-                            params={"dataset": dataset},
+                            params={"dataset": dataset, "model": model.id},
                             distributions={},
                             expression=expression,
                             settings=settings,
@@ -532,7 +579,7 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
                         Trial(
                             study_id=study_id,
                             number=number,
-                            params={"dataset": dataset, "rejected": True},
+                            params={"dataset": dataset, "model": model.id, "rejected": True},
                             distributions={},
                             expression=text[:2000],
                             settings={},
@@ -556,6 +603,9 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
                 mine["offset"] = offset + shown
                 by[dataset] = mine
                 llm["byDataset"] = by
+                tally = dict(llm.get("byModel") or {})
+                tally[model.id] = int(tally.get(model.id) or 0) + 1
+                llm["byModel"] = tally
             entry |= {"valid": valid, "rejected": rejected}
             params.llm = llm
             params.calls = [*params.calls, entry][-100:]
@@ -563,6 +613,8 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
             if valid and stored.message and stored.message.startswith("Waiting for LLM budget"):
                 stored.message = None
         await optimizer.notify()
+        if failing:
+            await _pause(optimizer, study_id, failing)
     except Exception:
         log.exception("power_pool.write_failed", study_id=study_id)
         _retry[study_id] = time.monotonic() + 60.0

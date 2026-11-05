@@ -55,6 +55,9 @@ class LLMKey(Out):
     last_error: str | None
     created_at: str | None
     usage: list[LLMKeyUsage]
+    #: Requests this key may still send each set-up model today, by model id: the model's
+    #: own limit or the key's cap, whichever runs out first. A cap counts every model.
+    remaining_today: dict[str, int]
 
 
 class LLMBudget(Out):

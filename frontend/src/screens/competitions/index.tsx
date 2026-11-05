@@ -6,6 +6,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { ExternalLinkIcon, TrophyIcon } from 'lucide-react'
 import { type Competition, competitions } from '@/api/core'
+import { PLATFORM_COMPETITIONS_URL } from '@/api/platform'
 import { fmt } from '@/lib/format'
 import {
   Badge,
@@ -21,7 +22,7 @@ import {
 } from '@/ui/kit'
 
 const BRAIN_COMPETITION_URL = (id: string) =>
-  `https://platform.worldquantbrain.com/competitions/${encodeURIComponent(id)}`
+  `${PLATFORM_COMPETITIONS_URL}${encodeURIComponent(id)}`
 
 const DAY_MS = 86_400_000
 

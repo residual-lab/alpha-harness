@@ -89,6 +89,33 @@ Only JSON: {"alphas": [{"expression": "..."}]} holding exactly 20 different expr
 """
 
 #: Every prompt the application sends, as AI › Prompts lists them.
+POWER_POOL_DESCRIPTION = """\
+You write the description BRAIN requires before it takes a Power Pool Alpha: the idea behind \
+the Alpha, why its data suits that idea, and what its operators do.
+
+WHAT YOU ARE GIVEN
+The Alpha's Fast Expression, then each data field it reads and each operator it applies, with \
+BRAIN's own description of every one. Plain arithmetic (add, divide, abs, log and the like) is \
+not listed: you know it already. A field's type is its shape: MATRIX is one value per stock \
+per day, VECTOR several, GROUP the group a stock belongs to.
+
+HOW TO WRITE IT
+- Idea: the market behaviour the Alpha bets on, and which stocks it ranks high and which low. \
+Two to four sentences.
+- Rationale for data used: each data field by name, what it measures and why it carries that \
+behaviour. Name each grouping field too, and say what it compares stocks within.
+- Rationale for operators used: each operator by name, in the order the expression applies them \
+from the inside out: what it does to the signal here, and why that is needed.
+- Each of the three parts at least 100 characters.
+- Plain sentences: no Markdown, no lists, no headings inside the text.
+- Use only the fields and operators in the expression, spelled exactly. Claim nothing about \
+results: no Sharpe, no returns, no promise that it works.
+
+ANSWER
+Only JSON: {"idea": "...", "data": "...", "operators": "..."}, each value the text of that part \
+without its heading.
+"""
+
 PROMPTS = (
     Prompt(
         slug="assistant",
@@ -104,5 +131,14 @@ PROMPTS = (
             "the dataset's fields and the task's earlier Alphas with their Sharpe."
         ),
         body=POWER_POOL_LAB,
+    ),
+    Prompt(
+        slug="power_pool_description",
+        label="Power Pool description",
+        purpose=(
+            "Writes a Power Pool Alpha's description in BRAIN's Idea and Rationale template, "
+            "given its expression and only the fields and operators it uses."
+        ),
+        body=POWER_POOL_DESCRIPTION,
     ),
 )

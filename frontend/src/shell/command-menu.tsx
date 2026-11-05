@@ -4,11 +4,15 @@
  */
 
 import { Dialog as BDialog } from '@base-ui/react/dialog'
+import { useQuery } from '@tanstack/react-query'
 import { useRouter } from '@tanstack/react-router'
 import { Command } from 'cmdk'
 import { SearchIcon } from 'lucide-react'
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { create } from 'zustand'
+import { useFieldFilter } from '@/screens/data/state'
+import { alphaIdOf } from '@/screens/pool/api'
+import { labTasks } from '@/screens/tasks/api'
 import { BACKDROP } from '@/ui/overlay'
 import { NAV } from './nav'
 import { useSettings } from './settings'
@@ -26,7 +30,22 @@ interface Destination {
   label: string
   href?: string
   run?: () => void
+  /** Other words for it, so a search for what it does finds it too. */
+  also?: string[]
 }
+
+/** What a destination is for, in the words someone looking for it would type. */
+const ALSO: Record<string, string[]> = {
+  '/dashboard': ["Dispatch Today's Simulations"],
+  '/matrix': ['View Live Simulation Matrix'],
+  '/pool/submittable': ['Browse Submittable Alphas'],
+  '/sync': ['Sync Data Fields with BRAIN'],
+  '/ai/assistant': ['Ask AI Assistant'],
+  '/data': ['Explore Data Catalog'],
+}
+
+/** Shaped like a BRAIN Alpha id: letters and digits, with a digit or a capital past the first. */
+const ALPHA_ID = /^(?=[A-Za-z0-9]{7,8}$).(?=.*[0-9A-Z])/
 
 export function CommandMenu() {
   const { open, setOpen } = useCommandMenu()
@@ -43,33 +62,75 @@ export function CommandMenu() {
     return () => window.removeEventListener('keydown', onKey)
   }, [setOpen])
 
+  const [query, setQuery] = useState('')
+  // Each opening starts empty, as cmdk's own input would.
+  useEffect(() => {
+    if (!open) setQuery('')
+  }, [open])
+  const typed = query.trim()
+  const id = alphaIdOf(typed)
+  // The Tasks screen's own list, read when the menu opens, so a task is found by its name.
+  const tasks = useQuery({ queryKey: ['lab-tasks'], queryFn: labTasks.list, enabled: open })
   const groups = useMemo<[string, Destination[]][]>(
     () => [
+      ...(ALPHA_ID.test(id)
+        ? [
+            [
+              'Alpha',
+              [
+                { label: `Open Alpha ${id}`, href: `/alpha/${id}` },
+                {
+                  label: `Settings Sampler on ${id}`,
+                  href: `/tools/settings-sampler?alpha=${id}`,
+                },
+                {
+                  label: `Fields Sampler on ${id}`,
+                  href: `/tools/fields-sampler?alpha=${id}`,
+                },
+                {
+                  label: `Correlation Breaker on ${id}`,
+                  href: `/tools/correlation-breaker?alpha=${id}`,
+                },
+              ],
+            ] as [string, Destination[]],
+          ]
+        : []),
       [
-        'Quick Actions',
+        'Actions',
         [
-          // A typed apostrophe is U+0027, so the typographic one would never match.
-          { label: "Dispatch Today's Simulations", href: '/dashboard' },
-          { label: 'View Live Simulation Matrix', href: '/matrix' },
-          { label: 'Browse Submittable Alphas', href: '/pool/submittable' },
-          { label: 'Sync Data Fields with BRAIN', href: '/sync' },
-          { label: 'Ask AI Assistant', href: '/ai/assistant' },
-          { label: 'Explore Data Catalog', href: '/data' },
           { label: 'Open Settings', run: () => useSettings.getState().setOpen(true) },
+          ...(typed
+            ? [
+                {
+                  label: `Search Data Fields for “${typed}”`,
+                  run: () => {
+                    useFieldFilter.getState().replace({ search: typed })
+                    void router.navigate({ to: '/data' })
+                  },
+                },
+              ]
+            : []),
         ],
+      ],
+      [
+        'Tasks',
+        (tasks.data?.tasks ?? []).map((t) => ({
+          label: `Task ${t.id} · ${t.name || t.templateName || t.labName}`,
+          href: `/tasks?task=${t.id}`,
+        })),
       ],
       [
         'Screens & Labs',
         NAV.flatMap((item) => [
-          { label: item.label, href: item.to },
-          ...('tabs' in item ? item.tabs : []).map((t) => ({
-            label: `${item.label} · ${t.label}`,
-            href: `${item.to}/${t.tab}`,
-          })),
+          { label: item.label, href: item.to, also: ALSO[item.to] ?? [] },
+          ...('tabs' in item ? item.tabs : []).map((t) => {
+            const href = `${item.to}/${t.tab}`
+            return { label: `${item.label} · ${t.label}`, href, also: ALSO[href] ?? [] }
+          }),
         ]),
       ],
     ],
-    [],
+    [typed, id, tasks.data, router],
   )
 
   const go = (destination: Destination) => {
@@ -93,6 +154,8 @@ export function CommandMenu() {
               <SearchIcon className="size-4 shrink-0 text-ink-subtle" aria-hidden />
               <Command.Input
                 autoFocus
+                value={query}
+                onValueChange={setQuery}
                 placeholder="Go to a screen or lab…"
                 className="h-11 flex-1 bg-transparent text-body text-ink outline-none placeholder:text-ink-subtle"
               />
@@ -111,7 +174,10 @@ export function CommandMenu() {
                           // Unique across groups: cmdk selects by value, and a screen offered as
                           // both a quick action and a destination lit up twice.
                           value={destination.label}
-                          keywords={destination.href ? [destination.href] : []}
+                          keywords={[
+                            ...(destination.href ? [destination.href] : []),
+                            ...(destination.also ?? []),
+                          ]}
                           onSelect={() => go(destination)}
                           className="flex h-8 cursor-default items-center rounded-sm px-2 text-body text-ink-muted select-none data-[selected=true]:bg-surface-4 data-[selected=true]:text-ink"
                         >

@@ -15,15 +15,42 @@ import { telemetry } from './ws'
  */
 let coreAssignment: ReadonlyMap<number, number> = new Map()
 
+type Built = ReturnType<typeof buildCores>
+/** The last layout and what it was built from: the header and the matrix ask with the same
+ *  snapshot on every tick, and the second is answered without building it again. */
+let lastBuilt: {
+  active: SimulationRow[] | null | undefined
+  slots: number
+  maxBatch: number
+  from: ReadonlyMap<number, number>
+  built: Built
+} | null = null
+
+function coresFor(
+  active: SimulationRow[] | null | undefined,
+  slots: number,
+  maxBatch: number,
+): Built {
+  const last = lastBuilt
+  if (
+    last &&
+    last.active === active &&
+    last.slots === slots &&
+    last.maxBatch === maxBatch &&
+    last.from === coreAssignment
+  )
+    return last.built
+  const built = buildCores(active ?? [], slots, maxBatch, coreAssignment)
+  lastBuilt = { active, slots, maxBatch, from: coreAssignment, built }
+  return built
+}
+
 export function useCores(
   active: SimulationRow[] | null | undefined,
   slots: number,
   maxBatch: number,
 ) {
-  const built = useMemo(
-    () => buildCores(active ?? [], slots, maxBatch, coreAssignment),
-    [active, slots, maxBatch],
-  )
+  const built = useMemo(() => coresFor(active, slots, maxBatch), [active, slots, maxBatch])
   // Kept after the render commits, never during it: a render may be thrown away (StrictMode
   // runs each one twice), and a discarded pass must not move everyone's core.
   useEffect(() => {
@@ -50,9 +77,10 @@ export const useLive = create<Live>(() => ({
   verificationUrl: null,
 }))
 
-// A snapshot from before a disconnect may be long stale; dropping it re-arms the REST fallbacks.
+// A snapshot from before a disconnect may be long stale, and a restarted backend has no tasks
+// message to replay for jobs that died with it; dropping both re-arms the REST fallbacks.
 telemetry.onStatus((connected) =>
-  useLive.setState(connected ? { connected } : { connected, simulations: null }),
+  useLive.setState(connected ? { connected } : { connected, simulations: null, tasks: null }),
 )
 telemetry.subscribe('simulations', (payload) => {
   // The topic also carries `{alphaId, stored}` from backfill; only arrays are snapshots.

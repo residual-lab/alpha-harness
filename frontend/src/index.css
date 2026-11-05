@@ -35,7 +35,7 @@
   --spec-status-running: #3b82f6;
   --spec-status-queued: #8a8f98;
   --spec-status-warning: #f59e0b;
-  --spec-status-idle: #23252a;
+  --spec-status-idle: #34343a;
   --neutral-600: oklch(0.5 0.011 262.9);
   --lavender-300: oklch(0.8 0.096 280.7);
   --orchid-400: oklch(0.7 0.108 324.8);
@@ -336,6 +336,12 @@
     border-color: var(--color-hairline);
     scrollbar-width: thin;
     scrollbar-color: var(--color-hairline-strong) transparent;
+  }
+  /* Tailwind v4 leaves buttons on the arrow; rows and boxes here already point, so these do too. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  summary {
+    cursor: pointer;
   }
   :focus-visible {
     outline: 2px solid var(--focus-ring);

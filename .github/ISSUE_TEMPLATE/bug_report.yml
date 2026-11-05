@@ -1,0 +1,126 @@
+name: 🕷️ Bug report
+description: Report errors or unexpected behavior
+labels: ["type: bug", "status: needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. A bug we can make happen ourselves gets fixed; one we can't gets closed with `status: needs repro` until it can be.
+
+        - **Questions** ("how do I…", "why does BRAIN…") go to [Discussions](https://github.com/residual-lab/alpha-harness/discussions/categories/q-a), not here.
+        - **Update first.** If the sidebar shows an **Update** button, install it and check the bug is still there.
+        - **Search** [open and closed issues](https://github.com/residual-lab/alpha-harness/issues?q=is%3Aissue) first. If yours is there, add your details to it instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: Alpha Harness version
+      description: Shown at the bottom of the sidebar, and under Settings › Updates. Write the number, not "latest".
+      placeholder: "2026.10.20"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Windows 8.1 or older
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you run it
+      options:
+        - Desktop app (downloaded from Releases)
+        - uvx / wheel
+        - From source (lefthook run dev)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where it happens
+      options:
+        - Install, start-up or updates
+        - Sign-in and BRAIN session
+        - Simulation Matrix and Tasks
+        - Research Labs (Search, Template, Evolution, LLM Power Pool, Super Alpha)
+        - Tools (Settings Sampler, Correlation Breaker, Fields Sampler)
+        - Pool and Portfolio
+        - Data catalog
+        - AI keys and models
+        - Speed or memory
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, in your own words. Paste any error message the app showed, word for word.
+      placeholder: "The Correlation Breaker task stays at 0% and the Matrix shows nothing running."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to make it happen
+      description: The exact clicks, from opening the app. If it only happens sometimes, say how often.
+      placeholder: |
+        1. Open Tools › Correlation Breaker
+        2. Enter Alpha ID …
+        3. Click Add & Run
+        4. See …
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        The last 100 lines of `launcher.log`, copied after the bug happens:
+        - Windows: `%LOCALAPPDATA%\AlphaHarness\launcher.log`
+        - macOS: `~/Library/Application Support/AlphaHarness/launcher.log`
+        - Linux: `~/.local/share/AlphaHarness/launcher.log`
+
+        Running from source? Paste the terminal output instead. Remove your email first.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot
+      description: Optional, but it often saves a round trip. Drag the image in.
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before you submit
+      options:
+        - label: I'm on the newest version, or the newest one won't install.
+          required: true
+        - label: I searched open and closed issues and this isn't already reported.
+          required: true
+        - label: This report contains no password, API key or session cookie.
+          required: true

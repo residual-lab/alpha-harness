@@ -19,12 +19,14 @@ import {
   CircleAlertIcon,
   InfoIcon,
   LoaderCircleIcon,
+  MinusIcon,
   TriangleAlertIcon,
 } from 'lucide-react'
 import { type ComponentProps, Fragment, type ReactNode, useId } from 'react'
 import { ApiError, errorMessage } from '@/api/http'
 import type { CheckResult } from '@/api/types'
 import { cn } from '@/lib/cn'
+import { type CORE_ORDER, isNum } from '@/lib/format'
 
 // ── Tone helpers: data colour comes from the value, never from decoration ──────────────
 
@@ -38,9 +40,56 @@ export const TEXT_TONE: Record<Tone, string> = {
   warn: 'text-status-warning',
 }
 
-/** Sign of a return, Sharpe or PnL. */
+/** Sign of money made or lost: a return, a PnL, a change to a portfolio. */
 export const signTone = (v: number | null | undefined): Tone =>
   v == null || v === 0 ? 'neutral' : v > 0 ? 'profit' : 'loss'
+
+/**
+ * A diagnostic ratio judged against the cutoff BRAIN submits at rather than against zero: red
+ * when negative (an inverted signal), green once it `meets` the cutoff, and plain between, since
+ * a positive figure is not yet a good one. With no cutoff to meet, only red is earned.
+ */
+export const cutoffTone = (v: number | null | undefined, meets = false): Tone =>
+  v == null || Number.isNaN(v) ? 'neutral' : v < 0 ? 'loss' : meets ? 'profit' : 'neutral'
+
+/** The limits BRAIN's checks set one Alpha's figures, by check name (`LOW_SHARPE`, …). */
+export type Limits = Partial<Record<string, number>>
+
+/**
+ * A core figure's tone: Returns by sign; Sharpe, Fitness and Turnover against the limits the
+ * Alpha's own checks name, so with none known only a negative is called out; Margin, which BRAIN
+ * checks against nothing, only when negative; Drawdown not at all.
+ */
+export function figureTone(
+  key: (typeof CORE_ORDER)[number],
+  v: number | null | undefined,
+  limits: Limits = {},
+): Tone {
+  if (!isNum(v)) return 'neutral'
+  const at = (check: string) => limits[check]
+  switch (key) {
+    case 'returns':
+      return signTone(v)
+    case 'sharpe': {
+      const floor = at('LOW_SHARPE')
+      return cutoffTone(v, floor !== undefined && v >= floor)
+    }
+    case 'fitness': {
+      const floor = at('LOW_FITNESS')
+      return cutoffTone(v, floor !== undefined && v >= floor)
+    }
+    // A band rather than a floor: outside it the Alpha fails the check outright.
+    case 'turnover': {
+      const [low, high] = [at('LOW_TURNOVER'), at('HIGH_TURNOVER')]
+      if ((low !== undefined && v < low) || (high !== undefined && v > high)) return 'loss'
+      return low !== undefined && high !== undefined ? 'profit' : 'neutral'
+    }
+    case 'margin':
+      return cutoffTone(v)
+    case 'drawdown':
+      return 'neutral'
+  }
+}
 
 /**
  * One BRAIN submission check, coloured by what it says on its own: passed, unsettled, or
@@ -68,13 +117,23 @@ export function PageHeader({
   title,
   description,
   actions,
+  sticky = false,
 }: {
   title: ReactNode
   description?: ReactNode
   actions?: ReactNode
+  /** Stays at the top while the page scrolls, for a form whose buttons are up here and whose
+   *  last inputs are at the bottom. */
+  sticky?: boolean
 }) {
   return (
-    <header className="flex flex-wrap items-end justify-between gap-3 px-1 pt-1">
+    <header
+      className={cn(
+        'flex flex-wrap items-end justify-between gap-3 px-1 pt-1',
+        sticky &&
+          '-mx-3 -mt-3 sticky top-0 z-20 border-b border-hairline bg-canvas/95 px-4 py-3 backdrop-blur-sm lg:-mx-4 lg:-mt-4 lg:px-5',
+      )}
+    >
       <div className="flex min-w-0 flex-col gap-1">
         <h1 className="text-headline text-balance break-words font-semibold text-ink">{title}</h1>
         {description && (
@@ -145,10 +204,11 @@ const BUTTON_VARIANT = {
     'border border-hairline bg-surface-2 text-ink hover:border-hairline-strong hover:bg-surface-3 active:bg-surface-4',
   ghost: 'text-ink-muted hover:bg-surface-2 hover:text-ink active:bg-surface-3',
   danger:
-    'border border-hairline bg-surface-1 text-pnl-negative-text hover:border-(--btn-danger-border-hover) hover:bg-pnl-negative-tint active:border-pnl-negative',
+    'border border-hairline bg-surface-2 text-pnl-negative-text hover:border-(--btn-danger-border-hover) hover:bg-pnl-negative-tint active:border-pnl-negative',
 }
 const BUTTON_SIZE = {
-  md: 'rounded-sm px-3 py-1.5 text-body [&_svg]:size-4',
+  // The input's height, so a button beside a field lines up with it, border or none.
+  md: 'h-8 rounded-sm px-3 text-body [&_svg]:size-4',
   sm: 'h-7 rounded-sm px-2 text-body-compact [&_svg]:size-3.5',
   icon: 'size-8 rounded-sm [&_svg]:size-4',
   'icon-sm': 'size-7 rounded-sm [&_svg]:size-3.5',
@@ -283,13 +343,17 @@ export function Fieldset({
 export function Checkbox({
   label,
   checked,
+  indeterminate = false,
   onChange,
   disabled,
   className,
   ...props
 }: {
+  /** `null` for a box labelled by `aria-label` alone, as in a table row. */
   label: ReactNode
   checked: boolean
+  /** Some of what it stands for is ticked, not all: drawn as a dash. */
+  indeterminate?: boolean | undefined
   onChange: (checked: boolean) => void
   disabled?: boolean | undefined
   className?: string | undefined
@@ -297,23 +361,29 @@ export function Checkbox({
 }) {
   const id = useId()
   return (
-    <span className={cn('group inline-flex items-start gap-2.5', className)}>
+    <span className={cn('group/check inline-flex items-start gap-2.5', className)}>
       <BaseCheckbox.Root
         id={id}
         checked={checked}
+        indeterminate={indeterminate}
         disabled={disabled}
         onCheckedChange={onChange}
         className={cn(
           'mt-px flex size-4 shrink-0 items-center justify-center rounded-xs border transition-colors',
           'border-(--field-border) bg-surface-1',
           'data-[checked]:border-(--btn-primary-bg) data-[checked]:bg-(--btn-primary-bg)',
+          'data-[indeterminate]:border-(--btn-primary-bg) data-[indeterminate]:bg-(--btn-primary-bg)',
           'data-[disabled]:border-(--field-border-disabled) data-[disabled]:bg-surface-2',
-          !disabled && 'cursor-pointer group-hover:border-(--field-border-hover)',
+          !disabled && 'cursor-pointer group-hover/check:border-(--field-border-hover)',
         )}
         {...props}
       >
         <BaseCheckbox.Indicator className="flex text-(--btn-primary-text)">
-          <CheckIcon className="size-3" strokeWidth={3.5} aria-hidden />
+          {indeterminate ? (
+            <MinusIcon className="size-3" strokeWidth={3.5} aria-hidden />
+          ) : (
+            <CheckIcon className="size-3" strokeWidth={3.5} aria-hidden />
+          )}
         </BaseCheckbox.Indicator>
       </BaseCheckbox.Root>
       {label && (
@@ -323,7 +393,7 @@ export function Checkbox({
             'flex min-w-0 flex-col gap-0.5 text-body select-none',
             disabled
               ? 'cursor-not-allowed text-(--field-text-disabled)'
-              : 'cursor-pointer text-ink-muted group-hover:text-ink',
+              : 'cursor-pointer text-ink-muted group-hover/check:text-ink',
           )}
         >
           {label}
@@ -421,7 +491,7 @@ export function Segmented<V extends string | number>({
   onChange,
   label,
 }: {
-  items: { value: V; label: ReactNode }[]
+  items: { value: V; label: ReactNode; disabled?: boolean }[]
   value: V
   onChange: (value: V) => void
   label: string
@@ -441,7 +511,8 @@ export function Segmented<V extends string | number>({
         <Radio.Root
           key={String(item.value)}
           value={String(item.value)}
-          className="inline-flex h-7 items-center justify-center rounded-xs border border-transparent px-3 text-body-compact leading-none font-medium text-ink-subtle transition-colors hover:text-ink data-[checked]:border-hairline-strong data-[checked]:bg-surface-3 data-[checked]:text-ink"
+          disabled={item.disabled}
+          className="inline-flex h-7 items-center justify-center rounded-xs border border-transparent px-3 text-body-compact leading-none font-medium text-ink-subtle transition-colors hover:text-ink data-[checked]:border-hairline-strong data-[checked]:bg-surface-3 data-[checked]:text-ink data-[disabled]:text-ink-disabled data-[disabled]:hover:text-ink-disabled"
         >
           {item.label}
         </Radio.Root>
@@ -574,13 +645,17 @@ export function Progress({
   value,
   className,
   label,
+  mark,
 }: {
   value: number | null
   className?: string
   label?: string
+  /** A tick across the track at this fraction, for a fill to be read against: the quota gauge's
+   *  share of the day gone. */
+  mark?: { at: number; label: string } | undefined
 }) {
   const clamped = value == null ? null : Math.min(1, Math.max(0, value))
-  return (
+  const bar = (
     <div
       role="progressbar"
       aria-label={label}
@@ -596,6 +671,19 @@ export function Progress({
           clamped == null ? 'w-1/3 animate-pulse' : 'origin-left transition-transform',
         )}
         style={clamped == null ? undefined : { transform: `scaleX(${clamped})` }}
+      />
+    </div>
+  )
+  if (!mark) return bar
+  return (
+    <div className="relative">
+      {bar}
+      <span
+        role="img"
+        aria-label={mark.label}
+        title={mark.label}
+        className="absolute top-1/2 h-2.5 w-0.5 -translate-x-1/2 -translate-y-1/2 rounded-pill bg-ink-muted"
+        style={{ left: `${Math.min(1, Math.max(0, mark.at)) * 100}%` }}
       />
     </div>
   )

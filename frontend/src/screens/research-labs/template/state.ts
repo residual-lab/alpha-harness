@@ -2,7 +2,15 @@
 
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
+import {
+  DEFAULT_DECAY,
+  DEFAULT_NAN_HANDLING,
+  DEFAULT_PASTEURIZATION,
+  DEFAULT_TRUNCATION,
+  TEST_PERIOD_YEARS,
+} from '@/api/platform'
 import { DEFAULT_SCOPE } from '@/lib/scope'
+import { followOtherTabs } from '@/lib/tabs'
 import type { Investability, VariableDef } from './api'
 
 export interface TemplateDraft {
@@ -62,11 +70,11 @@ const DRAFT: TemplateDraft = {
   universes: [],
   neutralizations: [],
   investability: [],
-  decay: '0',
-  truncation: '0.08',
-  pasteurization: 'ON',
-  nanHandling: 'ON',
-  testYears: '2',
+  decay: String(DEFAULT_DECAY),
+  truncation: String(DEFAULT_TRUNCATION),
+  pasteurization: DEFAULT_PASTEURIZATION,
+  nanHandling: DEFAULT_NAN_HANDLING,
+  testYears: String(TEST_PERIOD_YEARS),
   testMonths: '0',
   cores: null,
   simulations: null,
@@ -140,3 +148,4 @@ export const useTemplateLab = create<TemplateDraft & Actions>()(
     },
   ),
 )
+followOtherTabs(useTemplateLab)

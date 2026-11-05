@@ -23,7 +23,7 @@ a limit — because a local refusal can name another key or model, and a ``429``
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from datetime import time as clock  # `time` is already the module, imported above
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 
 WINDOW_SECONDS = 60.0
+#: The usage row that counts a key's requests to every model, for its own daily cap.
+ALL_MODELS = "*"
 
 
 def quota_day(tz: tzinfo, moment: datetime | None = None) -> str:
@@ -63,17 +65,13 @@ def seconds_until_reset(tz: tzinfo, moment: datetime | None = None) -> float:
     """
     now = (moment or utcnow()).astimezone(tz)
     midnight = datetime.combine(now.date() + timedelta(days=1), clock.min, tzinfo=tz)
-    return max(0.0, (midnight - now).total_seconds())
+    # In UTC: two times sharing a zone subtract as wall clocks, which ignores the change.
+    return max(0.0, (midnight.astimezone(UTC) - now.astimezone(UTC)).total_seconds())
 
 
 def model_reset(model: ModelInfo) -> float:
     """Seconds until the model's provider starts a new day."""
     return seconds_until_reset(ZoneInfo(model.reset_timezone))
-
-
-def daily_ceiling(model: ModelInfo, cap: int | None) -> int:
-    """Requests a key may send a model today: the model's limit, or the key's cap if lower."""
-    return model.rpd if cap is None else min(cap, model.rpd)
 
 
 @dataclass(slots=True)
@@ -161,33 +159,41 @@ class Ledger:
     def _window(self, key_id: int, model: str) -> Window:
         return self._windows.setdefault((key_id, model), Window())
 
-    async def _requests_today(self, key_id: int, model: ModelInfo) -> int:
-        day = model_day(model)
-        cached = self._daily.get((key_id, model.id, day))
+    async def _count(self, key_id: int, model_id: str, day: str) -> int:
+        """Requests a key has sent a model (or :data:`ALL_MODELS`) on ``day``."""
+        cached = self._daily.get((key_id, model_id, day))
         if cached is not None:
             return cached
         async with self.db.session() as session:
             row = await session.scalar(
                 select(KeyUsage).where(
                     KeyUsage.api_key_id == key_id,
-                    KeyUsage.model == model.id,
+                    KeyUsage.model == model_id,
                     KeyUsage.day == day,
                 )
             )
             count = int(row.requests) if row else 0
-        self._daily[(key_id, model.id, day)] = count
+        self._daily[(key_id, model_id, day)] = count
         return count
 
     async def headroom(self, key_id: int, model: ModelInfo, *, cap: int | None = None) -> Headroom:
         """What is left, and the first limit that would stop the next request.
 
         ``cap`` is the key's own daily limit. A paid key must have one, because it is the
-        only thing between its owner and a bill; where both are set, the lower one stops.
+        only thing between its owner and a bill, so it counts every model the key serves.
+        Where both are set, the one closer to running out stops.
         """
         now = time.monotonic()
         window = self._window(key_id, model.id)
-        today = await self._requests_today(key_id, model) + self._in_flight[(key_id, model.id)]
-        daily = daily_ceiling(model, cap)
+        day = model_day(model)
+        today = await self._count(key_id, model.id, day) + self._in_flight[(key_id, model.id)]
+        daily = model.rpd
+        if cap is not None:
+            spent = await self._count(key_id, ALL_MODELS, day) + sum(
+                n for (key, _), n in self._in_flight.items() if key == key_id
+            )
+            if cap - spent < daily - today:
+                today, daily = spent, cap
 
         state = Headroom(
             key_id=key_id,
@@ -226,46 +232,56 @@ class Ledger:
         """
         day = model_day(model)
         spent, now_at = max(0, tokens), utcnow()
-        # One atomic statement: calls finishing together otherwise read-then-write the same
-        # count and lose increments, and the day's first two collide inserting its row.
-        statement = (
-            insert(KeyUsage)
-            .values(
-                api_key_id=key_id,
-                model=model.id,
-                day=day,
-                requests=1,
-                tokens=spent,
-                last_request_at=now_at,
+
+        def bump(model_id: str) -> Any:
+            # One atomic statement: calls finishing together otherwise read-then-write the
+            # same count and lose increments, and the day's first two collide inserting its row.
+            return (
+                insert(KeyUsage)
+                .values(
+                    api_key_id=key_id,
+                    model=model_id,
+                    day=day,
+                    requests=1,
+                    tokens=spent,
+                    last_request_at=now_at,
+                )
+                .on_conflict_do_update(
+                    index_elements=["api_key_id", "model", "day"],
+                    set_={
+                        "requests": KeyUsage.requests + 1,
+                        "tokens": KeyUsage.tokens + spent,
+                        "last_request_at": now_at,
+                    },
+                )
+                .returning(KeyUsage.requests)
             )
-            .on_conflict_do_update(
-                index_elements=["api_key_id", "model", "day"],
-                set_={
-                    "requests": KeyUsage.requests + 1,
-                    "tokens": KeyUsage.tokens + spent,
-                    "last_request_at": now_at,
-                },
-            )
-            .returning(KeyUsage.requests)
-        )
+
         async with self.db.session() as session:
-            requests = (await session.execute(statement)).scalar_one()
-        self._daily[(key_id, model.id, day)] = requests
+            counted = {
+                model_id: (await session.execute(bump(model_id))).scalar_one()
+                for model_id in (model.id, ALL_MODELS)
+            }
+        for model_id, requests in counted.items():
+            self._daily[(key_id, model_id, day)] = requests
 
         # Yesterday's counts are not just stale, they are wrong to serve — drop them. Only
         # this key's for this model: another provider serving the same id keeps its own clock.
-        for cached in [k for k in self._daily if k[:2] == (key_id, model.id) and k[2] != day]:
+        for cached in [
+            k
+            for k in self._daily
+            if k[0] == key_id and k[1] in (model.id, ALL_MODELS) and k[2] != day
+        ]:
             del self._daily[cached]
 
-    async def penalise(
-        self, key_id: int, model: ModelInfo, *, daily: bool, cap: int | None = None
-    ) -> None:
+    async def penalise(self, key_id: int, model: ModelInfo, *, daily: bool) -> None:
         """Believe the provider over our own arithmetic.
 
-        A ``429`` means the local count was wrong, so the count is moved to the ceiling and
-        rotation immediately treats this pair as spent rather than retrying into it.
+        A ``429`` means the local count was wrong, so the count is moved to the model's
+        ceiling and rotation immediately treats this pair as spent rather than retrying into
+        it. Only this model's row: the key's all-models row counts what was actually sent.
         """
-        ceiling = daily_ceiling(model, cap)
+        ceiling = model.rpd
         if daily:
             day = model_day(model)
             async with self.db.session() as session:

@@ -20,6 +20,8 @@ import { ErrorNotice, Page, Panel, Progress, Skeleton, TEXT_TONE, type Tone } fr
 import { GettingStarted } from './getting-started'
 import { WorkInFlight } from './work'
 
+const DAY_SECONDS = 24 * 60 * 60
+
 export function DashboardScreen() {
   const day = useQuery({ queryKey: ['today'], queryFn: () => today.get() })
   useRefetchOn('simulations', ['today'], 10_000)
@@ -76,6 +78,11 @@ export function DashboardScreen() {
               <Progress
                 value={sims.limit ? sims.used / sims.limit : 0}
                 label="Simulation quota depletion"
+                // A fill left of the mark is allowance falling behind the day.
+                mark={{
+                  at: 1 - sims.resetsInSeconds / DAY_SECONDS,
+                  label: `${fmt.pct(1 - sims.resetsInSeconds / DAY_SECONDS, 0)} of the quota day gone`,
+                }}
               />
             )
           }

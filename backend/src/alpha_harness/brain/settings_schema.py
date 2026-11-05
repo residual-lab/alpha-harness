@@ -94,6 +94,16 @@ def resolve_options(
     return resolved
 
 
+def chosen_labels(schema: dict[str, Any] | None, settings: dict[str, Any]) -> dict[str, str]:
+    """Each setting BRAIN offers as a choice, by the label of the value chosen."""
+    return {
+        name: str(choice["label"])
+        for name, field in resolve_options(schema or {}, settings).items()
+        for choice in field["choices"] or []
+        if choice.get("value") == settings.get(name) and choice.get("label") is not None
+    }
+
+
 def valid_values(schema: dict[str, Any], field: str, settings: dict[str, Any]) -> list[Any]:
     """The legal values for one field given the rest of the settings."""
     node = schema.get(field)

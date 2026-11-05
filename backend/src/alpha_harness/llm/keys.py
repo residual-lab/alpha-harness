@@ -35,6 +35,10 @@ class LLMError(Exception):
     """Something wrong with the LLM setup, phrased for whoever has to fix it."""
 
 
+class LLMUnavailable(LLMError):
+    """The provider timed out or failed on its side: worth trying another model, or later."""
+
+
 class NoKeysError(LLMError):
     def __init__(self, provider: str | None = None) -> None:
         if provider and provider != "google":
@@ -97,7 +101,11 @@ def hint(key: str) -> str:
     return f"{clean[:6]}…{clean[-4:]}"
 
 
-def serialise(row: ApiKey, usage: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def serialise(
+    row: ApiKey,
+    usage: list[dict[str, Any]] | None = None,
+    remaining: dict[str, int] | None = None,
+) -> dict[str, Any]:
     return {
         "id": row.id,
         "label": row.label,
@@ -109,6 +117,7 @@ def serialise(row: ApiKey, usage: list[dict[str, Any]] | None = None) -> dict[st
         "lastError": row.last_error,
         "createdAt": row.created_at.isoformat() if row.created_at else None,
         "usage": usage or [],
+        "remainingToday": remaining or {},
     }
 
 
@@ -289,6 +298,8 @@ class KeyStore:
 
         configured_providers = {r.provider for r in rows}
         budget: list[dict[str, Any]] = []
+        #: Key id -> model id -> requests that key may still send that model today.
+        left: dict[int, dict[str, int]] = {}
         for model in models:
             if model.provider not in configured_providers:
                 continue
@@ -301,6 +312,7 @@ class KeyStore:
                 state = await self.ledger.headroom(row.id, model, cap=row.daily_limit)
                 remaining += state.daily_remaining
                 allowed += state.requests_per_day
+                left.setdefault(row.id, {})[model.id] = state.daily_remaining
             budget.append(
                 {
                     "model": model.id,
@@ -314,7 +326,7 @@ class KeyStore:
             )
 
         return {
-            "keys": [serialise(r, by_key.get(r.id, [])) for r in rows],
+            "keys": [serialise(r, by_key.get(r.id, []), left.get(r.id)) for r in rows],
             "enabled": sum(1 for r in rows if r.enabled),
             "budget": budget,
             # The soonest any model's day turns over; each budget row carries its own.

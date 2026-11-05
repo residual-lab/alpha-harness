@@ -29,15 +29,11 @@ class Session(Out):
     user_id: str | None
     full_name: str | None
     permissions: list[str]
-    #: Epoch seconds.
-    expires_at: float | None
-    restored_from_cache: bool
     verification_url: str | None
     #: The Persona inquiry a paused sign-in is waiting on, which `/verify` closes.
     inquiry: str | None
     detail: str | None
     can_multi_simulate: bool
-    is_consultant: bool
     expires_in_seconds: int | None
 
 

@@ -43,8 +43,8 @@ export const LAB_TABS = [
  *  under the sidebar entry, for the same reason as the labs. */
 export const TOOL_TABS = [
   { tab: 'settings-sampler', label: 'Settings Sampler', to: '/tools/settings-sampler' },
-  { tab: 'submission-planner', label: 'Submission Planner', to: '/tools/submission-planner' },
   { tab: 'correlation-breaker', label: 'Correlation Breaker', to: '/tools/correlation-breaker' },
+  { tab: 'fields-sampler', label: 'Fields Sampler', to: '/tools/fields-sampler' },
 ] as const
 
 /** `group` heads a run of items in the sidebar; empty sits above every heading. An item's

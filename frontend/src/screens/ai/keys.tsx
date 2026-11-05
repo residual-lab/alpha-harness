@@ -1,6 +1,6 @@
 import { useMutation } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
 import { DASH, fmt } from '@/lib/format'
@@ -205,7 +205,13 @@ function CapCell({ apiKey: k }: { apiKey: LLMKey }) {
     },
   })
 
+  // Escape leaves the field too, and leaving it saves: this keeps that one from saving.
+  const dropped = useRef(false)
   const commit = () => {
+    if (dropped.current) {
+      dropped.current = false
+      return
+    }
     const clean = draft.trim()
     if (clean === '') {
       if (k.dailyLimit !== null) save.mutate(null)
@@ -230,7 +236,14 @@ function CapCell({ apiKey: k }: { apiKey: LLMKey }) {
       disabled={save.isPending}
       onChange={(e) => setDraft(e.target.value)}
       onBlur={commit}
-      onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault()
+          dropped.current = true
+          setDraft(String(k.dailyLimit ?? ''))
+          e.currentTarget.blur()
+        } else if (e.key === 'Enter') e.currentTarget.blur()
+      }}
     />
   )
 }

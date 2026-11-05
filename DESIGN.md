@@ -27,7 +27,7 @@ colors:
   status-running: "#3b82f6"
   status-queued: "#8a8f98"
   status-warning: "#f59e0b"
-  status-idle: "#23252a"
+  status-idle: "#34343a"
 
 typography:
   caption:
@@ -129,7 +129,8 @@ components:
     textColor: "{colors.on-primary}"
     typography: "{typography.body}"
     rounded: "{rounded.sm}"
-    padding: 6px 12px
+    padding: 0 12px
+    height: 32px
   button-primary-hover:
     backgroundColor: "{colors.primary-hover}"
   button-primary-active:
@@ -139,7 +140,8 @@ components:
     textColor: "{colors.ink}"
     typography: "{typography.body}"
     rounded: "{rounded.sm}"
-    padding: 6px 12px
+    padding: 0 12px
+    height: 32px
   button-secondary-hover:
     backgroundColor: "{colors.surface-3}"
   button-secondary-active:
@@ -150,7 +152,7 @@ components:
     typography: "{typography.body}"
     rounded: "{rounded.sm}"
   button-danger:
-    backgroundColor: "{colors.surface-1}"
+    backgroundColor: "{colors.surface-2}"
     textColor: "{colors.pnl-negative-text}"
     typography: "{typography.body}"
     rounded: "{rounded.sm}"
@@ -222,17 +224,17 @@ components:
     backgroundColor: "{colors.surface-1}"
     textColor: "{colors.ink}"
     typography: "{typography.body-compact}"
-    height: 34px
+    height: 28px
   data-table-row-hover:
     backgroundColor: "{colors.surface-2}"
-  check-bar-pass:
+  check-dot-pass:
     backgroundColor: "{colors.pnl-positive}"
     rounded: "{rounded.pill}"
-    height: 4px
-  check-bar-fail:
+    size: 6px
+  check-dot-fail:
     backgroundColor: "{colors.pnl-negative}"
     rounded: "{rounded.pill}"
-    height: 4px
+    size: 6px
   quota-gauge-track:
     backgroundColor: "{colors.surface-2}"
     rounded: "{rounded.pill}"
@@ -242,9 +244,12 @@ components:
     rounded: "{rounded.pill}"
     height: 6px
   core-slot-idle:
-    backgroundColor: "{colors.status-idle}"
+    backgroundColor: "{colors.surface-1}"
     rounded: "{rounded.xs}"
     size: 20px
+  core-slot-idle-edge:
+    backgroundColor: "{colors.status-idle}"
+    width: 1px
   core-slot-queued:
     backgroundColor: "{colors.status-queued}"
     rounded: "{rounded.xs}"
@@ -312,10 +317,22 @@ one component.
 - **Lavender** (`primary`, `primary-hover`, `primary-focus`, `on-primary`) — execution, focus and
   selection: the primary button, the focus ring, the selected row, the progress fill. Never
   decoration.
-- **`pnl-positive` / `pnl-negative`** — the sign of a number. Applied through `signTone(value)`,
-  never chosen by hand, so a red figure always means a negative figure. These two paint marks,
-  fills and edges; a figure is written in **`pnl-positive-text` / `pnl-negative-text`**, the same
-  hues lifted in OKLCH lightness until they clear the Lc 60 floor (see Floors).
+- **`pnl-positive` / `pnl-negative`** — a verdict on a figure, never chosen by hand. What the
+  verdict is depends on what the figure is:
+  - **Money** (Returns, PnL, a change to the Portfolio) by its sign, through `signTone(value)`:
+    green made, red lost.
+  - **Diagnostic ratios** (Sharpe, Fitness, Turnover, Margin, and their train, test and
+    after-cost versions) against the limits the Alpha's own checks name (`LOW_SHARPE`,
+    `LOW_FITNESS`, `LOW_TURNOVER`, `HIGH_TURNOVER`), through `cutoffTone` and `figureTone`: red
+    when negative, an inverted signal; green once it meets its limit; plain `ink` between,
+    because a positive Sharpe of 0.32 is noise, not profit. The limits are read, never written
+    down here: they differ by market. Turnover has a band rather than a floor, so it is green
+    inside it and red outside, where the Alpha fails outright. With no limit known — Margin,
+    or a figure that is not one Alpha's — only red is earned.
+  So a red figure always means lost money, an inverted signal or a failed check, and a green
+  one always means money made or a cutoff met. These two paint marks, fills and edges; a
+  figure is written in **`pnl-positive-text` / `pnl-negative-text`**, the same hues lifted in
+  OKLCH lightness until they clear the Lc 60 floor (see Floors).
 - **`status-idle` / `status-queued` / `status-running` / `status-warning`** — what a simulation
   core is doing. The four states of the core matrix in the top bar.
 - **`ink` → `ink-muted` → `ink-subtle` → `ink-tertiary`** — four text steps. Body copy is `ink`,
@@ -333,16 +350,16 @@ mix over a named surface:
 - **`pyramid-*`** — eleven steps of `pnl-positive` over `surface-1` (5 → 72%), one per Pyramid
   Multiplier BRAIN offers, mapped from the values actually present rather than an assumed range.
   Deepening rather than diverging: the lowest multiplier is the floor of the payout, not a loss,
-  so nothing on this map is ever red. It tops out at 72% so white figures hold APCA 78, and
-  because each step also rises in lightness the ordering survives red-green colour blindness.
+  so nothing on this map is ever red. It tops out at 72% so white figures hold APCA 78.
 - **`*-tint` / `*-edge`** — a semantic hue at 12% (fill) and 40% (outline) over its surface, for
   judged badges and notices.
 
 ### Floors
 
 Contrast is judged in **APCA**, not WCAG 2, because WCAG 2's ratio is known to misjudge light
-text on near-black and this canvas is #010102. Measured with `frontend/tools/oklch.ts`, over
-`surface-1`:
+text on near-black and this canvas is #010102. Measured by `frontend/tools/contrast.ts`, over
+`surface-1`, on every `lefthook run check`: each figure below must still be what the token
+measures, and each token must clear the floor its verdict names.
 
 | Text | APCA Lc | WCAG 2 | Verdict |
 | --- | --- | --- | --- |
@@ -352,23 +369,28 @@ text on near-black and this canvas is #010102. Measured with `frontend/tools/okl
 | `pnl-negative-text` | 61.5 | 9.16:1 | Figures a consultant acts on |
 | `status-warning` | 60.0 | 8.87:1 | Fluent text, 14px+ |
 | `pnl-positive` | 43.0 | 6.01:1 | Marks, fills and edges; not text |
-| `ink-subtle` | 41.5 | 5.86:1 | Large or bold only |
+| `ink-subtle` | 41.5 | 5.86:1 | Labels, headers, hints and punctuation |
 | `pnl-negative` | 35.8 | 4.87:1 | Marks, fills and edges; not text |
 | `ink-tertiary` | 16.0 | 2.59:1 | Non-text only, which is all it is used for |
 
-The floor for new work is **Lc 75 for anything a consultant reads as a sentence** and **Lc 60 for
-a figure they have to act on**. The two `-text` tokens hold Lc 60 on every surface a figure sits
-on, not just `surface-1`: the lowest is 60.2, on the profit and loss tints. One token sits below
-the floor today; see Known Gaps. Note that APCA
-is the stricter judge here — `ink-subtle` passes WCAG AA at 5.86:1 while APCA puts it below the
-body-text threshold — which is why deferring to it is not a relaxation.
+Text has three floors, by what it is for:
 
-Two rules hold regardless of contrast:
+- **Lc 75 — sentences**, anything a consultant reads as prose: `ink`, `ink-muted`.
+- **Lc 60 — figures and statuses they act on**: `pnl-positive-text`, `pnl-negative-text`,
+  `status-warning`. The two `-text` tokens hold it on every surface a figure sits on, not just
+  `surface-1`: the lowest is 60.2, on the profit and loss tints.
+- **Lc 40 — structural chrome**: column headers, metric labels, hints and expression
+  punctuation, in `ink-subtle`. After the first day these are landmarks, not reading: they
+  orient the eye to the figure beneath and should recede from it. Lifting them would flatten
+  that order — and narrow the gap between brackets and numbers in an expression — while still
+  landing under Lc 60.
 
-- Non-text edges and fills: a visible step under deuteranopia and protanopia simulation, which is
-  why the category hues are spaced round the wheel rather than packed into the greens.
-- No colour is the only carrier of a state. A red tile also has a label; a green number also has
-  a sign.
+APCA is the stricter judge here — `ink-subtle` passes WCAG AA at 5.86:1 — which is why deferring
+to it is not a relaxation. `frontend/tools/contrast.ts` checks the table, both `-text` tokens on
+their tints, and white on the deepest Pyramid step on every `lefthook run check`.
+
+One rule holds regardless of contrast: no colour is the only carrier of a state. A red tile also
+has a label; a green number also has a sign.
 
 ## Typography
 
@@ -471,7 +493,8 @@ Corners never mix within one surface: a panel at `lg` holds buttons at `sm` hold
 - **kit.tsx** — `Page`, `PageHeader`, `Panel`, `Button`, `Input`, `Textarea`, `Field`, `Fieldset`,
   `Checkbox`, `Switch`, `Chips`, `Segmented`, `Metric`, `Badge`, `MetricBadge`, `KV`, `Progress` (also the
   quota gauge), `Kbd`, `Spinner`, `Skeleton`, `Notice`, `ErrorNotice`, `Empty`, `Disclosure`,
-  `TabBar`, and the tone helpers (`signTone`, `checkTone`, `TEXT_TONE`).
+  `TabBar`, and the tone helpers (`signTone`, `cutoffTone`, `figureTone`, `checkTone`,
+  `TEXT_TONE`).
 - **table.tsx** — `DataTable`, virtualised and server-sorted, and `Pager`.
 - **overlay.tsx** — `Dialog`, `Sheet`, `Confirm`, `Select`, `Menu`, `Tooltip`, on Base UI.
 - **panels.tsx** — `SplitPane`, `ResizeHandle`, `useMediaQuery`.
@@ -481,7 +504,11 @@ All of them are headless primitives (Base UI, cmdk, TanStack, react-resizable-pa
 with the tokens above. No component library, no CSS-in-JS.
 
 Two domain components have no generic equivalent. The **core slots** are one tile per concurrent
-simulation core, always present in the top bar, cycling through the four `status-*` colours. The
+simulation core, always present in the top bar, cycling through the four `status-*` colours. An
+idle core is a hollow socket — `surface-1` inside a dashed `status-idle` edge — so it reads as
+room to fill rather than as a disabled control; a filled tile is busy. Colour is never the only
+mark: a running core fills along its bottom edge as its simulation goes, and a warning carries
+a `!`. The
 **AST editor** renders an Alpha expression on the canvas colour in mono, with operators in
 lavender, fields in `ink`, numbers in `ink-muted` and punctuation in `ink-subtle`.
 
@@ -492,7 +519,8 @@ let a label be tinted as though it were a verdict.
 ## Do's and Don'ts
 
 - Do reach for a tier-2 token, always.
-- Do let the value pick the colour: `signTone(sharpe)`, `checkTone(result)`.
+- Do let the value pick the colour: `signTone(returns)`, `figureTone('sharpe', sharpe, limits)`,
+  `checkTone(result)`.
 - Do use `num` for every standalone figure and `mono-metric` for every comparable metric.
 - Do add a state to tier 3 only when a second component needs the same one.
 - Do keep panels flush to the viewport width.
@@ -533,22 +561,13 @@ than 300ms.
 1. Changing a palette value: edit the frontmatter here, then `--spec-*` in `index.css`.
 2. Adding a hue (a seventh operator category, say): generate the ramp with
    `frontend/tools/oklch.ts`, paste the eleven steps into tier 1, then add the 10% fill and 45%
-   edge mixes to tier 2. Check it under colour-vision simulation before committing.
+   edge mixes to tier 2.
 3. Adding a component state: put it in tier 3 only if a second component reads it.
-4. `lefthook run check` validates this file's structure and the code's types and formatting. It
-   does not check contrast; that is measured by hand with the APCA and CVD helpers in
-   `frontend/tools/oklch.ts`.
+4. `lefthook run check` validates this file's structure, the Floors table against the colours
+   (`frontend/tools/contrast.ts`), and the code's types and formatting.
 
 ## Known Gaps
 
-- **One token sits under the contrast floor.** `ink-subtle` (Lc 41.5) carries metric labels and
-  table column headers at 11px, below the Lc 60 floor. Raising it means lightening a token every
-  screen uses, so it is a deliberate debt rather than an oversight. Figures cleared the same
-  floor through their own `-text` tokens, which left the fills and edges untouched.
-- **No automated contrast gate.** `tools/oklch.ts` can measure APCA, ΔE_OK and colour-vision
-  simulation, but nothing runs it: the frontend has no test runner. `design-lint.sh` reports the
-  format's own WCAG 2 findings as advisories and does not fail on them, because WCAG 2 is not
-  this system's standard. The APCA floors above are therefore a convention, not a check.
 - **Borders are prose, not tokens.** The DESIGN.md component schema has no `borderColor`, so the
   hairline rules appear here as 1px `rule` components and the real border assignments live in
   `index.css`.

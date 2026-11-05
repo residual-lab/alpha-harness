@@ -61,7 +61,7 @@ export function HubCardBody({
           {String(index + 1).padStart(2, '0')}
         </span>
         <h2 className="text-headline font-semibold text-balance text-ink">{label}</h2>
-        {about && <p className="max-w-prose text-body text-pretty text-ink-subtle">{about}</p>}
+        {about && <p className="text-body text-pretty text-ink-subtle">{about}</p>}
       </div>
     </>
   )

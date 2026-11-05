@@ -1,7 +1,7 @@
 /** Tasks: everything the labs added. Only here does a task run, wait for cores, pause or stop. */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link, useNavigate } from '@tanstack/react-router'
+import { Link, useNavigate, useSearch } from '@tanstack/react-router'
 import {
   CopyIcon,
   EllipsisIcon,
@@ -12,39 +12,37 @@ import {
   SquareIcon,
   Trash2Icon,
   TriangleAlertIcon,
+  XIcon,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
+import { SUPER_ALPHA_SLOTS } from '@/api/platform'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useNow } from '@/lib/now'
 import { useRefetchOn } from '@/lib/ws'
+import { AlphaTable, type AlphaTableRow, fromRanked, option } from '@/screens/alpha-table'
 import { DatasetChips, useDatasetTree } from '@/screens/data/dataset-chips'
-import { DetailSheet } from '@/screens/pool/detail'
+import { alphaIds, useDetailSheet } from '@/screens/pool/detail'
 import { MAX_SIMULATIONS } from '@/screens/research-labs/lab-task'
-import { type LabTask, labTasks, type RankedAlpha } from '@/screens/tasks/api'
-import {
-  AFTER_COST_HEADER,
-  DELAY,
-  INVESTABILITY,
-  QuickBadge,
-  SharpeCell,
-  TRUNCATION,
-  taskStatus,
-} from '@/screens/tasks/columns'
+import { type LabTask, labTasks, type RankedAlpha, TOP_LIMIT } from '@/screens/tasks/api'
+import { TASK_OFFER, taskStatus } from '@/screens/tasks/columns'
 import { resultsMarkdown } from '@/screens/tasks/copy'
 import { SubmittableAlphas } from '@/screens/tasks/submittable'
 import {
   Badge,
   Button,
+  cutoffTone,
   Disclosure,
   Empty,
   ErrorNotice,
   Field,
   Fieldset,
+  figureTone,
   Input,
   LINK,
+  type Limits,
   Metric,
   Notice,
   Page,
@@ -52,7 +50,6 @@ import {
   Panel,
   Progress,
   Segmented,
-  signTone,
   TEXT_TONE,
 } from '@/ui/kit'
 import { Confirm, Dialog, Menu } from '@/ui/overlay'
@@ -61,148 +58,49 @@ import { type Column, DataTable } from '@/ui/table'
 /** Matches `labs.params.SETTINGS_SAMPLER`. */
 const SETTINGS_SAMPLER = 'settings-sampler'
 
-const TOP_COLUMNS: Column<RankedAlpha>[] = [
-  {
-    key: 'expression',
-    header: 'Expression',
-    width: 'minmax(280px,3fr)',
+/** What a task searches for, where that is not Sharpe, named as the task names it. */
+const objective = (task: LabTask) =>
+  option('Summary', 'value', task.objectiveLabel, {
+    width: '112px',
+    align: 'right',
+    value: (r) => r.value,
     cell: (r) => (
-      <span className="flex min-w-0 items-center gap-1.5">
-        <QuickBadge alpha={r} />
-        <span className="num block truncate text-ink" title={r.expression ?? undefined}>
-          {r.expression ?? DASH}
-        </span>
+      <span className={cn('num', TEXT_TONE[objectiveTone(task, r.value, r.limits)])}>
+        {fmt.ratio(r.value)}
       </span>
     ),
-  },
-  {
-    key: 'sharpe',
-    header: 'Sharpe',
-    width: '90px',
-    align: 'right',
-    cell: (r) => <SharpeCell value={r.sharpe} />,
-  },
-  {
-    // The held-out years, where an Alpha that only fits its train years shows its decay.
-    key: 'testSharpe',
-    header: 'Test Sharpe',
-    width: '100px',
-    align: 'right',
-    cell: (r) => (
-      <span className={TEXT_TONE[signTone(r.testSharpe)]}>{fmt.ratio(r.testSharpe)}</span>
-    ),
-  },
-  {
-    key: 'fitness',
-    header: 'Fitness',
-    width: '80px',
-    align: 'right',
-    cell: (r) => fmt.ratio(r.fitness),
-  },
-  {
-    key: 'turnover',
-    header: 'Turnover',
-    width: '88px',
-    align: 'right',
-    cell: (r) => fmt.pct(r.turnover),
-  },
-  {
-    key: 'universe',
-    header: 'Universe',
-    width: '96px',
-    cell: (r) => r.settings?.universe ?? DASH,
-  },
-  {
-    key: 'neutralization',
-    header: 'Neutralization',
-    width: '120px',
-    cell: (r) => r.settings?.neutralization ?? DASH,
-  },
+  })
+
+/** A task's objective, judged like Sharpe when it is Sharpe and one Alpha's limits are known;
+ *  otherwise only a negative stands out. */
+const objectiveTone = (task: LabTask, v: number | null | undefined, limits?: Limits) =>
+  task.objectiveLabel === 'Sharpe' ? figureTone('sharpe', v, limits) : cutoffTone(v)
+
+/** A Settings Sampler row is only ever the same expression, so the settings lead instead. */
+const samplerDefaults = (task: LabTask) => [
+  'trial',
+  'region',
+  'delay',
+  'universe',
+  'neutralization',
+  'investability',
+  ...(task.truncationAgent ? ['truncation'] : []),
+  'sharpe',
+  'afterCostSharpe',
 ]
 
-/**
- * The Alpha's Sharpe once 5 bps is charged against each day's own turnover, normalized to ten
- * years of data. It sits beside the gross Sharpe rather than replacing it.
- *
- * Empty until the daily PnL and turnover are downloaded, which is a request per Alpha.
- */
-const AFTER_COST_SHARPE: Column<RankedAlpha> = {
-  key: 'afterCostSharpe',
-  header: AFTER_COST_HEADER,
-  width: '132px',
-  align: 'right',
-  cell: (r) =>
-    r.afterCostSharpe == null ? (
-      <span className="text-ink-subtle" title="Daily PnL not downloaded yet">
-        {DASH}
-      </span>
-    ) : (
-      <span className={cn('num', TEXT_TONE[signTone(r.afterCostSharpe)])}>
-        {fmt.ratio(r.afterCostSharpe)}
-      </span>
-    ),
-}
-
-const setting = (key: string, header: string, width: string): Column<RankedAlpha> => ({
-  key,
-  header,
-  width,
-  cell: (r) => <span className="num">{(r.settings?.[key] as string | undefined) ?? DASH}</span>,
-})
-
-/**
- * A Settings Sampler row is only ever the same expression, so the settings lead instead and
- * Sharpe closes.
- */
-const SAMPLER_COLUMNS: Column<RankedAlpha>[] = [
-  {
-    key: 'number',
-    header: 'Trial',
-    width: '120px',
-    cell: (r) => (
-      <span className="num flex items-center gap-1.5 text-ink-subtle">
-        {r.number}
-        <QuickBadge alpha={r} />
-      </span>
-    ),
-  },
-  // Region, Delay, Universe, Neutralization, Max Trade, Max Position — the order a market is
-  // named in everywhere, so a reader's eye lands in the same place on every screen.
-  setting('region', 'Region', '96px'),
-  DELAY,
-  setting('universe', 'Universe', '116px'),
-  // Takes the slack, so the table fills its pane and Sharpe closes at the right edge.
-  setting('neutralization', 'Neutralization', 'minmax(180px,1fr)'),
-  INVESTABILITY,
-  {
-    key: 'sharpe',
-    header: 'Sharpe',
-    width: '100px',
-    align: 'right',
-    cell: (r) => <SharpeCell value={r.sharpe} />,
-  },
-  AFTER_COST_SHARPE,
+const TOP_DEFAULTS = [
+  'expression',
+  'value',
+  'universe',
+  'neutralization',
+  'sharpe',
+  'fitness',
+  'turnover',
+  'testSharpe',
 ]
 
-/** What a task searches for leads the table when it is not Sharpe, which the table shows anyway. */
-const topColumns = (task: LabTask): Column<RankedAlpha>[] =>
-  task.lab === SETTINGS_SAMPLER
-    ? task.truncationAgent
-      ? [...SAMPLER_COLUMNS.slice(0, 5), TRUNCATION, ...SAMPLER_COLUMNS.slice(5)]
-      : SAMPLER_COLUMNS
-    : task.objectiveLabel === 'Sharpe'
-      ? TOP_COLUMNS
-      : [
-          ...TOP_COLUMNS.slice(0, 1),
-          {
-            key: 'value',
-            header: task.objectiveLabel,
-            width: '112px',
-            align: 'right',
-            cell: (r) => <span className={TEXT_TONE[signTone(r.value)]}>{fmt.ratio(r.value)}</span>,
-          },
-          ...TOP_COLUMNS.slice(1),
-        ]
+const TASK_DETAIL = 'task-detail'
 
 type Act = { action: 'runAll' } | { action: 'run' | 'pause' | 'stop' | 'remove'; task: LabTask }
 
@@ -211,19 +109,36 @@ export function TasksScreen() {
   const list = useQuery({ queryKey: ['lab-tasks'], queryFn: labTasks.list })
   useRefetchOn('studies', ['lab-tasks'], 2_000)
   useRefetchOn('simulations', ['lab-tasks'], 5_000)
-  const [selectedId, setSelectedId] = useState<number | null>(null)
   const [editing, setEditing] = useState<LabTask | null>(null)
   const [renaming, setRenaming] = useState<LabTask | null>(null)
   const [confirming, setConfirming] = useState<Act | null>(null)
-  const [alphaId, setAlphaId] = useState<string | null>(null)
-  const [view, setView] = useState<'tasks' | 'submittable'>('tasks')
+  const detail = useDetailSheet()
+  const search = useSearch({ from: '/tasks/' })
+  const navigate = useNavigate({ from: '/tasks/' })
+  const view = search.view ?? 'tasks'
+  const selectedId = search.task ?? null
+  const setView = (next: 'tasks' | 'submittable') =>
+    void navigate({
+      search: ({ view: _, ...s }) => (next === 'submittable' ? { ...s, view: next } : s),
+      replace: true,
+    })
+  // Once the reader has opened or closed a task, it stays their choice.
+  const chose = useRef(search.task !== undefined)
+  const setSelectedId = (task: number | null) => {
+    chose.current = true
+    void navigate({
+      search: ({ task: _, ...s }) => (task === null ? s : { ...s, task }),
+      replace: true,
+    })
+  }
 
   // Nothing picked yet: open on what is running, then stay there. Re-deriving this every render
   // would move the pane out from under the reader the moment that task finished.
   const running = list.data?.tasks.find((t) => t.status === 'RUNNING')?.id ?? null
   useEffect(() => {
-    if (running != null) setSelectedId((id) => id ?? running)
-  }, [running])
+    if (running != null && selectedId === null && !chose.current)
+      void navigate({ search: (s) => ({ ...s, task: running }), replace: true })
+  }, [running, selectedId, navigate])
 
   const act = useMutation({
     meta: { inline: true },
@@ -329,15 +244,26 @@ export function TasksScreen() {
       key: 'simulations',
       header: 'Simulations',
       width: 'minmax(220px,1.5fr)',
+      // Reused Alphas count towards the target as simulated ones do: without them, a task that
+      // reran settings it had run before read as finished early, e.g. "28 / 88, Complete".
       cell: (t) => (
         <span className="flex w-full min-w-0 items-center gap-2">
           <Progress
             className="flex-1"
-            value={t.target > 0 ? t.simulated / t.target : 0}
+            value={t.target > 0 ? (t.simulated + t.cached) / t.target : 0}
             label="Simulated"
           />
           <span className="num shrink-0 text-body-compact">
-            {fmt.int(t.simulated)} / {fmt.int(t.target)}
+            {fmt.int(t.simulated + t.cached)} / {fmt.int(t.target)}
+            {t.cached > 0 && (
+              <span
+                className="text-ink-subtle"
+                title="Simulated before, so read back from BRAIN's earlier result without spending quota or adding a new Alpha on BRAIN"
+              >
+                {' '}
+                · {fmt.int(t.cached)} reused
+              </span>
+            )}
           </span>
         </span>
       ),
@@ -348,7 +274,7 @@ export function TasksScreen() {
       width: '96px',
       align: 'right',
       cell: (t) => (
-        <span title={t.objectiveLabel} className={TEXT_TONE[signTone(t.best)]}>
+        <span title={t.objectiveLabel} className={TEXT_TONE[objectiveTone(t, t.best)]}>
           {fmt.ratio(t.best)}
         </span>
       ),
@@ -361,8 +287,14 @@ export function TasksScreen() {
       cell: (t) => (
         <Actions
           task={t}
+          busy={
+            act.isPending && act.variables.action !== 'runAll' && act.variables.task.id === t.id
+          }
+          // Pausing and running are undone with one click; stopping and removing are not.
           onAct={(action) =>
-            action === 'pause' ? act.mutate({ action, task: t }) : ask({ action, task: t })
+            action === 'pause' || action === 'run'
+              ? act.mutate({ action, task: t })
+              : ask({ action, task: t })
           }
           onEdit={() => setEditing(t)}
           onRename={() => setRenaming(t)}
@@ -376,14 +308,25 @@ export function TasksScreen() {
       <PageHeader
         title="Tasks"
         actions={
-          <Button
-            variant="primary"
-            disabled={fresh === 0}
-            onClick={() => ask({ action: 'runAll' })}
-          >
-            <PlayIcon />
-            Run All
-          </Button>
+          <>
+            <Segmented
+              label="View"
+              items={[
+                { value: 'tasks', label: 'Tasks' },
+                { value: 'submittable', label: 'Submittable Alphas' },
+              ]}
+              value={view}
+              onChange={setView}
+            />
+            <Button
+              variant="primary"
+              disabled={fresh === 0}
+              onClick={() => ask({ action: 'runAll' })}
+            >
+              <PlayIcon />
+              Run All
+            </Button>
+          </>
         }
       />
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -415,44 +358,55 @@ export function TasksScreen() {
       )}
       {act.isError && confirming === null && <ErrorNotice error={act.error} />}
 
-      <Panel
-        actions={
-          <Segmented
-            label="View"
-            items={[
-              { value: 'tasks', label: 'Tasks' },
-              { value: 'submittable', label: 'Submittable Alphas' },
-            ]}
-            value={view}
-            onChange={setView}
+      {view === 'submittable' ? (
+        <SubmittableAlphas onOpenAlpha={detail.open} openAlpha={detail.openId} />
+      ) : (
+        <Panel>
+          {list.data && all.length === 0 ? (
+            <Empty title="No tasks yet">
+              <Link to="/labs" className={LINK}>
+                Open Research Labs
+              </Link>
+            </Empty>
+          ) : (
+            <DataTable
+              label="Tasks"
+              rows={all}
+              columns={columns}
+              rowKey={(t) => String(t.id)}
+              activeKey={selectedId === null ? null : String(selectedId)}
+              onRowClick={(t) => {
+                // A second click closes it, giving the list its height back.
+                if (t.id === selectedId) {
+                  setSelectedId(null)
+                  return
+                }
+                setSelectedId(t.id)
+                // The detail is below the table: bring it up, or the click seems to do nothing.
+                requestAnimationFrame(() =>
+                  document
+                    .getElementById(TASK_DETAIL)
+                    ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }),
+                )
+              }}
+              // Short while a task is open below, so the list and the task share the screen.
+              {...(selected ? { maxHeight: '36vh' } : {})}
+              loading={list.isPending}
+              error={list.error}
+            />
+          )}
+        </Panel>
+      )}
+      {view === 'tasks' && selected && (
+        <div id={TASK_DETAIL} className="scroll-mt-4">
+          <TaskDetail
+            task={selected}
+            onOpenAlpha={detail.open}
+            openAlpha={detail.openId}
+            onClose={() => setSelectedId(null)}
           />
-        }
-      >
-        {view === 'submittable' ? (
-          <SubmittableAlphas onOpenAlpha={setAlphaId} />
-        ) : list.data && all.length === 0 ? (
-          <Empty title="No tasks yet">
-            <Link to="/labs" className={LINK}>
-              Open Research Labs
-            </Link>
-          </Empty>
-        ) : (
-          <DataTable
-            label="Tasks"
-            rows={all}
-            columns={columns}
-            rowKey={(t) => String(t.id)}
-            onRowClick={(t) => setSelectedId(t.id)}
-            // Held through hover, which otherwise repaints the row as if nothing were picked.
-            rowClass={(t) =>
-              t.id === selectedId ? 'bg-primary-subtle hover:bg-primary-subtle' : undefined
-            }
-            loading={list.isPending}
-            error={list.error}
-          />
-        )}
-      </Panel>
-      {view === 'tasks' && selected && <TaskDetail task={selected} onOpenAlpha={setAlphaId} />}
+        </div>
+      )}
 
       {editing && (
         <EditTask key={editing.id} task={editing} slots={slots} onClose={() => setEditing(null)} />
@@ -460,7 +414,7 @@ export function TasksScreen() {
       {renaming && (
         <RenameTask key={renaming.id} task={renaming} onClose={() => setRenaming(null)} />
       )}
-      <DetailSheet alphaId={alphaId} onClose={() => setAlphaId(null)} />
+      {detail.sheet}
       <Confirm
         open={confirming !== null}
         onOpenChange={(isOpen) => {
@@ -489,15 +443,6 @@ function confirmCopy(a: Act, fresh: number): { title: string; label: string; bod
         title: `Run ${fmt.int(fresh)} ${fresh === 1 ? 'task' : 'tasks'}?`,
         label: 'Run All',
       }
-    case 'run':
-      if (a.task.status === 'PAUSED') return { title: 'Resume this task?', label: 'Resume' }
-      if (a.task.status === 'FAILED')
-        return {
-          title: 'Retry this task?',
-          label: 'Retry',
-          body: 'Simulations it sent before it failed are scored on the way.',
-        }
-      return { title: 'Run this task?', label: 'Run Task' }
     case 'stop':
       // The second press, on a task that has been stopping and has not stopped. It says
       // what it will cost, because forcing gives up on simulations the quota already paid
@@ -540,11 +485,14 @@ const RUN_LABEL = { IDLE: 'Run', PAUSED: 'Resume', FAILED: 'Retry' } as const
 
 function Actions({
   task,
+  busy,
   onAct,
   onEdit,
   onRename,
 }: {
   task: LabTask
+  /** One of its own actions is on its way, so the row's buttons wait for it. */
+  busy: boolean
   onAct: (action: 'run' | 'pause' | 'stop' | 'remove') => void
   onEdit: () => void
   onRename: () => void
@@ -566,6 +514,7 @@ function Actions({
           variant="ghost"
           aria-label={RUN_LABEL[status]}
           title={RUN_LABEL[status]}
+          loading={busy}
           onClick={() => onAct('run')}
         >
           <PlayIcon />
@@ -577,6 +526,7 @@ function Actions({
           variant="ghost"
           aria-label="Pause"
           title="Pause"
+          loading={busy}
           onClick={() => onAct('pause')}
         >
           <PauseIcon />
@@ -619,7 +569,6 @@ function Actions({
 
 /** Task actions that are not one-click enough to earn a button of their own. */
 function TaskActionsMenu({ task, onRename }: { task: LabTask; onRename: () => void }) {
-  const navigate = useNavigate()
   return (
     <Menu
       trigger={
@@ -627,15 +576,7 @@ function TaskActionsMenu({ task, onRename }: { task: LabTask; onRename: () => vo
           <EllipsisIcon />
         </Button>
       }
-      items={[
-        { label: 'Rename', onClick: onRename },
-        {
-          label: 'Submission Planner',
-          disabled: !task.simulated,
-          onClick: () =>
-            void navigate({ to: '/tools/submission-planner', search: { task: task.id } }),
-        },
-      ]}
+      items={[{ label: 'Rename', onClick: onRename }]}
     />
   )
 }
@@ -643,16 +584,21 @@ function TaskActionsMenu({ task, onRename }: { task: LabTask; onRename: () => vo
 function TaskDetail({
   task,
   onOpenAlpha,
+  openAlpha,
+  onClose,
 }: {
   task: LabTask
-  onOpenAlpha: (alphaId: string) => void
+  onOpenAlpha: (alphaId: string, ids?: string[]) => void
+  openAlpha: string | null
+  onClose: () => void
 }) {
   const top = useQuery({
     // Its own key, refreshed at most every 10s: the whole sweep is a megabyte or more on a
     // big task, too much to redo on each of the task list's two-second updates.
     queryKey: ['lab-task-top', task.id],
-    // The whole sweep is worth scrolling; the table virtualises, so the rows are cheap.
-    queryFn: () => labTasks.top(task.id, Math.min(Math.max(task.target, 50), 5000)),
+    // The whole sweep is worth scrolling; the table virtualises, so the rows are cheap. Not
+    // the target: cached Alphas and Full re-runs come back on top of it.
+    queryFn: () => labTasks.top(task.id, TOP_LIMIT),
   })
   useRefetchOn('studies', ['lab-task-top', task.id], 10_000)
   // Arrives sorted on the objective already.
@@ -661,14 +607,14 @@ function TaskDetail({
   // passing one: nothing has said no, which is the question this pane answers. Whether it is
   // submittable *yet* is the Submittable count's job, and that one does hold pending back.
   // A Quick Alpha nothing refused is neither: its Full run decides, and replaces it once back.
-  const awaitingFull = (r: RankedAlpha) => r.quick && r.refusedBy.length === 0
-  const verdict = (r: RankedAlpha) =>
+  const awaitingFull = (r: RankedAlpha | AlphaTableRow) => r.quick && r.refusedBy?.length === 0
+  const verdict = (r: AlphaTableRow) =>
     r.submittable || r.pending
       ? 'bg-pnl-positive-tint'
       : awaitingFull(r)
         ? ''
         : 'bg-pnl-negative-tint'
-  const rowClass = verdict
+  const rows = useMemo(() => found.map(fromRanked), [found])
 
   const done = task.status === 'COMPLETE' || task.status === 'FAILED'
   // Three outcomes and nothing else. Submittable: nothing has refused it, pending checks
@@ -714,6 +660,15 @@ function TaskDetail({
             Copy Results
           </Button>
           <TaskBadge task={task} />
+          <Button
+            size="icon-sm"
+            variant="ghost"
+            aria-label="Close this task"
+            title="Close this task"
+            onClick={onClose}
+          >
+            <XIcon />
+          </Button>
         </>
       }
     >
@@ -754,6 +709,7 @@ function TaskDetail({
             tone={red > 0 ? 'loss' : 'neutral'}
             label="Unsubmittable"
             value={fmt.int(red)}
+            hint={found.length >= TOP_LIMIT ? `Of the best ${fmt.int(TOP_LIMIT)}` : ''}
           />
           {errors > 0 && (
             <Metric
@@ -803,13 +759,16 @@ function TaskDetail({
             Open Full Results
           </Button>
         </div>
-        <DataTable
-          label={task.lab === SETTINGS_SAMPLER ? 'Results' : 'Top Alphas'}
-          rows={found}
-          columns={topColumns(task)}
-          rowKey={(r) => String(r.trialId)}
-          onRowClick={(r) => r.alphaId && onOpenAlpha(r.alphaId)}
-          rowClass={rowClass}
+        <AlphaTable
+          {...(task.lab === SETTINGS_SAMPLER
+            ? { view: 'task-sampler', label: 'Results', defaults: samplerDefaults(task) }
+            : { view: 'task', label: 'Top Alphas', defaults: TOP_DEFAULTS })}
+          rows={rows}
+          offer={task.objectiveLabel === 'Sharpe' ? TASK_OFFER : ['value', ...TASK_OFFER]}
+          overrides={[objective(task)]}
+          onRowClick={(r, _event, shown) => r.alphaId && onOpenAlpha(r.alphaId, alphaIds(shown))}
+          openAlpha={openAlpha}
+          rowClass={() => verdict}
           loading={top.isPending}
           error={top.error}
           empty={
@@ -963,7 +922,11 @@ function EditTask({ task, slots, onClose }: { task: LabTask; slots: number; onCl
         <Fieldset legend="Cores">
           <Segmented
             label="Cores"
-            items={Array.from({ length: slots }, (_, i) => ({ value: i + 1, label: i + 1 }))}
+            items={Array.from(
+              // BRAIN runs only three SuperAlpha simulations at once.
+              { length: task.lab === 'super-alpha' ? SUPER_ALPHA_SLOTS : slots },
+              (_, i) => ({ value: i + 1, label: i + 1 }),
+            )}
             value={cores}
             onChange={setCores}
           />

@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from ..brain.errors import BrainAuthError, BrainError
 from ..brain.filters import AlphaQuery
+from ..brain.platform import ALPHA_LIST_MAX_OFFSET, ALPHA_LIST_PAGE
 from ..brain.schemas import produced_type
 from ..db.models import SimStatus, SimulationRecord, utcnow
 from .lifecycle import remember, transition
@@ -38,11 +39,6 @@ WINDOW = timedelta(minutes=30)
 CLOCK_SLACK = timedelta(minutes=2)
 #: Lost sends queued again before one more is given up on.
 MAX_ORPHAN_REQUEUES = 2
-#: The alpha list serves at most 100 rows a page.
-PAGE = 100
-#: The alpha list refuses offsets past 1,000; beyond it the listing continues by
-#: ``dateCreated`` instead.
-MAX_OFFSET = 1_000
 
 _EXPRESSION_KEYS = ("regular", "combo", "selection")
 
@@ -134,7 +130,7 @@ async def _listed(endpoints: BrainEndpoints, cluster: _Cluster) -> list[dict[str
     while True:
         page = await endpoints.list_alphas(
             AlphaQuery(
-                limit=PAGE,
+                limit=ALPHA_LIST_PAGE,
                 offset=offset,
                 order="dateCreated",
                 hidden=None,
@@ -145,10 +141,10 @@ async def _listed(endpoints: BrainEndpoints, cluster: _Cluster) -> list[dict[str
         results = [r for r in page["results"] if isinstance(r, dict)]
         for r in results:
             found.setdefault(str(r.get("id")), r)
-        if len(results) < PAGE:
+        if len(results) < ALPHA_LIST_PAGE:
             break
-        offset += PAGE
-        if offset <= MAX_OFFSET:
+        offset += ALPHA_LIST_PAGE
+        if offset <= ALPHA_LIST_MAX_OFFSET:
             continue
         last = _created(results[-1])
         # A second holding more than the whole window cannot advance; stop rather than loop.

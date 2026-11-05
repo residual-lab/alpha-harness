@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from ..db.models import ChatMessage, ChatThread, utcnow
 from .prompts import ASSISTANT
-from .text import clip, loads_or
+from .text import CHARS_PER_TOKEN, clip, loads_or
 
 if TYPE_CHECKING:
     from ..catalog.queries import CatalogQueries, Tuple4
@@ -175,7 +175,18 @@ class ChatService:
                 raise ValueError(f"No conversation {thread_id}.")
             _, history = found
 
-        fields, available, catalog_note = await self._field_menu(scope, dataset_ids)
+        info = self.llm.model_for(model)
+        transcript = _transcript(history)
+        message = f"THEIR MESSAGE:\n{text}"
+        # The fields get what the model's prompt allows once everything else is in.
+        room = (
+            info.prompt_tokens * CHARS_PER_TOKEN
+            - len(ASSISTANT)
+            - len(transcript)
+            - len(message)
+            - 200
+        )
+        fields, available, catalog_note = await self._field_menu(scope, dataset_ids, room)
         if not fields:
             raise ValueError(
                 f"No data has been downloaded for {scope.label} yet, so there is nothing "
@@ -183,17 +194,13 @@ class ChatService:
             )
 
         prompt = "\n\n---\n\n".join(
-            [
-                f"DATA FIELDS AVAILABLE IN {scope.label}:\n{fields}",
-                _transcript(history),
-                f"THEIR MESSAGE:\n{text}",
-            ]
+            [f"DATA FIELDS AVAILABLE IN {scope.label}:\n{fields}", transcript, message]
         )
 
         answer = await self.llm.generate(
             system=ASSISTANT,
             user=prompt,
-            model_ref=model,
+            model_ref=info.ref,
             temperature=0.6,
             response_schema=FIELD_PICK_SCHEMA,
             thinking=REASONING[reasoning]["level"],
@@ -241,9 +248,10 @@ class ChatService:
     # -- helpers ---------------------------------------------------------
 
     async def _field_menu(
-        self, scope: Tuple4, dataset_ids: list[str] | None
+        self, scope: Tuple4, dataset_ids: list[str] | None, room: int
     ) -> tuple[str, set[str], str | None]:
-        """The fields the assistant may choose from: the text, their ids, and a note.
+        """The fields the assistant may choose from, as many as fit in ``room`` characters:
+        the text, their ids, and a note.
 
         Capped, and ordered by coverage: a field present on 4% of the market cannot carry a
         signal about it however good the idea, and listing thousands would spend the whole
@@ -266,17 +274,25 @@ class ChatService:
         if not rows:
             return "", set(), None
 
-        lines = [
-            f"  {r['field_id']} ({r.get('dataset_id')}): {clip(r.get('description'), 110)}"
-            for r in rows
-        ]
+        lines: list[str] = []
+        for r in rows:
+            line = f"  {r['field_id']} ({r.get('dataset_id')}): {clip(r.get('description'), 110)}"
+            if room - len(line) < 0:
+                break
+            room -= len(line) + 1
+            lines.append(line)
+        if not lines:
+            raise ValueError(
+                "The model's Max Prompt Tokens leave no room for a single field. Raise it "
+                "under LLM Integration › Models."
+            )
         note = None
-        if int(page["total"]) > len(rows):
+        if int(page["total"]) > len(lines):
             note = (
-                f"The assistant was shown the {len(rows)} widest-coverage fields of "
+                f"The assistant was shown the {len(lines)} widest-coverage fields of "
                 f"{page['total']} in this market."
             )
-        return "\n".join(lines), {str(r["field_id"]) for r in rows}, note
+        return "\n".join(lines), {str(r["field_id"]) for r in rows[: len(lines)]}, note
 
     async def _append(self, thread_id: int, role: str, text: str, **meta: Any) -> None:
         async with self.db.session() as session:
@@ -329,7 +345,12 @@ def _parse(text: str) -> dict[str, Any]:
     datasets = payload.get("datasets")
     return {
         "reply": str(payload.get("reply") or "").strip() or text.strip(),
-        "picks": [p for p in picks if isinstance(p, dict) and p.get("field")]
+        # A field named by anything but a string is no field: kept, it fails the catalog lookup.
+        "picks": [
+            p
+            for p in picks
+            if isinstance(p, dict) and isinstance(p.get("field"), str) and p["field"]
+        ]
         if isinstance(picks, list)
         else [],
         "datasets": [str(d) for d in datasets if d] if isinstance(datasets, list) else [],

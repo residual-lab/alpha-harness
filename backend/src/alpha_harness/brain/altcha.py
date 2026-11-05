@@ -85,20 +85,45 @@ class Solution:
         return base64.b64encode(compact.encode("utf-8")).decode("ascii")
 
 
+_DIGITS = tuple(str(n).encode("ascii") for n in range(100))
+_TWO_DIGITS = tuple(f"{n:02d}".encode("ascii") for n in range(100))
+
+
 def solve(challenge: Challenge) -> Solution:
     """Search for the integer whose digest matches the challenge.
 
     Raises :class:`AltchaError` if no solution exists at or below ``maxnumber``, which
     means the challenge was malformed or the algorithm changed.
     """
-    salt = challenge.salt.encode("utf-8")
-    target = challenge.challenge.lower()
+    # The salt hashed once and copied, and raw digests compared: measured, faster.
+    salted = hashlib.sha256(challenge.salt.encode("utf-8"))
+    try:
+        target = bytes.fromhex(challenge.challenge)
+    except ValueError:
+        target = b""  # Matches no digest, so it ends as any unsolvable challenge does.
     started = time.monotonic()
 
-    for number in range(challenge.maxnumber + 1):
-        if hashlib.sha256(salt + str(number).encode("ascii")).hexdigest() == target:
-            took_ms = int((time.monotonic() - started) * 1000)
-            return Solution(challenge=challenge, number=number, took_ms=took_ms)
+    def found(number: int) -> Solution:
+        took_ms = int((time.monotonic() - started) * 1000)
+        return Solution(challenge=challenge, number=number, took_ms=took_ms)
+
+    limit = challenge.maxnumber
+    for number in range(min(limit + 1, 100)):
+        attempt = salted.copy()
+        attempt.update(_DIGITS[number])
+        if attempt.digest() == target:
+            return found(number)
+    # Past 99 the leading digits are hashed once per hundred numbers, each then finished with
+    # its last two: the same digest as the whole number's, since SHA-256 reads a stream.
+    for hundreds in range(1, limit // 100 + 1):
+        prefix = salted.copy()
+        prefix.update(str(hundreds).encode("ascii"))
+        base = hundreds * 100
+        for last in range(min(100, limit - base + 1)):
+            attempt = prefix.copy()
+            attempt.update(_TWO_DIGITS[last])
+            if attempt.digest() == target:
+                return found(base + last)
 
     raise AltchaError(
         f"No solution found for {challenge.algorithm} challenge within "

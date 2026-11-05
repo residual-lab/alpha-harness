@@ -79,7 +79,12 @@ export const fastExpression = StreamLanguage.define<Reading>({
       return `bracket${state.depth % 3}`
     }
     if (stream.match(/^(?:&&|\|\||==|!=|<=|>=|[-+*/^<>!?:=])/)) return 'operator'
-    if (stream.match(/^[,;]/)) return 'punctuation'
+    if (stream.match(';')) {
+      // A statement ends here, so a bracket it left open cannot colour the next one's names.
+      state.depth = 0
+      return 'punctuation'
+    }
+    if (stream.eat(',')) return 'punctuation'
     stream.next()
     return 'invalid'
   },
@@ -101,18 +106,42 @@ export const fastExpression = StreamLanguage.define<Reading>({
   },
 })
 
-/** The text with comments and strings blanked, every position kept, so a scan reads only code. */
+/** The text with comments and strings blanked, every position and line break kept, so a scan
+ *  reads only code and a statement still ends where its line does. */
 export function code(text: string): string {
   return text.replace(/\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\n]*|#[^\n]*|"[^"]*"?|'[^']*'?/g, (m) =>
-    ' '.repeat(m.length),
+    m.replace(/[^\n]/g, ' '),
   )
 }
 
-/** The names the template's own lines define: `r = …;`. */
+/** A name being assigned, read from where a statement starts. */
+const ASSIGNED = /\s*([A-Za-z_]\w*)\s*=(?!=)/y
+
+/**
+ * The names the template's own lines define: `r = …;`. Only outside brackets, as the
+ * highlighter reads them: inside a call spread over lines, `lag = 1` names an option.
+ */
 export function locals(blank: string): Set<string> {
-  return new Set(
-    [...blank.matchAll(/(?:^|[;\n])\s*([A-Za-z_]\w*)\s*=(?!=)/g)].map((m) => m[1] ?? ''),
-  )
+  const found = new Set<string>()
+  let depth = 0
+  const statement = (at: number) => {
+    if (depth > 0) return
+    ASSIGNED.lastIndex = at
+    const name = ASSIGNED.exec(blank)?.[1]
+    if (name) found.add(name)
+  }
+  statement(0)
+  for (let at = 0; at < blank.length; at++) {
+    const ch = blank[at]
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1
+    else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1)
+    else if (ch === ';') {
+      // A statement ends here, as the highlighter also reads it: an unclosed bracket stops.
+      depth = 0
+      statement(at + 1)
+    } else if (ch === '\n') statement(at + 1)
+  }
+  return found
 }
 
 /** Every bare name, not a `$variable` and not an operator being called. */

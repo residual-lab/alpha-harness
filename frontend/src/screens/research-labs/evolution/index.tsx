@@ -9,7 +9,7 @@ import { useNavigate } from '@tanstack/react-router'
 import { DnaIcon, ListChecksIcon, WandSparklesIcon, XIcon } from 'lucide-react'
 import { useEffect, useMemo } from 'react'
 import { ApiError } from '@/api/http'
-import { DASH, fmt } from '@/lib/format'
+import { CORE_METRICS, DASH, fmt } from '@/lib/format'
 import { useCores } from '@/lib/preferences'
 import { marketKey, regionLabel, useScopeOptions } from '@/lib/scope'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
@@ -20,7 +20,12 @@ import {
   type SeedRow,
 } from '@/screens/research-labs/evolution/api'
 import { MAX_SEEDS, useSeedPick } from '@/screens/research-labs/evolution/seed-pick'
-import { MAX_SIMULATIONS, simulationsValid, useLabPreview } from '@/screens/research-labs/lab-task'
+import {
+  MAX_SIMULATIONS,
+  offeredOnly,
+  simulationsValid,
+  useLabPreview,
+} from '@/screens/research-labs/lab-task'
 import { NeutralizationPicker } from '@/screens/research-labs/neutralization'
 import { CoresSetting, SimulationsSetting } from '@/screens/research-labs/task-settings'
 import {
@@ -29,6 +34,7 @@ import {
   Empty,
   ErrorNotice,
   Fieldset,
+  figureTone,
   Metric,
   Notice,
   Page,
@@ -36,7 +42,6 @@ import {
   Panel,
   Progress,
   Segmented,
-  signTone,
   TEXT_TONE,
 } from '@/ui/kit'
 import { Select } from '@/ui/overlay'
@@ -83,7 +88,7 @@ export function EvolutionLabScreen() {
     delay: draft.delay,
     universe: draft.universe,
     alpha_ids: draft.seedIds,
-    neutralizations: draft.neutralizations,
+    neutralizations: offeredOnly(draft.neutralizations, scopeOptions.neutralizations),
     cores,
     population: draft.population,
     mutation_rate: draft.mutationRate,
@@ -190,6 +195,9 @@ export function EvolutionLabScreen() {
     hasSeeds &&
     plan.problems.length === 0 &&
     simulationsValid(simulations, maxSimulations)
+  const blocked = !hasSeeds
+    ? 'Choose seeds first.'
+    : (plan?.problems[0] ?? (simulations === null ? 'Enter the simulations to run.' : null))
 
   const columns: Column<SeedRow>[] = [
     {
@@ -213,7 +221,11 @@ export function EvolutionLabScreen() {
       header: 'Sharpe',
       width: '80px',
       align: 'right',
-      cell: (r) => <span className={TEXT_TONE[signTone(r.sharpe)]}>{fmt.ratio(r.sharpe)}</span>,
+      cell: (r) => (
+        <span className={TEXT_TONE[figureTone('sharpe', r.sharpe, r.limits)]}>
+          {fmt.ratio(r.sharpe)}
+        </span>
+      ),
     },
     {
       key: 'fitness',
@@ -227,7 +239,7 @@ export function EvolutionLabScreen() {
       header: 'Turnover',
       width: '88px',
       align: 'right',
-      cell: (r) => fmt.pct(r.turnover),
+      cell: (r) => CORE_METRICS.turnover.show(r.turnover),
     },
     {
       key: 'remove',
@@ -250,7 +262,11 @@ export function EvolutionLabScreen() {
 
   return (
     <Page>
-      <PageHeader title="Evolution Lab" actions={<AddTaskButtons add={add} disabled={!ready} />} />
+      <PageHeader
+        sticky
+        title="Evolution Lab"
+        actions={<AddTaskButtons add={add} disabled={!ready} blocked={blocked} />}
+      />
       {options.isError && (
         <ErrorNotice error={options.error} title="Could not load the lab's options" />
       )}
@@ -408,12 +424,6 @@ export function EvolutionLabScreen() {
           <p className="text-body-compact text-pretty text-ink-subtle">
             Scored on Fitness over the first 8 years; the last 2 stay untouched.
           </p>
-          {simulations !== null && simulations > maxSimulations && (
-            <Notice
-              tone="error"
-              title={`A task takes at most ${fmt.int(maxSimulations)} simulations.`}
-            />
-          )}
           {preview.isError && <ErrorNotice error={preview.error} title="Could not plan the task" />}
           {plan?.problems.map((m) => (
             <Notice key={m} tone="error" title={m} />

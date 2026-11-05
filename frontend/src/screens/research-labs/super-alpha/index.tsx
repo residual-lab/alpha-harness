@@ -4,8 +4,13 @@ import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import type { components } from '@/api/generated'
 import { http } from '@/api/http'
+import {
+  REGION_AGNOSTIC_REGION,
+  SUPER_ALPHA_MIN_SELECTION,
+  SUPER_ALPHA_SLOTS,
+} from '@/api/platform'
 import { fmt } from '@/lib/format'
-import { REGION_AGNOSTIC, useScope, useScopeOptions } from '@/lib/scope'
+import { useScope, useScopeOptions } from '@/lib/scope'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
 import {
   Disclosure,
@@ -31,9 +36,10 @@ const ACTIVATIONS: { value: NonNullable<Activation>; label: string }[] = [
   { value: 'IS', label: 'IS' },
   { value: 'OS', label: 'OS' },
 ]
-/** BRAIN runs at most three SuperAlpha simulations per person at once. */
-const CORES = [1, 2, 3].map((n) => ({ value: n, label: String(n) }))
-const MIN_LIMIT = 10
+const CORES = Array.from({ length: SUPER_ALPHA_SLOTS }, (_, i) => ({
+  value: i + 1,
+  label: String(i + 1),
+}))
 const MAX_LIMIT = 200
 
 export function SuperAlphaLabScreen() {
@@ -50,8 +56,9 @@ export function SuperAlphaLabScreen() {
     : (options.neutralizations.find((n) => n.value === 'SUBINDUSTRY')?.value ??
       options.neutralizations[0]?.value ??
       '')
-  const agnostic = scope.region === REGION_AGNOSTIC
-  const limitValid = Number.isInteger(limit) && limit >= MIN_LIMIT && limit <= MAX_LIMIT
+  const agnostic = scope.region === REGION_AGNOSTIC_REGION
+  const limitValid =
+    Number.isInteger(limit) && limit >= SUPER_ALPHA_MIN_SELECTION && limit <= MAX_LIMIT
   const body = {
     region: scope.region,
     delay: scope.delay,
@@ -63,11 +70,11 @@ export function SuperAlphaLabScreen() {
   }
 
   const plan = useQuery({
-    queryKey: ['super-lab', 'plan', limitValid ? limit : MIN_LIMIT, activation],
+    queryKey: ['super-lab', 'plan', limitValid ? limit : SUPER_ALPHA_MIN_SELECTION, activation],
     queryFn: () =>
       http.post<Schemas['SuperPlan']>('/api/super-lab/plan', {
         ...body,
-        selectionLimit: limitValid ? limit : MIN_LIMIT,
+        selectionLimit: limitValid ? limit : SUPER_ALPHA_MIN_SELECTION,
       }),
     placeholderData: keepPreviousData,
   })
@@ -77,6 +84,7 @@ export function SuperAlphaLabScreen() {
   return (
     <Page>
       <PageHeader
+        sticky
         title="Super Alpha Lab"
         description="Combines your submitted Alphas into SuperAlphas, ready to submit"
         actions={<AddTaskButtons add={add} disabled={!ready} />}
@@ -112,12 +120,12 @@ export function SuperAlphaLabScreen() {
         <div className="flex flex-wrap items-end gap-6">
           <Field
             label="Selection Limit"
-            hint={`Alphas kept from the top of each ranking, ${MIN_LIMIT} to ${MAX_LIMIT}.`}
+            hint={`Alphas kept from the top of each ranking, ${SUPER_ALPHA_MIN_SELECTION} to ${MAX_LIMIT}.`}
             className="w-48"
           >
             <Input
               type="number"
-              min={MIN_LIMIT}
+              min={SUPER_ALPHA_MIN_SELECTION}
               max={MAX_LIMIT}
               value={Number.isNaN(limit) ? '' : String(limit)}
               onChange={(e) => setLimit(e.target.valueAsNumber)}
@@ -139,7 +147,7 @@ export function SuperAlphaLabScreen() {
         {!limitValid && (
           <Notice
             tone="error"
-            title={`Selection Limit must be a whole number from ${MIN_LIMIT} to ${MAX_LIMIT}.`}
+            title={`Selection Limit must be a whole number from ${SUPER_ALPHA_MIN_SELECTION} to ${MAX_LIMIT}.`}
             className="mt-3"
           />
         )}
@@ -147,7 +155,7 @@ export function SuperAlphaLabScreen() {
 
       <Panel
         title="What Runs"
-        description="Every selection with every combo, at two Decays to land Turnover between 2% and 40%. Each runs in Full mode, so BRAIN's own checks say which are submittable: those show green in Tasks and reach the Submission Planner."
+        description="Every selection with every combo, at two Decays to land Turnover between 2% and 40%. Each runs in Full mode, so BRAIN's own checks say which are submittable: those show green in Tasks."
       >
         {plan.isError && <ErrorNotice error={plan.error} title="Could not plan the task" />}
         {plan.data && (

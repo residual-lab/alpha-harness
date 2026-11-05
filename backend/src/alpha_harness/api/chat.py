@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field
 
 from ..catalog.queries import Tuple4
 from ..llm.chat import DEFAULT_REASONING, Reasoning, reasoning_options
-from ..llm.registry import LLMModels
 from ..schemas import Out
 from .deps import State, refuse
 
@@ -27,7 +26,6 @@ class ReasoningOption(Out):
 
 
 class ChatOptions(Out):
-    models: LLMModels
     reasoning: list[ReasoningOption]
     default_reasoning: Reasoning
     note: str
@@ -86,11 +84,11 @@ class ChatReply(Out):
 
 
 @router.get("/options")
-async def options(state: State) -> ChatOptions:
-    """The two choices a conversation offers: which model, and how hard to think."""
+async def options() -> ChatOptions:
+    """How hard a conversation may think. Its other choice, the model, is one of those a Key
+    can run, which the screen reads with the Keys."""
     return ChatOptions.model_validate(
         {
-            "models": state.llm.registry.roster(),
             "reasoning": reasoning_options(),
             "defaultReasoning": DEFAULT_REASONING,
             "note": (

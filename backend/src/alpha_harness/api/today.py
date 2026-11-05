@@ -16,6 +16,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Query
 
 from ..brain.filters import PLATFORM_TZ
+from ..brain.platform import DAILY_SIMULATIONS, INSTRUMENT_TYPE
 from ..catalog.queries import scope_label
 from ..db.models import SyncStatus
 from ..llm.budget import seconds_until_reset
@@ -25,23 +26,14 @@ from .llm import LLMBudget
 
 router = APIRouter(prefix="/api/today", tags=["today"])
 
-#: A consultant's daily simulation allowance, shown until the day's first simulation POST
-#: returns its x-ratelimit-* headers.
-DAILY_ALLOWANCE = 5000
-
-
-class Feature(Out):
-    code: str
-    label: str
-    meaning: str
-
 
 class You(Out):
     signed_in: bool
     email: str | None
     user_id: str | None
     full_name: str | None
-    features: list[Feature]
+    #: BRAIN's permission codes for the account, as it sends them.
+    permissions: list[str]
     can_run_ten_at_once: bool
     verification_url: str | None
 
@@ -103,50 +95,6 @@ class Bar(Out):
     resets_in_seconds: int
 
 
-#: Account permissions in plain language. A consultant should not have to look up
-#: ``MULTI_SIMULATION`` to find out they can run ten at a time.
-FEATURES: dict[str, tuple[str, str]] = {
-    "CONSULTANT": (
-        "Consultant",
-        "You are a paid consultant. Your alphas can earn you money when they are used.",
-    ),
-    "MULTI_SIMULATION": (
-        "Ten at a time",
-        "You can run ten simulations in one go instead of one, which is why a day's work "
-        "takes hours instead of weeks.",
-    ),
-    "SUPER_ALPHA": (
-        "SuperAlpha",
-        "You can combine several of your alphas into one bigger one.",
-    ),
-    "PROD_ALPHAS": (
-        "Production alphas",
-        "You can see the alphas that are running with real money.",
-    ),
-    "VISUALIZATION": ("Charts", "You can see how an alpha performed, drawn as a chart."),
-    "REGION_AGNOSTIC": (
-        "Region-agnostic",
-        "You can simulate one alpha across USA, Europe, Asia and Global at once. It can be "
-        "submitted when it works in two or more of them.",
-    ),
-    "BRAIN_LABS": ("BRAIN Labs", "You have access to the experimental tools."),
-    "BRAIN_LABS_JUPYTER_LAB": ("Notebooks", "You can write Python against the platform."),
-    "BEFORE_AND_AFTER_PERFORMANCE_V2": (
-        "Before and after",
-        "You can see how your pool of alphas would perform before and after adding an alpha.",
-    ),
-    "REFERRAL": ("Referrals", "You can invite other people to the platform."),
-    # BRAIN's own words for the matching check: "Quick mode alphas cannot be submitted."
-    "QUICK_MODE": (
-        "Quick mode",
-        "You can simulate with only the checks that score an alpha, which finishes sooner in "
-        "some regions. The numbers are the same, but the alpha must be simulated again in "
-        "full before it can be submitted.",
-    ),
-    "WORKDAY": ("Workday", "You can sign in to BRAIN through Workday."),
-}
-
-
 @router.get("")
 async def today(
     state: State,
@@ -155,7 +103,7 @@ async def today(
     universe: str = "TOP3000",
     # Aliased like the catalog's scope: one spelling on the wire, so the frontend has one
     # scope-to-query-string helper rather than one per route.
-    instrument_type: Annotated[str, Query(alias="instrumentType")] = "EQUITY",
+    instrument_type: Annotated[str, Query(alias="instrumentType")] = INSTRUMENT_TYPE,
 ) -> Today:
     """Everything the first screen needs, in one call."""
     session = state.auth.session
@@ -260,14 +208,7 @@ async def _you(state: State, session: Any, stored_email: str | None) -> dict[str
         "email": stored_email,
         "userId": session.user_id,
         "fullName": full_name or session.user_id,
-        "features": [
-            {
-                "code": code,
-                "label": FEATURES.get(code, (code.replace("_", " ").title(), ""))[0],
-                "meaning": FEATURES.get(code, (code, "An extra permission on your account."))[1],
-            }
-            for code in granted
-        ],
+        "permissions": granted,
         # Surfaced separately because it is the one that decides whether a day's work
         # takes hours or weeks.
         "canRunTenAtOnce": "MULTI_SIMULATION" in granted,
@@ -276,7 +217,7 @@ async def _you(state: State, session: Any, stored_email: str | None) -> dict[str
 
 
 async def simulations_today(state: State) -> dict[str, Any]:
-    allowance = DAILY_ALLOWANCE
+    allowance = DAILY_SIMULATIONS
     used = await state.tracker.used_today()
     snapshot = await state.tracker.latest_quota()
 

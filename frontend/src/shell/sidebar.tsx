@@ -3,29 +3,35 @@
  * Collapses to icons below `lg`.
  */
 
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link, useRouterState } from '@tanstack/react-router'
 import {
+  CheckIcon,
   ChevronsUpDownIcon,
   ExternalLinkIcon,
   LogOutIcon,
+  MessageSquareTextIcon,
   PanelLeftIcon,
   PowerIcon,
   SettingsIcon,
+  ShieldCheckIcon,
 } from 'lucide-react'
 import { Fragment, useEffect, useState } from 'react'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { auth } from '@/api/core'
+import { PLATFORM_URL } from '@/api/platform'
 import type { Today } from '@/api/types'
 import { cn } from '@/lib/cn'
-import { useRefetchOn } from '@/lib/ws'
-import { pool } from '@/screens/pool/api'
-import { Button, Kbd } from '@/ui/kit'
-import { Confirm, Menu, Tooltip } from '@/ui/overlay'
+import { Button, Empty, Kbd } from '@/ui/kit'
+import { Confirm, Dialog, Menu, Tooltip } from '@/ui/overlay'
+import { MOD } from './desktop'
 import { NAV } from './nav'
 import { SETTINGS_SHORTCUT, useSettings } from './settings'
 import { UpdateBadge, useQuitApp, useUpdateStatus, VersionBadge } from './update'
+
+/** GitHub's own chooser: a bug, a feature, or a security report. */
+const FEEDBACK_URL = 'https://github.com/residual-lab/alpha-harness/issues/new/choose'
 
 /** Areas a new consultant has to open once: Data (download fields) and AI (add a key). They flash until visited. */
 const ONBOARDING: readonly string[] = ['data', 'ai']
@@ -88,8 +94,7 @@ export const useSidebarHidden = create<{
   ),
 )
 
-/** The shortcut as this keyboard writes it: most consultants are on Windows, not a Mac. */
-export const SIDEBAR_SHORTCUT = /Mac|iPhone|iPad/.test(navigator.userAgent) ? '⌘B' : 'Ctrl+B'
+export const SIDEBAR_SHORTCUT = `${MOD}B`
 
 /** Shows or hides the sidebar. Lives in the header, so it stays put whichever it is. */
 export function SidebarToggle() {
@@ -144,11 +149,8 @@ export function Sidebar({
   useEffect(() => {
     if (ONBOARDING.includes(area)) visit(area)
   }, [area, visit])
-  const submittable = useQuery(pool.everywhere)
-  useRefetchOn('simulations', pool.everywhere.queryKey, 5000)
-  const total = submittable.data?.total ?? 0
-
   const [quitting, setQuitting] = useState(false)
+  const [permissions, setPermissions] = useState(false)
   const quit = useQuitApp()
   const launched = useUpdateStatus().data?.launcher != null
 
@@ -209,20 +211,26 @@ export function Sidebar({
             >
               <item.icon className="size-4 shrink-0" aria-hidden />
               {!collapsed && <span className="flex-1 truncate">{item.label}</span>}
-              {!collapsed && item.to === '/pool' && total > 0 && (
-                <span
-                  className="num rounded-pill border border-pnl-positive-edge bg-pnl-positive-tint px-1.5 py-0.5 text-caption font-medium text-pnl-positive-text"
-                  title="Submittable Alphas"
-                >
-                  {total}
-                </span>
-              )}
             </Link>
           </Fragment>
         ))}
       </nav>
 
       <div className="flex flex-col gap-1 border-t border-hairline p-2">
+        <a
+          href={FEEDBACK_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Give Feedback"
+          {...(collapsed && { 'aria-label': 'Give Feedback' })}
+          className={cn(
+            'flex h-8 items-center gap-3 rounded-md text-body text-ink-muted transition-colors hover:bg-surface-3 hover:text-ink',
+            collapsed ? 'justify-center' : 'px-2',
+          )}
+        >
+          <MessageSquareTextIcon className="size-4 shrink-0" aria-hidden />
+          {!collapsed && <span className="flex-1 truncate">Give Feedback</span>}
+        </a>
         {/* Both above the account, where someone reading a screenshot looks for them. The
             update stays on the rail as an icon — it is the one thing here worth interrupting
             for — while the version hides: 52px has no room for a date. */}
@@ -268,14 +276,14 @@ export function Sidebar({
               onClick: () => useSettings.getState().setOpen(true),
             },
             {
+              label: 'Permissions',
+              icon: <ShieldCheckIcon />,
+              onClick: () => setPermissions(true),
+            },
+            {
               label: 'Open the BRAIN Platform',
               icon: <ExternalLinkIcon />,
-              onClick: () =>
-                window.open(
-                  'https://platform.worldquantbrain.com',
-                  '_blank',
-                  'noopener,noreferrer',
-                ),
+              onClick: () => window.open(PLATFORM_URL, '_blank', 'noopener,noreferrer'),
             },
             {
               label: 'Sign Out',
@@ -285,7 +293,6 @@ export function Sidebar({
               onClick: () => signOut.mutate(),
             },
             // Only a launcher can bring the app back, so only a launched app offers to close.
-            // On macOS and Linux this is the only way to close it: there is no tray icon.
             ...(launched
               ? [
                   {
@@ -298,6 +305,31 @@ export function Sidebar({
           ]}
         />
       </div>
+      <Dialog
+        open={permissions}
+        onOpenChange={setPermissions}
+        // Wide enough for the longest code BRAIN sends to sit whole in its tile.
+        className="max-w-2xl"
+        title="Permissions"
+        description={`${you.permissions.length} granted to this account, as BRAIN names them.`}
+      >
+        {you.permissions.length ? (
+          <ul className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {you.permissions.map((code) => (
+              <li
+                key={code}
+                title={code}
+                className="flex min-w-0 items-center gap-2 rounded-md border border-hairline bg-surface-2 px-3 py-2"
+              >
+                <CheckIcon className="size-3.5 shrink-0 text-pnl-positive-text" aria-hidden />
+                <span className="num min-w-0 truncate text-body-compact text-ink">{code}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <Empty title="BRAIN reported no permissions for this account" />
+        )}
+      </Dialog>
       <Confirm
         open={quitting}
         onOpenChange={setQuitting}

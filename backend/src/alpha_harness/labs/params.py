@@ -6,11 +6,16 @@ survive a read and a write (``extra="allow"``), and every field a reader used to
 still defaults here. Only what a lab cannot run without is required.
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import ConfigDict, Field
 
-from ..brain.schemas import TEST_PERIOD
+from ..brain.platform import (
+    DEFAULT_NAN_HANDLING,
+    DEFAULT_PASTEURIZATION,
+    DEFAULT_TRUNCATION,
+    TEST_PERIOD,
+)
 from ..schemas import Out
 
 if TYPE_CHECKING:
@@ -27,6 +32,9 @@ POWER_POOL_SAMPLER = "power-pool"
 SETTINGS_SAMPLER = "settings-sampler"
 #: Studies that re-shape one Alpha's expression at its own settings (tools.correlation_breaker).
 CORRELATION_BREAKER = "correlation-breaker"
+#: Studies that swap one Alpha's data fields for others, growing from what passes
+#: (tools.fields_sampler).
+FIELDS_SAMPLER = "fields-sampler"
 #: Studies that combine your submitted Alphas into SuperAlphas (labs.super_alpha).
 SUPER_LAB = "super-alpha"
 #: Studies that are research-lab tasks, run only from the Tasks tab, by their lab's name.
@@ -37,6 +45,7 @@ TASK_SAMPLERS = {
     POWER_POOL_SAMPLER: "LLM Power Pool Lab",
     SETTINGS_SAMPLER: "Settings Sampler",
     CORRELATION_BREAKER: "Correlation Breaker",
+    FIELDS_SAMPLER: "Fields Sampler",
     SUPER_LAB: "Super Alpha Lab",
 }
 
@@ -70,11 +79,9 @@ class SearchParams(TaskParams):
 class TemplateParams(SearchParams):
     #: The template as typed, ``$variables`` and all (``labs.template``).
     template: str = ""
-    #: A task added while templates were built from blocks: run by ``labs.template_v1``.
-    tree: dict[str, Any] | None = None
-    truncation: float = 0.08
-    pasteurization: str = "ON"
-    nan_handling: str = "ON"
+    truncation: float = DEFAULT_TRUNCATION
+    pasteurization: str = DEFAULT_PASTEURIZATION
+    nan_handling: str = DEFAULT_NAN_HANDLING
     test_period: str = TEST_PERIOD
 
 
@@ -95,7 +102,10 @@ class PowerPoolParams(TaskParams):
     #: The Data Explorer's filter the datasets were chosen under, applied on every call.
     field_filter: dict[str, Any] | None = None
     model: str = ""
-    #: Running LLM tallies: ``calls``, ``empty``, ``failed`` and ``byDataset``.
+    #: Off, a call ``model`` cannot make (no budget left, provider down) goes to the next model
+    #: a Key can run; on, the task waits for ``model`` alone.
+    only_model: bool = False
+    #: Running LLM tallies: ``calls``, ``empty``, ``failed``, ``byDataset`` and ``byModel``.
     llm: dict[str, Any] = Field(default_factory=dict)
     #: The last hundred LLM calls, for the task's detail view.
     calls: list[dict[str, Any]] = Field(default_factory=list)
@@ -113,10 +123,10 @@ class SettingsParams(TaskParams):
     markets: int = 0
     #: Held at the source Alpha's values for every simulation in the sweep.
     decay: int = 0
-    truncation: float = 0.08
+    truncation: float = DEFAULT_TRUNCATION
     #: Truncation set per market by the Truncation Agent instead of held at ``truncation``.
     truncation_agent: bool = False
-    nan_handling: str = "ON"
+    nan_handling: str = DEFAULT_NAN_HANDLING
     #: ``P{years}Y{months}M0D``. Empty on a task added before it was recorded.
     test_period: str = ""
 
@@ -132,9 +142,22 @@ class BreakerParams(TaskParams):
     universe: str = ""
     neutralization: str = ""
     decay: int = 0
-    truncation: float = 0.08
+    truncation: float = DEFAULT_TRUNCATION
     #: The recipes queued, by id, for the task's detail line.
     recipes: list[str] = Field(default_factory=list)
+
+
+class FieldsSamplerParams(BreakerParams):
+    """Fields Sampler: one Alpha's fields swapped, its settings the source Alpha's. Every
+    winner is swept the same way, so ``mode`` and ``k`` are kept for those later sweeps."""
+
+    mode: Literal["sweep", "similar", "buckets"] = "sweep"
+    #: Similar: the most fields taken from each tier. Buckets: the picks from each bucket.
+    k: int = 10
+    #: The source Alpha's fields chosen to be swapped first.
+    fields: list[str] = Field(default_factory=list)
+    #: Other Alphas of the same expression whose settings every swap also runs at.
+    alphas: list[str] = Field(default_factory=list)
 
 
 class SuperParams(TaskParams):
@@ -156,6 +179,7 @@ BY_SAMPLER: dict[str, type[TaskParams]] = {
     POWER_POOL_SAMPLER: PowerPoolParams,
     SETTINGS_SAMPLER: SettingsParams,
     CORRELATION_BREAKER: BreakerParams,
+    FIELDS_SAMPLER: FieldsSamplerParams,
     SUPER_LAB: SuperParams,
 }
 

@@ -22,11 +22,14 @@ import { create } from 'zustand'
 import { type Preferences, simulations, update } from '@/api/core'
 import type { components } from '@/api/generated'
 import { errorMessage } from '@/api/http'
+import { REGION_AGNOSTIC_REGION, SIMULATION_SLOTS } from '@/api/platform'
 import { fmt } from '@/lib/format'
 import { usePreferences, useSavePreferences } from '@/lib/preferences'
-import { DEFAULT_SCOPE, REGION_AGNOSTIC, useScopeOptions } from '@/lib/scope'
+import { DEFAULT_SCOPE, useScopeOptions } from '@/lib/scope'
+import { useProviderLabel, useRunnableModels } from '@/screens/ai/shared'
 import { Button, Chips, ErrorNotice, Segmented, Skeleton, Switch } from '@/ui/kit'
 import { BACKDROP, Select } from '@/ui/overlay'
+import { MOD } from './desktop'
 import { useApplyUpdate, useUpdateStatus } from './update'
 
 export const useSettings = create<{
@@ -37,8 +40,7 @@ export const useSettings = create<{
   setOpen: (open) => set({ open }),
 }))
 
-/** The shortcut as this keyboard writes it, as for the sidebar's. */
-export const SETTINGS_SHORTCUT = /Mac|iPhone|iPad/.test(navigator.userAgent) ? '⌘,' : 'Ctrl+,'
+export const SETTINGS_SHORTCUT = `${MOD},`
 
 type SectionId = 'simulations' | 'tasks' | 'alphas' | 'updates'
 
@@ -123,7 +125,8 @@ export function SettingsDialog() {
 const ABOUT: Record<SectionId, string> = {
   simulations: 'How simulations run, share the eight cores, and keep going through the day.',
   tasks: 'What a new task in any lab or tool starts with.',
-  alphas: 'What is kept on this computer as Alphas come back from BRAIN.',
+  alphas:
+    'What is kept on this computer as Alphas come back from BRAIN, and which model writes their descriptions.',
   updates: 'How Alpha Harness finds and installs new versions.',
 }
 
@@ -178,7 +181,9 @@ function SimulationRows({ current, change }: Rows) {
   const awake = engine.data?.awake
   // Region-agnostic runs are scored as a family of regions, which Quick mode has not been
   // tried against, so only single regions are offered.
-  const regions = useScopeOptions(DEFAULT_SCOPE).regions.filter((r) => r.value !== REGION_AGNOSTIC)
+  const regions = useScopeOptions(DEFAULT_SCOPE).regions.filter(
+    (r) => r.value !== REGION_AGNOSTIC_REGION,
+  )
   const quick = current.quickRegions ?? []
   const quickAllowed = engine.data?.quickAllowed ?? true
   return (
@@ -241,7 +246,10 @@ function SimulationRows({ current, change }: Rows) {
 
 // ── Tasks ────────────────────────────────────────────────────────────────────────────────
 
-const CORES = Array.from({ length: 8 }, (_, i) => ({ value: i + 1, label: String(i + 1) }))
+const CORES = Array.from({ length: SIMULATION_SLOTS }, (_, i) => ({
+  value: i + 1,
+  label: String(i + 1),
+}))
 
 function TaskRows({ current, change }: Rows) {
   return (
@@ -293,11 +301,20 @@ function describeResults(chosen: CheckResult[]): string {
 }
 
 function AlphaRows({ current, change }: Rows) {
+  return (
+    <>
+      <PnlRow current={current} change={change} />
+      <DescriptionModelRow current={current} change={change} />
+    </>
+  )
+}
+
+function PnlRow({ current, change }: Rows) {
   const chosen = current.pnlCheckResults ?? DEFAULT_RESULTS
   return (
     <SettingRow
       title="Download PnL as Alphas land"
-      description="Saves each new Alpha's daily PnL on this computer as soon as its simulation finishes, so charts, correlations and the Submission Planner never wait for it. Each costs about three BRAIN requests. PnL a screen needs is still downloaded when you open it, whatever you choose here."
+      description="Saves each new Alpha's daily PnL on this computer as soon as its simulation finishes, so charts and correlations never wait for it. Each costs about three BRAIN requests. PnL a screen needs is still downloaded when you open it, whatever you choose here."
       control={(labels) => (
         <Switch
           checked={current.pnlDownload}
@@ -324,6 +341,72 @@ function AlphaRows({ current, change }: Rows) {
           count.
         </Status>
       </div>
+    </SettingRow>
+  )
+}
+
+/** The Select's value for no choice: model refs always hold a colon, so it names none. */
+const AUTOMATIC = 'automatic'
+
+function DescriptionModelRow({ current, change }: Rows) {
+  const { runnable, all, ready } = useRunnableModels()
+  const providerLabel = useProviderLabel()
+  const named = (m: { id: string; provider: string }) => `${m.id} · ${providerLabel(m.provider)}`
+  const chosen = current.descriptionModel ?? AUTOMATIC
+  const kept = all.find((m) => m.ref === chosen)
+  const runs = chosen === AUTOMATIC || runnable.some((m) => m.ref === chosen)
+  const items = [
+    { value: AUTOMATIC, label: 'Automatic' },
+    ...runnable.map((m) => ({ value: m.ref, label: named(m) })),
+    // A choice that can no longer run keeps its place, so it reads as it was made, and why.
+    ...(runs
+      ? []
+      : [
+          {
+            value: chosen,
+            label: kept ? `${named(kept)} (no enabled Key)` : `${chosen} (no longer set up)`,
+          },
+        ]),
+  ]
+  const [busiest] = runnable
+  const status = !ready
+    ? null
+    : !busiest
+      ? 'Off: none of your Keys can run a model. Add a Key and a model under LLM Integration.'
+      : !runs
+        ? kept
+          ? 'It has no enabled Key, so Write with AI is off. Enable one under LLM Integration.'
+          : 'It is no longer set up, so Write with AI is off. Choose another model.'
+        : chosen === AUTOMATIC
+          ? `Automatic uses ${named(busiest)}: most requests left today.`
+          : null
+  return (
+    <SettingRow
+      title="Power Pool Alpha Descriptions"
+      description={
+        // A sentence a line, each short enough not to wrap in the dialog.
+        <>
+          <span className="block">
+            Writes a Power Pool Alpha's description when you press Write with AI on its page.
+          </span>
+          <span className="block">
+            It sees only that Alpha's expression and the fields and operators it uses.
+          </span>
+        </>
+      }
+      control={() => (
+        <Select
+          label="Model for Power Pool Alpha Descriptions"
+          items={items}
+          value={chosen}
+          className="w-96"
+          disabled={ready && !busiest}
+          onChange={(next) => change({ descriptionModel: next === AUTOMATIC ? null : next })}
+        />
+      )}
+      stacked
+    >
+      {status && <Status>{status}</Status>}
     </SettingRow>
   )
 }
@@ -414,7 +497,7 @@ function UpdateRows({ current, change }: Rows) {
       </div>
       <SettingRow
         title="Check for updates"
-        description="Asks GitHub whether a newer version is out. Never more than once an hour, whatever you pick: GitHub allows each computer sixty questions an hour, shared with everything else on it."
+        description="Asks GitHub whether a newer version is out. The answer is kept, so restarting the app does not ask again."
         control={() => (
           <Select
             label="Check for updates"

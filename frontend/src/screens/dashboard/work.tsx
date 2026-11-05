@@ -9,7 +9,6 @@ import { toast } from 'sonner'
 import { simulations, tasks as tasksApi } from '@/api/core'
 import { DASH, fmt } from '@/lib/format'
 import { useLive } from '@/lib/live'
-import { useRefetchOn } from '@/lib/ws'
 import { Badge, Button, Empty, ErrorNotice, Panel, Progress, Skeleton } from '@/ui/kit'
 import { Confirm } from '@/ui/overlay'
 import { type Column, DataTable } from '@/ui/table'
@@ -23,13 +22,13 @@ interface WorkRow {
 
 export function WorkInFlight() {
   const queryClient = useQueryClient()
+  // The header's own query, which it already refreshes on every simulations message.
   const status = useQuery({
-    queryKey: ['engine'],
+    queryKey: ['simulations', 'engine'],
     queryFn: () => simulations.engine(),
   })
-  useRefetchOn('simulations', ['engine'], 2000)
 
-  // `task` undefined = stop everything.
+  // `task` undefined = pause everything.
   const [confirm, setConfirm] = useState<{
     task?: string
     name: string
@@ -39,9 +38,9 @@ export function WorkInFlight() {
     mutationFn: (task?: string) => simulations.dropQueue(task),
     onSuccess: (result, task) => {
       toast.success(
-        `Dropped ${fmt.int(result.dropped)} queued simulations${task ? ` from ${task}` : ''}. Anything already sent to BRAIN keeps running.`,
+        `Paused ${task ?? 'every task'}: ${fmt.int(result.dropped)} queued simulations wait for Run on the Tasks screen. Anything already sent to BRAIN keeps running.`,
       )
-      for (const queryKey of [['engine'], ['simulations'], ['bar'], ['today']])
+      for (const queryKey of [['simulations'], ['bar'], ['today'], ['lab-tasks']])
         void queryClient.invalidateQueries({ queryKey })
     },
     onSettled: () => setConfirm(null),
@@ -101,7 +100,7 @@ export function WorkInFlight() {
             disabled={stop.isPending}
             onClick={() => setConfirm({ task: r.task, name: r.task, waiting: r.waiting })}
           >
-            Stop
+            Pause
           </Button>
         ),
     },
@@ -113,12 +112,11 @@ export function WorkInFlight() {
       actions={
         stoppable.length > 0 && (
           <Button
-            variant="danger"
             size="sm"
             disabled={stop.isPending}
-            onClick={() => setConfirm({ name: 'all queued work', waiting: waitingTotal })}
+            onClick={() => setConfirm({ name: 'every task', waiting: waitingTotal })}
           >
-            Stop all
+            Pause all
           </Button>
         )
       }
@@ -146,15 +144,15 @@ export function WorkInFlight() {
       <Confirm
         open={confirm !== null}
         onOpenChange={(open) => !open && !stop.isPending && setConfirm(null)}
-        title={confirm?.task ? `Stop ${confirm.name}?` : 'Stop all queued work?'}
-        confirmLabel="Stop"
+        title={confirm?.task ? `Pause ${confirm.name}?` : 'Pause every task?'}
+        confirmLabel="Pause"
         cancelLabel="Keep going"
-        danger
         pending={stop.isPending}
         onConfirm={() => stop.mutate(confirm?.task)}
       >
-        Drops <span className="num text-ink">{fmt.int(confirm?.waiting)}</span> queued simulations
-        of {confirm?.name}; they will not be sent. Anything already sent to BRAIN keeps running.
+        Takes <span className="num text-ink">{fmt.int(confirm?.waiting)}</span> queued simulations
+        of {confirm?.name} off the queue; they are sent when you run it again from Tasks. Anything
+        already sent to BRAIN keeps running.
       </Confirm>
     </Panel>
   )

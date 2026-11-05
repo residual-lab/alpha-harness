@@ -13,11 +13,21 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from ..brain.schemas import TEST_PERIOD, region_label
+from ..brain.platform import (
+    INSTRUMENT_TYPE,
+    INVESTABILITY,
+    MAX_DECAY,
+    MAX_TRADE_REGIONS,
+    POWER_POOL_MAX_FIELDS,
+    POWER_POOL_MAX_OPERATORS,
+    TEST_PERIOD,
+    TEST_PERIOD_PATTERN,
+)
+from ..brain.schemas import region_label
 from ..catalog.queries import FieldFilter, Tuple4
 from ..db.models import Template, utcnow
 from ..labs import search, template
-from ..labs.fastexpr import MAX_FIELDS, MAX_OPERATORS, Node, ParseError, operator_table, walk
+from ..labs.fastexpr import Node, ParseError, operator_table, walk
 from ..labs.launch import (
     NO_NEUTRALIZATION,
     NO_SIMULATIONS,
@@ -43,7 +53,7 @@ from .deps import State, refuse
 router = APIRouter(prefix="/api/template-lab", tags=["template-lab"])
 
 ORIGIN = "template-lab"
-LIMITS = [MAX_OPERATORS, MAX_FIELDS]
+LIMITS = [POWER_POOL_MAX_OPERATORS, POWER_POOL_MAX_FIELDS]
 #: A saved template's document: its text and its variables.
 DOC_VERSION = 2
 
@@ -90,12 +100,12 @@ class TemplateTask(BaseModel):
         default_factory=list, max_length=3
     )
     #: Held at one value for every simulation.
-    decay: int = Field(default=0, ge=0, le=512)
+    decay: int = Field(default=0, ge=0, le=MAX_DECAY)
     truncation: float = Field(default=search.TRUNCATION, ge=0, le=1)
     pasteurization: Literal["ON", "OFF"] = "ON"
     nan_handling: Literal["ON", "OFF"] = "ON"
     #: ``P{years}Y{months}M0D``, the shape BRAIN's own field takes.
-    test_period: str = Field(default=TEST_PERIOD, pattern=r"^P[0-6]Y(?:[0-9]|1[01])M0D$")
+    test_period: str = Field(default=TEST_PERIOD, pattern=TEST_PERIOD_PATTERN)
     cores: int = Field(default=search.MAX_CORES, ge=1, le=search.MAX_CORES)
     #: Needed to add a task; a preview ignores it.
     simulations: int = Field(default=0, ge=0, le=search.MAX_SIMULATIONS)
@@ -272,7 +282,9 @@ async def _market(state: Any, region: str, delay: int) -> Tuple4 | None:
     rows = [
         r
         for r in await state.queries.synced_tuples()
-        if r["instrument_type"] == "EQUITY" and r["region"] == region and int(r["delay"]) == delay
+        if r["instrument_type"] == INSTRUMENT_TYPE
+        and r["region"] == region
+        and int(r["delay"]) == delay
     ]
     if not rows:
         return None
@@ -562,11 +574,11 @@ async def _plan(body: TemplateTask, state: Any) -> dict[str, Any]:
     if not neutralizations:
         settings_problems.append(NO_NEUTRALIZATION)
     position = template.takes_max_position(body.region)
-    investable = [n for n in template.INVESTABILITY if n != "max_position" or position]
+    investable = [n for n in INVESTABILITY if n != "max_position" or position]
     investability = [n for n in investable if n in body.investability]
     if not investability:
         settings_problems.append("Choose at least one Investability.")
-    elif body.region in template.MAX_TRADE_REGIONS and investability != ["max_trade"]:
+    elif body.region in MAX_TRADE_REGIONS and investability != ["max_trade"]:
         warnings.append(
             f"In {region_label(body.region)}, an Alpha without Max Trade is only submittable if "
             "it keeps 70% of its Sharpe under investability constraints."

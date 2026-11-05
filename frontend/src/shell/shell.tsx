@@ -15,6 +15,7 @@ import { useRefetchOn } from '@/lib/ws'
 import { Button, Empty, LINK, Notice, Skeleton, Spinner } from '@/ui/kit'
 import { ResizeHandle, useMediaQuery, WIDE } from '@/ui/panels'
 import { CommandMenu } from './command-menu'
+import { DesktopNotifications, inDesktop } from './desktop'
 import { Header } from './header'
 import { SettingsDialog } from './settings'
 import { SIDEBAR_WIDTH, Sidebar, useSidebarHidden } from './sidebar'
@@ -117,6 +118,7 @@ function Workspace({ you }: { you: Today['you'] }) {
   return (
     <div className="flex h-svh flex-col">
       <Header />
+      {inDesktop && <DesktopNotifications />}
       <Group
         id="shell"
         orientation="horizontal"

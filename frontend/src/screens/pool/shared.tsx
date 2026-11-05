@@ -6,15 +6,15 @@ import { CheckIcon, CopyIcon, EllipsisIcon, ExternalLinkIcon, RefreshCwIcon } fr
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/cn'
-import { fmt } from '@/lib/format'
-import { pool } from '@/screens/pool/api'
+import { CORE_METRICS, fmt } from '@/lib/format'
+import { BRAIN_ALPHA_URL, pool } from '@/screens/pool/api'
 import { Button } from '@/ui/kit'
 import { Menu } from '@/ui/overlay'
 import { type AstKind, tokenizeBrainAst } from './brain-ast'
 
 /** A check's value or limit: turnover as a percentage, the rest as a ratio. */
 export const checkFigure = (name: string, v: number | null | undefined) =>
-  name.includes('TURNOVER') ? fmt.pct(v) : fmt.ratio(v)
+  name.includes('TURNOVER') ? CORE_METRICS.turnover.show(v) : fmt.ratio(v)
 
 /** The strict submission boundary: submission happens on BRAIN, never here. */
 export function OpenInBrain({ url }: { url: string }) {
@@ -27,7 +27,15 @@ export function OpenInBrain({ url }: { url: string }) {
 }
 
 /** Re-runs BRAIN's submission checks (never submits) and refreshes what depends on them. */
-export function RecheckButton({ alphaId }: { alphaId: string }) {
+export function RecheckButton({
+  alphaId,
+  label = 'Re-check on BRAIN',
+  disabled,
+}: {
+  alphaId: string
+  label?: string
+  disabled?: boolean
+}) {
   const queryClient = useQueryClient()
   const mutation = useMutation({
     mutationFn: () => pool.check(alphaId),
@@ -43,20 +51,32 @@ export function RecheckButton({ alphaId }: { alphaId: string }) {
       // The Alpha page holds the verdict and checks under its own key.
       void queryClient.invalidateQueries({ queryKey: ['alpha', alphaId, 'page'] })
       void queryClient.invalidateQueries({ queryKey: ['pool', 'submittable'] })
-      // Not under the prefix above: the sidebar badge and Dashboard count.
+      // Not under the prefix above: every market's count, which an empty market points to.
       void queryClient.invalidateQueries({ queryKey: ['pool', 'submittable-count'] })
+      // The task tables judge on the same checks.
+      void queryClient.invalidateQueries({ queryKey: ['lab-tasks'] })
+      void queryClient.invalidateQueries({ queryKey: ['lab-task-top'] })
+      void queryClient.invalidateQueries({ queryKey: ['submittable-alphas'] })
     },
   })
   return (
-    <Button size="sm" loading={mutation.isPending} onClick={() => mutation.mutate()}>
+    <Button
+      size="sm"
+      loading={mutation.isPending}
+      disabled={disabled}
+      onClick={() => mutation.mutate()}
+    >
       {!mutation.isPending && <RefreshCwIcon />}
-      Re-check on BRAIN
+      {label}
     </Button>
   )
 }
 
-/** Per-Alpha actions that are not one-click enough to earn a button of their own. */
-export function AlphaActionsMenu({ alphaId }: { alphaId: string }) {
+/**
+ * Per-Alpha actions that are not one-click enough to earn a button of their own. `links` adds
+ * the full page and BRAIN, for a table row, where nothing else on the row offers them.
+ */
+export function AlphaActionsMenu({ alphaId, links = false }: { alphaId: string; links?: boolean }) {
   const navigate = useNavigate()
   return (
     <Menu
@@ -73,10 +93,32 @@ export function AlphaActionsMenu({ alphaId }: { alphaId: string }) {
         </Button>
       }
       items={[
+        ...(links
+          ? [
+              {
+                label: 'Open Full Page',
+                onClick: () => void navigate({ to: '/alpha/$alphaId', params: { alphaId } }),
+              },
+              {
+                label: 'Open in BRAIN',
+                onClick: () =>
+                  window.open(BRAIN_ALPHA_URL(alphaId), '_blank', 'noopener,noreferrer'),
+              },
+            ]
+          : []),
         {
           label: 'Settings Sampler',
           onClick: () =>
             void navigate({ to: '/tools/settings-sampler', search: { alpha: alphaId } }),
+        },
+        {
+          label: 'Fields Sampler',
+          onClick: () => void navigate({ to: '/tools/fields-sampler', search: { alpha: alphaId } }),
+        },
+        {
+          label: 'Correlation Breaker',
+          onClick: () =>
+            void navigate({ to: '/tools/correlation-breaker', search: { alpha: alphaId } }),
         },
       ]}
     />

@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { today } from '@/api/core'
+import { DAILY_SIMULATIONS } from '@/api/platform'
 import { fmt } from '@/lib/format'
 import type { LLMKey, LLMModel } from '@/screens/ai/api'
 import { Empty, ErrorNotice, LINK, Metric, Panel, Progress, Skeleton } from '@/ui/kit'
@@ -12,7 +13,8 @@ interface KeyModelRow {
   model: LLMModel
   /** What this Key may send this model today: the model's limit, or the Key's cap if lower. */
   allowed: number
-  requests: number
+  /** What is left of that, as the backend counts it: a Key's cap counts every model it serves. */
+  remaining: number
   tokens: number
 }
 
@@ -46,7 +48,7 @@ export function Budget() {
             key: k,
             model: m,
             allowed: k.dailyLimit === null ? m.rpd : Math.min(k.dailyLimit, m.rpd),
-            requests: usage.reduce((s, u) => s + u.requests, 0),
+            remaining: k.remainingToday[m.id] ?? 0,
             tokens: usage.reduce((s, u) => s + u.tokens, 0),
           }
         }),
@@ -71,21 +73,18 @@ export function Budget() {
       key: 'rpd',
       header: 'Requests left today',
       width: 'minmax(200px,1.2fr)',
-      cell: (r) => {
-        const remaining = Math.max(0, r.allowed - r.requests)
-        return (
-          <div className="flex w-full items-center gap-2">
-            <Progress
-              className="flex-1"
-              value={remaining / r.allowed}
-              label={`${r.model.id} requests left`}
-            />
-            <span className="num shrink-0 text-body-compact text-ink-muted">
-              {fmt.int(remaining)} / {fmt.int(r.allowed)}
-            </span>
-          </div>
-        )
-      },
+      cell: (r) => (
+        <div className="flex w-full items-center gap-2">
+          <Progress
+            className="flex-1"
+            value={r.remaining / r.allowed}
+            label={`${r.model.id} requests left`}
+          />
+          <span className="num shrink-0 text-body-compact text-ink-muted">
+            {fmt.int(r.remaining)} / {fmt.int(r.allowed)}
+          </span>
+        </div>
+      ),
     },
     {
       key: 'rpm',
@@ -120,7 +119,7 @@ export function Budget() {
           <Metric
             label="BRAIN simulations reset in"
             value={bar.isError ? '—' : fmt.countdown(eastern)}
-            hint="00:00 US Eastern. A separate clock: the 5,000 daily simulations."
+            hint={`00:00 US Eastern. A separate clock: the ${fmt.int(DAILY_SIMULATIONS)} daily simulations.`}
           />
           <Metric
             label="Enabled Keys"

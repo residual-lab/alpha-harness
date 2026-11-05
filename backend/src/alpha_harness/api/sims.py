@@ -1,8 +1,12 @@
 """Simulations and their resulting alphas."""
 
 from fastapi import APIRouter, HTTPException
+from sqlalchemy import select
 
+from ..db.models import Study, StudyStatus
 from ..engine.lifecycle import serialise
+from ..labs import scheduler
+from ..labs.params import TASK_SAMPLERS
 from ..schemas import (
     CancelResult,
     DropResult,
@@ -22,11 +26,23 @@ async def engine_status(state: State) -> EngineStatus:
 
 @router.delete("/simulations/queue")
 async def drop_queue(state: State, task: str | None = None) -> DropResult:
-    """Discard queued work that has not been submitted yet.
+    """Pause the tasks whose simulations are queued, and drop queued work no task owns.
 
-    Safe by construction: a queued row has no platform id because nothing was sent.
+    Paused rather than only emptied: a running task queues the same work again at once. Its
+    simulations wait for it to run again; nothing queued was sent, so nothing was spent.
     """
-    return DropResult(dropped=await state.engine.drop_queued(task))
+    statement = select(Study.id).where(
+        Study.sampler.in_(TASK_SAMPLERS),
+        Study.status.in_([StudyStatus.RUNNING, StudyStatus.QUEUED]),
+    )
+    if task is not None:
+        statement = statement.where(Study.task == task)
+    async with state.db.session() as session:
+        owners = list((await session.scalars(statement)).all())
+    dropped = 0
+    for study_id in owners:
+        dropped += await scheduler.pause(state.optimizer, study_id) or 0
+    return DropResult(dropped=dropped + await state.engine.drop_queued(task))
 
 
 @router.get("/simulations/active")

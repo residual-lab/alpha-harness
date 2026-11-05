@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel, Field
 
-from ..brain.schemas import REGION_AGNOSTIC_REGION
+from ..brain.platform import INSTRUMENT_TYPE, REGION_AGNOSTIC_REGION
 from .search import MATCH, TABLE, query_terms
 from .search import ready as search_ready
 
@@ -63,7 +63,7 @@ class Tuple4(BaseModel):
     #: Reused predicate; ``params`` supplies its four placeholders in order.
     WHERE: ClassVar[str] = "instrument_type = ? AND region = ? AND delay = ? AND universe = ?"
 
-    instrument_type: str = "EQUITY"
+    instrument_type: str = INSTRUMENT_TYPE
     region: str
     delay: int
     universe: str
@@ -77,6 +77,17 @@ class Tuple4(BaseModel):
         return scope_label(self.instrument_type, self.region, self.delay, self.universe)
 
 
+#: A field whose id or description holds the ``containing`` pattern, given twice.
+NAMED_OR_DESCRIBED = r"(lower(field_id) LIKE ? ESCAPE '\' OR lower(description) LIKE ? ESCAPE '\')"
+
+
+def containing(text: str) -> str:
+    """A LIKE pattern for ``text`` anywhere, case-insensitive. `_` and `%` are LIKE wildcards,
+    and field ids are full of underscores: unescaped, searching `_eps_` matches "steps" too."""
+    escaped = text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 class FieldFilter(BaseModel):
     """Everything the Data Explorer can narrow on.
 
@@ -86,6 +97,8 @@ class FieldFilter(BaseModel):
 
     search: str | None = None
     dataset_ids: list[str] = Field(default_factory=list)
+    #: Only these fields: the ones ticked one by one, e.g. the promising few of a dataset.
+    field_ids: list[str] = Field(default_factory=list)
     category_ids: list[str] = Field(default_factory=list)
     field_types: list[str] = Field(default_factory=list)
 
@@ -128,7 +141,12 @@ class FieldFilter(BaseModel):
         if self.sort_by == RELEVANCE:
             # Falls back to the default column when there is no score to order by, so a
             # stale relevance sort cannot empty the ordering.
-            return "ORDER BY score DESC, field_id ASC" if scored else "ORDER BY alpha_count DESC"
+            return (
+                "ORDER BY score DESC, field_id ASC"
+                if scored
+                # Most fields tie on a count of zero, and pages of ties overlap without the id.
+                else "ORDER BY alpha_count DESC NULLS LAST, field_id ASC"
+            )
         column = self.sort_by if self.sort_by in SORTABLE else "alpha_count"
         direction = "DESC" if self.sort_desc else "ASC"
         # NULLS LAST keeps unpopulated metrics from crowding the top of a descending sort.
@@ -148,19 +166,13 @@ class FieldFilter(BaseModel):
         if not search:
             pass
         elif self.search:
-            # `_` and `%` are LIKE wildcards, and field ids are full of underscores: without
-            # escaping, searching `_eps_` matches "steps" and "reps" too.
-            escaped = (
-                self.search.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            )
-            needle = f"%{escaped}%"
-            clauses.append(
-                r"(lower(field_id) LIKE ? ESCAPE '\' OR lower(description) LIKE ? ESCAPE '\')"
-            )
+            needle = containing(self.search)
+            clauses.append(NAMED_OR_DESCRIBED)
             params.extend([needle, needle])
 
         for column, values in (
             ("dataset_id", self.dataset_ids),
+            ("field_id", self.field_ids),
             ("category_id", self.category_ids),
             ("field_type", self.field_types),
         ):
@@ -267,18 +279,29 @@ class CatalogQueries:
         return bool(found)
 
     async def _page(
-        self, scope: Tuple4, filters: FieldFilter, terms: str | None, *, conjunctive: bool
+        self,
+        scope: Tuple4,
+        filters: FieldFilter,
+        terms: str | None,
+        *,
+        conjunctive: bool,
+        counted: bool = True,
     ) -> dict[str, Any]:
-        """One page of fields and the total behind it, both narrowed the same way."""
+        """One page of fields and the total behind it, both narrowed the same way. Without
+        ``counted`` the total is ``None`` and never read."""
         ranked = terms is not None
         source = SCORED_SOURCE if ranked else "data_field"
         head: list[Any] = [terms, int(conjunctive)] if ranked else []
         where, params = filters.where(scope, search=not ranked)
         scored = ranked and filters.sort_by == RELEVANCE
 
-        total = await self.catalog.scalar(
-            f"SELECT count(*) FROM {source} WHERE {where}",  # noqa: S608
-            [*head, *params],
+        total = (
+            await self.catalog.scalar(
+                f"SELECT count(*) FROM {source} WHERE {where}",  # noqa: S608
+                [*head, *params],
+            )
+            if counted
+            else None
         )
         rows = await self.catalog.query(
             f"""
@@ -294,27 +317,59 @@ class CatalogQueries:
             [*head, *params, filters.limit, filters.offset],
         )
         return {
-            "total": int(total or 0),
+            "total": int(total or 0) if counted else None,
             "limit": filters.limit,
             "offset": filters.offset,
             "results": rows,
         }
 
-    async def fields(self, scope: Tuple4, filters: FieldFilter) -> dict[str, Any]:
+    async def fields(
+        self, scope: Tuple4, filters: FieldFilter, *, counted: bool = True
+    ) -> dict[str, Any]:
         """A filtered, sorted, paginated page of fields plus the total match count.
 
         Where the index exists the search is answered by joining it, which narrows and ranks
         in one pass. Requiring every word is what makes a multi-word search mean something,
         so that is tried first; the count it produces is also the test of whether it found
         anything, and only an empty one costs a second round with any-of-the-words.
+
+        ``counted=False`` skips the total, for a caller reading only the first page's rows:
+        there an empty page says what a total of nought does.
         """
         terms = filters.terms()
         if not (terms and await search_ready(self.catalog)):
-            return await self._page(scope, filters, None, conjunctive=True)
-        page = await self._page(scope, filters, terms, conjunctive=True)
-        if page["total"] == 0 and " " in terms:
-            return await self._page(scope, filters, terms, conjunctive=False)
+            return await self._page(scope, filters, None, conjunctive=True, counted=counted)
+        page = await self._page(scope, filters, terms, conjunctive=True, counted=counted)
+        found = page["total"] if counted else len(page["results"])
+        if found == 0 and " " in terms:
+            return await self._page(scope, filters, terms, conjunctive=False, counted=counted)
         return page
+
+    async def field_anywhere(self, field_id: str) -> dict[str, Any] | None:
+        """One field from whichever market covers it best. What a field is, its type, dataset
+        and description, is the same in every market it is read in."""
+        rows = await self.catalog.query(
+            "SELECT * FROM data_field WHERE field_id = ? "
+            "ORDER BY coverage DESC NULLS LAST, region, delay, universe LIMIT 1",
+            [field_id],
+        )
+        return rows[0] if rows else None
+
+    async def fields_anywhere(self, search: str, limit: int) -> list[dict[str, Any]]:
+        """Fields named or described by ``search`` in any market, each once, from the market
+        that covers it best; the most used first."""
+        needle = containing(search)
+        return await self.catalog.query(
+            f"""
+            SELECT * FROM data_field WHERE {NAMED_OR_DESCRIBED}
+            QUALIFY row_number() OVER (
+                PARTITION BY field_id ORDER BY coverage DESC NULLS LAST, region, delay, universe
+            ) = 1
+            ORDER BY alpha_count DESC NULLS LAST, field_id
+            LIMIT ?
+            """,  # noqa: S608 - a constant clause and placeholders only
+            [needle, needle, limit],
+        )
 
     async def field(self, scope: Tuple4, field_id: str) -> dict[str, Any] | None:
         rows = await self.catalog.query(
@@ -349,6 +404,38 @@ class CatalogQueries:
             """,  # noqa: S608
             [*scope.params, *field_ids],
         )
+
+    async def described(self, field_ids: list[str], region: str) -> dict[str, dict[str, Any]]:
+        """Each field's type, description, dataset, category and subcategory, read where
+        ``region`` holds it, else wherever the catalog does: they rarely differ from one market
+        to the next."""
+        if not field_ids:
+            return {}
+        rows = await self.catalog.query(
+            f"""
+            SELECT DISTINCT ON (field_id) field_id, field_type, description, dataset_id,
+                   category_name, subcategory_name
+            FROM data_field
+            WHERE field_id IN ({", ".join("?" for _ in field_ids)})
+            ORDER BY field_id, region = ? DESC, region, delay, universe
+            """,  # noqa: S608 - placeholders only
+            [*field_ids, region],
+        )
+        return {str(r["field_id"]): r for r in rows}
+
+    async def datasets_described(self, dataset_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Each dataset's name and description, from whichever market describes it."""
+        if not dataset_ids:
+            return {}
+        rows = await self.catalog.query(
+            f"""
+            SELECT DISTINCT ON (dataset_id) dataset_id, name, description FROM data_set
+            WHERE dataset_id IN ({", ".join("?" for _ in dataset_ids)})
+            ORDER BY dataset_id, description IS NULL, region, delay, universe
+            """,  # noqa: S608 - placeholders only
+            dataset_ids,
+        )
+        return {str(r["dataset_id"]): r for r in rows}
 
     async def sole_datasets(self, field_ids: list[str]) -> dict[str, str]:
         """Each field's dataset where every market agrees on it. ``revenue`` is fundamental6 in
@@ -443,7 +530,7 @@ class CatalogQueries:
                 SELECT {column} AS id{select_extra}, count(*) AS n
                 FROM {table}
                 WHERE {where} AND {column} IS NOT NULL
-                GROUP BY {column} ORDER BY n DESC
+                GROUP BY {column} ORDER BY n DESC, id
                 """,  # noqa: S608
                 [*head, *params],
             )
@@ -507,21 +594,33 @@ class CatalogQueries:
         what pressing it would make it. Region Agnostic and Region Exclusive cannot both hold
         (a field in region ALL is in another region), so pressing one lets go of the other.
         """
-        pressed = {
-            "region_agnostic": {"region_agnostic": True, "region_exclusive": False},
-            "region_exclusive": {"region_exclusive": True, "region_agnostic": False},
-        }
-
-        async def count(update: dict[str, bool]) -> int:
-            where, params = active.model_copy(update=update).where(scope, search=not ranked)
-            n = await self.catalog.scalar(
-                f"SELECT count(*) FROM {table} WHERE {where}",  # noqa: S608
-                [*head, *params],
+        # Both counted in one pass over the scope, each with its own clause as ``where`` writes
+        # it: the same counts as one query per toggle, measured.
+        base = active.model_copy(update={"region_agnostic": False, "region_exclusive": False})
+        where, params = base.where(scope, search=not ranked)
+        if scope.region == REGION_AGNOSTIC_REGION:
+            agnostic, agnostic_params = "true", []
+        else:
+            agnostic = (
+                "field_id IN (SELECT field_id FROM data_field "
+                "WHERE instrument_type = ? AND region = ?)"
             )
-            return int(n or 0)
-
-        found = await asyncio.gather(*(count(update) for update in pressed.values()))
-        return dict(zip(pressed, found, strict=True))
+            agnostic_params = [scope.instrument_type, REGION_AGNOSTIC_REGION]
+        rows = await self.catalog.query(
+            f"""
+            SELECT count(*) FILTER (WHERE {agnostic}) AS region_agnostic,
+                   count(*) FILTER (WHERE field_id NOT IN (
+                       SELECT field_id FROM data_field WHERE instrument_type = ? AND region <> ?
+                   )) AS region_exclusive
+            FROM {table} WHERE {where}
+            """,  # noqa: S608
+            [*agnostic_params, scope.instrument_type, scope.region, *head, *params],
+        )
+        row = rows[0] if rows else {}
+        return {
+            "region_agnostic": int(row.get("region_agnostic") or 0),
+            "region_exclusive": int(row.get("region_exclusive") or 0),
+        }
 
     async def stats(self, scope: Tuple4) -> dict[str, Any]:
         """Distribution summary — lets the UI set sensible filter ranges."""

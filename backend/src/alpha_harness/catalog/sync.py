@@ -6,8 +6,8 @@ may simply not exist in EUR/delay-0. Storing one row per field *per tuple* is wh
 "which fields are in both delays" a single query later.
 
 ``GET /data-fields`` at ``version=3.0`` with all four scope parameters returns a whole
-scope in one response. Datasets are paged; categories are one request and do not depend
-on the scope.
+scope in one response. Datasets are paged. Categories need no read of their own: every field
+names its category and subcategory.
 """
 
 import asyncio
@@ -21,8 +21,9 @@ import structlog
 from sqlalchemy import select, update
 
 from ..brain.errors import BrainError
-from ..brain.schemas import REGION_AGNOSTIC_REGION, BulkField, FieldRef
-from ..db.duck import CATEGORY_COLUMNS, DATASET_COLUMNS, CatalogUnusableError
+from ..brain.platform import INSTRUMENT_TYPE, REGION_AGNOSTIC_REGION
+from ..brain.schemas import BulkField, FieldRef
+from ..db.duck import DATASET_COLUMNS, CatalogUnusableError
 from ..db.models import SyncRun, SyncStatus, utcnow
 from . import search
 from .queries import scope_label
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from ..brain.endpoints import BrainEndpoints
-    from ..brain.schemas import DataCategory, DataSet
+    from ..brain.schemas import DataSet
     from ..db.duck import Catalog
     from ..db.sqlite import Database
     from ..tasks import Task, TaskRegistry
@@ -95,7 +96,7 @@ class SyncTarget:
 
 
 #: The run row that stands for a whole-catalog sync rather than one scope.
-ALL_TARGET = SyncTarget("EQUITY", "*", -1, "*")
+ALL_TARGET = SyncTarget(INSTRUMENT_TYPE, "*", -1, "*")
 
 
 class CatalogSync:
@@ -131,9 +132,8 @@ class CatalogSync:
 
         One run row stands for the whole download, so there is one progress feed and one
         cancel. Every market runs its own pipeline at once: its fields first (with dataset
-        and category rows derived from them, so it is browsable immediately), then BRAIN's
-        full dataset and category records. A market that fails is noted and skipped rather
-        than ending the sync.
+        rows derived from them, so it is browsable immediately), then BRAIN's full dataset
+        records. A market that fails is noted and skipped rather than ending the sync.
         """
         for run_id in list(self._all):
             if run_id in self._tasks:
@@ -339,15 +339,10 @@ class CatalogSync:
         self, run_id: int, targets: list[SyncTarget], cancel: asyncio.Event
     ) -> None:
         progress = self._all[run_id]
-        totals = {"fields": 0, "datasets": 0, "categories": 0}
+        totals = {"fields": 0, "datasets": 0}
         synced: list[SyncTarget] = []
         # Bounds how many markets hold a full field payload in memory at once.
         gate = asyncio.Semaphore(ALL_CONCURRENCY)
-        # The taxonomy is the same for every scope, so it is read once. Locked because up
-        # to ``ALL_CONCURRENCY`` markets reach this together; held only across the fetch,
-        # so a failure leaves it unset for the next market's retry.
-        taxonomy: list[DataCategory] | None = None
-        taxonomy_lock = asyncio.Lock()
         # One unscoped read serves every market and runs beside the field downloads. Markets
         # never block on it for long: see BULK_DATASETS_WAIT.
         bulk_datasets = asyncio.create_task(self._all_datasets(targets))
@@ -357,7 +352,6 @@ class CatalogSync:
                 run_id,
                 fields_synced=totals["fields"],
                 datasets_synced=totals["datasets"],
-                categories_synced=totals["categories"],
                 error=_failures(progress),
             )
             await self._emit(run_id)
@@ -369,7 +363,7 @@ class CatalogSync:
                 market["state"] = "fetching"
                 await self._emit(run_id)
 
-                async def store() -> tuple[int, int, int]:
+                async def store() -> tuple[int, int]:
                     started = time.perf_counter()
                     raw = await self._fields(target, bulk_datasets, market, run_id, cancel)
                     fetched = time.perf_counter()
@@ -378,7 +372,7 @@ class CatalogSync:
                         raise RuntimeError("BRAIN returned no data fields")
                     now = utcnow()
                     rows = await asyncio.to_thread(_field_rows, raw, target, now)
-                    datasets, categories = await asyncio.to_thread(_derived_rows, raw, target, now)
+                    datasets = await asyncio.to_thread(_dataset_rows, raw, target, now)
                     prepared = time.perf_counter()
                     scope = [target.instrument_type, target.region, target.delay, target.universe]
                     await self.catalog.replace_fields(scope, rows)
@@ -386,9 +380,6 @@ class CatalogSync:
                     # Coverage and counts that an earlier details step stored.
                     await self.catalog.upsert(
                         "data_set", DATASET_COLUMNS, datasets, overwrite=False
-                    )
-                    await self.catalog.upsert(
-                        "data_category", CATEGORY_COLUMNS, categories, overwrite=False
                     )
                     # Where a full sync's time goes: BRAIN's response, row building, or the
                     # single-writer DuckDB lock (which also waits on the other scopes' writes).
@@ -400,10 +391,10 @@ class CatalogSync:
                         prepare_s=round(prepared - fetched, 2),
                         write_s=round(time.perf_counter() - prepared, 2),
                     )
-                    return len(rows), len(datasets), len(categories)
+                    return len(rows), len(datasets)
 
                 try:
-                    fields, datasets, categories = await _retry(store, cancel, target.label)
+                    fields, datasets = await _retry(store, cancel, target.label)
                 except SyncCancelled, CatalogUnusableError:
                     # An unusable catalog fails every remaining market the same way.
                     raise
@@ -415,33 +406,15 @@ class CatalogSync:
                     await report()
                     return
 
-            # Browsable now; BRAIN's full dataset and category records follow straight away.
+            # Browsable now; BRAIN's full dataset records follow straight away.
             totals["fields"] += fields
             totals["datasets"] += datasets
-            totals["categories"] += categories
             market.update(state="details", fields=fields)
             synced.append(target)
             await report()
 
             async def details() -> None:
-                nonlocal taxonomy
                 now = utcnow()
-                async with taxonomy_lock:
-                    if taxonomy is None:
-                        taxonomy = await self.endpoints.list_data_categories()
-                categories = taxonomy
-                category_rows = [
-                    row
-                    for category in categories
-                    for row in (
-                        _category_row(category, None, target, now),
-                        *(
-                            _category_row(sub, category.id, target, now)
-                            for sub in category.subcategories
-                        ),
-                    )
-                ]
-                await self.catalog.upsert("data_category", CATEGORY_COLUMNS, category_rows)
                 datasets = await _shared_datasets(bulk_datasets, target)
                 if datasets is None:
                     # Counted per run: a market paying for its own scope means the shared
@@ -504,6 +477,19 @@ class CatalogSync:
                 bulk_datasets.cancel()
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await bulk_datasets
+
+        # A market BRAIN stopped offering is never fetched, so nothing above replaces it: left,
+        # it stays browsable and counted, and a Lab could spend simulations on it. Logged
+        # rather than raised, like the compaction: it leaves only what was there before.
+        try:
+            removed = await self.catalog.prune_markets(
+                [(t.instrument_type, t.region, t.delay, t.universe) for t in targets],
+                region_agnostic=targets[0].region == REGION_AGNOSTIC_REGION,
+            )
+            if removed:
+                log.info("sync_all.pruned", run_id=run_id, fields=removed)
+        except Exception:
+            log.warning("sync_all.prune_failed", run_id=run_id, exc_info=True)
 
         # Once, at the end: per market this would serialise behind every other market's
         # write. A failure here costs disk, not data, so it is logged rather than raised.
@@ -708,60 +694,31 @@ def _dataset_row(dataset: DataSet, target: SyncTarget, now: datetime) -> tuple[A
     )
 
 
-def _category_row(
-    category: DataCategory, parent_id: str | None, target: SyncTarget, now: datetime
-) -> tuple[Any, ...]:
-    return (
-        category.id,
-        category.name,
-        parent_id,
-        category.dataset_count,
-        category.field_count,
-        category.value_score,
-        target.instrument_type,
-        target.region,
-        target.delay,
-        target.universe,
-        now,
-    )
-
-
-def _derived_rows(
-    raw: list[BulkField], target: SyncTarget, now: datetime
-) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
-    """Dataset and category rows built from the fields alone.
+def _dataset_rows(raw: list[BulkField], target: SyncTarget, now: datetime) -> list[tuple[Any, ...]]:
+    """Dataset rows built from the fields alone.
 
     Every field names its dataset, category and subcategory, so a scope is browsable before
     its details arrive. Read from the raw dicts rather than re-validating ~85k models.
     Stage 2 of a full sync overwrites these with BRAIN's full records.
     """
     datasets: dict[str, dict[str, Any]] = {}
-    categories: dict[str, dict[str, Any]] = {}
     blank = FieldRef()
     for item in raw:
-        dataset = item.dataset or blank
-        category = item.category or blank
-        subcategory = item.subcategory or blank
-        dataset_id = dataset.id
+        dataset_id = (item.dataset or blank).id
         if dataset_id:
             entry = datasets.setdefault(
                 dataset_id,
-                {"name": dataset.name, "category": category, "sub": subcategory, "n": 0},
+                {
+                    "name": (item.dataset or blank).name,
+                    "category": item.category or blank,
+                    "sub": item.subcategory or blank,
+                    "n": 0,
+                },
             )
             entry["n"] += 1
-        for node, parent_id in ((category, None), (subcategory, category.id)):
-            node_id = node.id
-            if not node_id:
-                continue
-            c = categories.setdefault(
-                node_id, {"name": node.name, "parent": parent_id, "ds": set(), "n": 0}
-            )
-            c["n"] += 1
-            if dataset_id:
-                c["ds"].add(dataset_id)
 
     scope = (target.instrument_type, target.region, target.delay, target.universe)
-    dataset_rows = [
+    return [
         (
             dataset_id,
             e["name"],
@@ -782,11 +739,6 @@ def _derived_rows(
         )
         for dataset_id, e in datasets.items()
     ]
-    category_rows = [
-        (node_id, c["name"], c["parent"], len(c["ds"]), c["n"], None, *scope, now)
-        for node_id, c in categories.items()
-    ]
-    return dataset_rows, category_rows
 
 
 def _reason(exc: BaseException) -> str:
@@ -818,7 +770,6 @@ def serialise_run(run: SyncRun) -> dict[str, Any]:
         else scope_label(run.instrument_type, run.region, run.delay, run.universe),
         "status": run.status,
         "phase": run.phase,
-        "categoriesSynced": run.categories_synced,
         "datasetsSynced": run.datasets_synced,
         "fieldsSynced": run.fields_synced,
         # A single market's field count is not known up front; the sync-all feed sets its own.

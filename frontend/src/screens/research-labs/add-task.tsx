@@ -6,6 +6,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { ListPlusIcon, PlayIcon } from 'lucide-react'
+import { useId } from 'react'
 import { toast } from 'sonner'
 import type { components } from '@/api/generated'
 import { errorMessage } from '@/api/http'
@@ -66,22 +67,33 @@ export function useAddTask(add: () => Promise<AddedTask>) {
 export function AddTaskButtons({
   add,
   disabled,
+  blocked,
   describedBy,
 }: {
   add: ReturnType<typeof useAddTask>
   disabled: boolean
-  /** An element saying why both are disabled, when they are. */
+  /** Why both are disabled, said beside them: the input missing may be far down the page. */
+  blocked?: string | null | undefined
+  /** An element elsewhere saying why both are disabled, when they are. */
   describedBy?: string | undefined
 }) {
   const running = add.isPending && add.variables
   const adding = add.isPending && !add.variables
+  const reason = useId()
+  const why = disabled && blocked
+  const described = why ? reason : describedBy
   return (
     <div className="flex flex-wrap items-center gap-2">
+      {why && (
+        <span id={reason} className="text-body-compact text-ink-subtle">
+          {why}
+        </span>
+      )}
       <Tooltip content="Saves it to Tasks without starting it. Run it from there when you're ready.">
         <Button
           disabled={disabled || running}
           loading={adding}
-          aria-describedby={describedBy}
+          aria-describedby={described}
           onClick={() => add.mutate(false)}
         >
           <ListPlusIcon />
@@ -93,7 +105,7 @@ export function AddTaskButtons({
           variant="primary"
           disabled={disabled || adding}
           loading={running}
-          aria-describedby={describedBy}
+          aria-describedby={described}
           onClick={() => add.mutate(true)}
         >
           <PlayIcon />

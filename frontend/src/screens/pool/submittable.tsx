@@ -5,7 +5,7 @@ import { CopyIcon } from 'lucide-react'
 import { toast } from 'sonner'
 import { type AlphaCheck, type Scope, scopeLabel } from '@/api/types'
 import { cn } from '@/lib/cn'
-import { fmt, isNum } from '@/lib/format'
+import { CORE_METRICS, fmt, isNum } from '@/lib/format'
 import { marketKey, useScope } from '@/lib/scope'
 import { useRefetchOn } from '@/lib/ws'
 import {
@@ -22,10 +22,11 @@ import {
   Disclosure,
   Empty,
   ErrorNotice,
+  figureTone,
+  type Limits,
   Metric,
   Panel,
   Skeleton,
-  type Tone,
 } from '@/ui/kit'
 import { Tooltip } from '@/ui/overlay'
 import { ScopePicker } from '@/ui/scope-picker'
@@ -43,8 +44,6 @@ const hiddenReasons = (data: SubmittableResponse) =>
   ]
     .filter(Boolean)
     .join('; ')
-
-const pass = (ok: boolean | null): Tone => (ok === null ? 'neutral' : ok ? 'profit' : 'loss')
 
 export function Submittable({ onOpen }: { onOpen: (alphaId: string) => void }) {
   const [scope, setScope] = useScope('pool-submittable')
@@ -72,8 +71,9 @@ export function Submittable({ onOpen }: { onOpen: (alphaId: string) => void }) {
           />
           <Metric
             boxed
-            label="Not Submittable"
+            label="Near Misses"
             value={fmt.int(data.nearMisses)}
+            hint="Refused by only one or two fixable checks, such as Turnover or Fitness"
             tone={data.nearMisses > 0 ? 'warn' : 'neutral'}
           />
         </div>
@@ -175,9 +175,12 @@ function Card({
   alpha: SubmittableAlpha
   onOpen: (alphaId: string) => void
 }) {
-  const d0 = a.settings.delay === 0
-  const sharpeBar = limitOf(a.checks, 'LOW_SHARPE') ?? (d0 ? 2.69 : 1.58)
-  const fitnessBar = limitOf(a.checks, 'LOW_FITNESS') ?? (d0 ? 1.5 : 1.0)
+  // The limits BRAIN set this Alpha, as its own checks name them: they differ by market.
+  const limits: Limits = Object.fromEntries(
+    a.checks.flatMap((c) => (isNum(c.limit) ? [[c.name, c.limit]] : [])),
+  )
+  const [sharpeBar, fitnessBar] = [limits['LOW_SHARPE'], limits['LOW_FITNESS']]
+  const [turnoverLow, turnoverHigh] = [limits['LOW_TURNOVER'], limits['HIGH_TURNOVER']]
   const passed = a.checks.filter((c) => c.result === 'PASS')
 
   const copy = () =>
@@ -205,35 +208,37 @@ function Card({
           boxed
           size="sm"
           label="Sharpe"
-          hint={`≥ ${fmt.ratio(sharpeBar)}`}
+          {...(sharpeBar !== undefined ? { hint: `≥ ${fmt.ratio(sharpeBar)}` } : {})}
           value={fmt.ratio(a.sharpe)}
-          tone={pass(isNum(a.sharpe) ? a.sharpe >= sharpeBar : null)}
+          tone={figureTone('sharpe', a.sharpe, limits)}
         />
         <Metric
           boxed
           size="sm"
           label="Fitness"
-          hint={`≥ ${fmt.ratio(fitnessBar)}`}
+          {...(fitnessBar !== undefined ? { hint: `≥ ${fmt.ratio(fitnessBar)}` } : {})}
           value={fmt.ratio(a.fitness)}
-          tone={pass(isNum(a.fitness) ? a.fitness >= fitnessBar : null)}
+          tone={figureTone('fitness', a.fitness, limits)}
         />
         <Metric
           boxed
           size="sm"
           label="Turnover"
-          hint="1%–70%"
-          value={fmt.pct(a.turnover)}
-          tone={pass(isNum(a.turnover) ? a.turnover >= 0.01 && a.turnover <= 0.7 : null)}
+          {...(turnoverLow !== undefined && turnoverHigh !== undefined
+            ? { hint: `${fmt.pct(turnoverLow, 0)}–${fmt.pct(turnoverHigh, 0)}` }
+            : {})}
+          value={CORE_METRICS.turnover.show(a.turnover)}
+          tone={figureTone('turnover', a.turnover, limits)}
         />
         <Metric
           boxed
           size="sm"
           label="Returns"
-          value={fmt.pct(a.returns)}
-          tone={isNum(a.returns) && a.returns !== 0 ? pass(a.returns > 0) : 'neutral'}
+          value={CORE_METRICS.returns.show(a.returns)}
+          tone={figureTone('returns', a.returns)}
         />
-        <Metric boxed size="sm" label="Drawdown" value={fmt.pct(a.drawdown)} />
-        <Metric boxed size="sm" label="Margin" value={fmt.bps(a.margin)} />
+        <Metric boxed size="sm" label="Drawdown" value={CORE_METRICS.drawdown.show(a.drawdown)} />
+        <Metric boxed size="sm" label="Margin" value={CORE_METRICS.margin.show(a.margin)} />
       </div>
       {isNum(a.testSharpe) && (
         <div className="grid grid-cols-3 gap-2">
@@ -244,7 +249,7 @@ function Card({
             label="Test Sharpe"
             hint="held-out years"
             value={fmt.ratio(a.testSharpe)}
-            tone={pass(a.testSharpe > 0)}
+            tone={figureTone('sharpe', a.testSharpe, limits)}
           />
         </div>
       )}
@@ -271,12 +276,6 @@ function Card({
       </div>
     </article>
   )
-}
-
-/** The limit BRAIN reported for a check, e.g. LOW_SHARPE → 1.58. */
-const limitOf = (checks: AlphaCheck[], name: string) => {
-  const limit = checks.find((c) => c.name === name)?.limit
-  return isNum(limit) ? limit : null
 }
 
 function CheckBadge({ check }: { check: AlphaCheck }) {

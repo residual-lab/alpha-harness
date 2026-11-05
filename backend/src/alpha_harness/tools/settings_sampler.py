@@ -16,18 +16,22 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from sqlalchemy import func, select
 
-from ..brain.schemas import (
+from ..brain.platform import (
+    DEFAULT_NAN_HANDLING,
+    DEFAULT_PASTEURIZATION,
+    DEFAULT_TRUNCATION,
+    GROUPING_FIELDS,
+    INSTRUMENT_TYPE,
+    MULTI_SIMULATION_SIZE,
+    RA_CHILDREN,
     REGION_AGNOSTIC_REGION,
     TEST_PERIOD,
-    SimulationRequest,
-    SimulationSettings,
 )
+from ..brain.schemas import SimulationRequest, SimulationSettings
 from ..brain.settings_schema import valid_values
 from ..db.models import StudyStatus, Trial, TrialState
-from ..engine.lifecycle import RA_CHILDREN
-from ..engine.packer import MAX_BATCH
 from ..labs import scheduler, template
-from ..labs.fastexpr import GROUPING, ParseError, data_fields, parse
+from ..labs.fastexpr import ParseError, data_fields, parse
 from ..labs.truncation import truncation_for
 
 if TYPE_CHECKING:
@@ -81,9 +85,13 @@ async def plan(
     # An override supplied stands; anything left out keeps the Alpha's own, or the platform
     # default when there is no Alpha to inherit from.
     source["decay"] = source.get("decay", 0) if decay is None else decay
-    source["truncation"] = source.get("truncation", 0.08) if truncation is None else truncation
-    source["pasteurization"] = pasteurization or source.get("pasteurization") or "ON"
-    source["nanHandling"] = nan_handling or source.get("nanHandling") or "ON"
+    source["truncation"] = (
+        source.get("truncation", DEFAULT_TRUNCATION) if truncation is None else truncation
+    )
+    source["pasteurization"] = (
+        pasteurization or source.get("pasteurization") or DEFAULT_PASTEURIZATION
+    )
+    source["nanHandling"] = nan_handling or source.get("nanHandling") or DEFAULT_NAN_HANDLING
     source["testPeriod"] = test_period or source.get("testPeriod") or TEST_PERIOD
     if not expression:
         problems.append(f"{alpha_id or 'The expression'} has no expression to re-run.")
@@ -110,7 +118,7 @@ async def plan(
         here = {
             (str(r["region"]), int(r["delay"]), str(r["universe"])): float(r["coverage"] or 0.0)
             for r in rows
-            if r["instrument_type"] == "EQUITY"
+            if r["instrument_type"] == INSTRUMENT_TYPE
         }
         if not here:
             problems.append(f"{field} is not downloaded in any market. Sync from BRAIN first.")
@@ -159,7 +167,7 @@ def _regions(
 
     out: list[dict[str, Any]] = []
     for region, delays in by_region.items():
-        market = {"instrumentType": "EQUITY", "region": region, "delay": next(iter(delays))}
+        market = {"instrumentType": INSTRUMENT_TYPE, "region": region, "delay": next(iter(delays))}
         neutralizations = [str(n) for n in valid_values(schema, "neutralization", market)]
         position = template.takes_max_position(region)
         pairs = pairs_for(position)
@@ -202,7 +210,7 @@ def simulation_cost(region: str) -> int:
 
 def batch_size(region: str) -> int:
     """How many runs one multi-simulation carries: BRAIN fails a batch of region-agnostic ones."""
-    return 1 if region == REGION_AGNOSTIC_REGION else MAX_BATCH
+    return 1 if region == REGION_AGNOSTIC_REGION else MULTI_SIMULATION_SIZE
 
 
 def _totals(regions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -227,15 +235,15 @@ def _settings(source: dict[str, Any]) -> dict[str, Any]:
         "truncation": source.get("truncation"),
         "maxTrade": source.get("maxTrade") or "OFF",
         "maxPosition": source.get("maxPosition") or "OFF",
-        "pasteurization": source.get("pasteurization") or "ON",
-        "nanHandling": source.get("nanHandling") or "ON",
+        "pasteurization": source.get("pasteurization") or DEFAULT_PASTEURIZATION,
+        "nanHandling": source.get("nanHandling") or DEFAULT_NAN_HANDLING,
         "testPeriod": source.get("testPeriod") or TEST_PERIOD,
     }
 
 
 def _grouping(placed: list[str]) -> list[str]:
     """The grouping fields among those read: shown, though BRAIN counts none as data."""
-    return [f for f in placed if f in GROUPING]
+    return [f for f in placed if f in GROUPING_FIELDS]
 
 
 def _empty(
@@ -270,13 +278,13 @@ async def _unsynced(state: Any, schema: dict[str, Any]) -> int:
     synced = {
         (str(r["region"]), int(r["delay"]), str(r["universe"]))
         for r in await state.queries.synced_tuples()
-        if r["instrument_type"] == "EQUITY"
+        if r["instrument_type"] == INSTRUMENT_TYPE
     }
-    base = {"instrumentType": "EQUITY"}
+    base = {"instrumentType": INSTRUMENT_TYPE}
     offered = {
         (str(region), int(delay), str(universe))
         for region in valid_values(schema, "region", base)
-        if region != "ALL"
+        if region != REGION_AGNOSTIC_REGION
         for delay in valid_values(schema, "delay", {**base, "region": region})
         for universe in valid_values(schema, "universe", {**base, "region": region, "delay": delay})
     }
@@ -322,9 +330,10 @@ def expand(
     """
     expression = str(source.get("expression") or "")
     decay = int(source.get("decay") or 0)
-    truncation = float(source.get("truncation") or 0.08)
-    pasteurization = str(source.get("pasteurization") or "ON")
-    nan_handling = str(source.get("nanHandling") or "ON")
+    held = source.get("truncation")
+    truncation = DEFAULT_TRUNCATION if held is None else float(held)
+    pasteurization = str(source.get("pasteurization") or DEFAULT_PASTEURIZATION)
+    nan_handling = str(source.get("nanHandling") or DEFAULT_NAN_HANDLING)
     test_period = str(source.get("testPeriod") or TEST_PERIOD)
 
     groups: dict[tuple[str, int], list[SimulationRequest]] = {}
@@ -380,8 +389,8 @@ def expand(
     full: list[tuple[SimulationRequest, ...]] = []
     tails: list[tuple[SimulationRequest, ...]] = []
     for members in groups.values():
-        for chunk in batched(members, MAX_BATCH, strict=False):
-            (full if len(chunk) == MAX_BATCH else tails).append(chunk)
+        for chunk in batched(members, MULTI_SIMULATION_SIZE, strict=False):
+            (full if len(chunk) == MULTI_SIMULATION_SIZE else tails).append(chunk)
     random.shuffle(full)
     random.shuffle(tails)
     return [request for chunk in (*full, *tails) for request in chunk]

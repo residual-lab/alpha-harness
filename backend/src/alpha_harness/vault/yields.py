@@ -22,6 +22,13 @@ from typing import TYPE_CHECKING, Any, Literal
 import structlog
 from sqlalchemy import select
 
+from ..brain.platform import (
+    IGNORED_CHECKS,
+    PLATFORM_ALPHA_URL,
+    POWER_POOL_CHECK,
+    QUOTA_CHECKS,
+    RA_MIN_PASSING_CHILDREN,
+)
 from ..brain.schemas import QUICK_MODE
 from ..db.models import SimulationRecord
 
@@ -30,51 +37,6 @@ if TYPE_CHECKING:
     from .store import AlphaVault
 
 log = structlog.get_logger(__name__)
-
-#: Checks that describe the *account's* submission quota rather than the Alpha, and are
-#: therefore not kept at all -- not stored, not read back, not shown.
-#:
-#: BRAIN attaches them to every Alpha it checks and they answer a question about the day:
-#: ``REGULAR_SUBMISSION`` fails once four Alphas have gone in, ``D0_SUBMISSION`` once the D0
-#: allowance is spent. Both reset tomorrow, so a FAIL frozen into an Alpha's row is a fact
-#: about an afternoon that outlives it -- and the Alpha reads as refused forever.
-QUOTA_CHECKS = frozenset({"REGULAR_SUBMISSION", "D0_SUBMISSION"})
-
-#: Checks that label an alpha rather than gate it. The platform reports these as ``WARNING``
-#: on every alpha checked, passing or failing, so judging them would make nothing submittable.
-#:
-#: ``PROD_CORRELATION`` gates nothing a consultant is kept from submitting, so it is excused
-#: too. ``SELF_CORRELATION`` is deliberately *not* here: an alpha too close to the pool
-#: genuinely cannot be submitted, and excusing it would hide the signal that should
-#: reallocate cores.
-IGNORED_CHECKS = frozenset(
-    {
-        "PROD_CORRELATION",
-        "MATCHES_COMPETITION",
-        "MATCHES_PYRAMID",
-        "MATCHES_THEMES",
-        "CLUSTER_TEST",
-        "OSMOSIS_ALLOCATION",
-        "POWER_POOL_DESCRIPTION_LENGTH",
-        "POWER_POOL_DESCRIPTION_FORMAT",
-    }
-)
-
-#: BRAIN attaches this check to an Alpha it considers Power Pool eligible, and to no other.
-#: Being Power Pool is independent of being submittable: an Alpha can carry this and still
-#: FAIL a regular threshold, which is the usual case for a Sharpe between Power Pool's 1.0
-#: and the region's own bar.
-#:
-#: The check itself sits at ``PENDING`` until BRAIN is asked to run it, so its *presence* is
-#: the signal and its result is not. Measured on a consultant's vault: it separates 2,553 of
-#: 29,753 Alphas and agrees with the ``Power Pool Alpha`` classification on every submitted
-#: one. The classification cannot stand in for it, because BRAIN assigns that only after
-#: submission -- no unsubmitted Alpha carries it.
-#:
-#: Being Power Pool is independent of being submittable, so this never enters :func:`verdict`.
-#: An Alpha whose Sharpe clears Power Pool's 1.0 but not its region's own bar carries this
-#: check *and* a ``LOW_SHARPE`` FAIL: 49 of one sweep's 279 Power Pool Alphas, measured.
-POWER_POOL_CHECK = "POWER_POOL_CORRELATION"
 
 
 def is_power_pool(checks: list[dict[str, Any]]) -> bool:
@@ -118,12 +80,53 @@ def checks_of(checks_json: str | None) -> list[dict[str, Any]]:
     return without_quota_checks([c for c in checks if isinstance(c, dict)])
 
 
+#: The checks a figure is judged against, by the limit each one names for this Alpha.
+LIMITED_CHECKS = ("LOW_SHARPE", "LOW_FITNESS", "LOW_TURNOVER", "HIGH_TURNOVER")
+
+
+def limits_of(checks: list[dict[str, Any]]) -> dict[str, float]:
+    """The limits BRAIN set this Alpha's figures, by check name. Read off its own checks, not
+    a table: they differ by region, delay, universe and the account."""
+    return {
+        str(c["name"]): float(limit)
+        for c in checks
+        if c.get("name") in LIMITED_CHECKS
+        and isinstance(limit := c.get("limit"), int | float)
+        and not isinstance(limit, bool)
+    }
+
+
 def gating_results(checks: list[dict[str, Any]]) -> set[str]:
     """The results of the checks that decide anything: every one but :data:`IGNORED_CHECKS`."""
     return {
         str(c.get("result", "")).upper()
         for c in checks
         if str(c.get("name", "")).upper() not in IGNORED_CHECKS
+    }
+
+
+def children_check(children: list[dict[str, Any]]) -> dict[str, Any]:
+    """A region-agnostic parent judged as BRAIN judges it, as one check: ``PASS`` once two
+    children pass every check, ``PENDING`` while two still could, ``FAIL`` otherwise.
+
+    The parent's own checks cannot say: it is simulated with none that decide anything, and
+    the submitted Alpha's listing carries only labels.
+    """
+    verdicts = [verdict(checks_of(c.get("checks")), c.get("simulation_mode")) for c in children]
+    passing = sum(v == "submittable" for v in verdicts)
+    possible = passing + sum(v == "pending" for v in verdicts)
+    result = (
+        "PASS"
+        if passing >= RA_MIN_PASSING_CHILDREN
+        else "PENDING"
+        if possible >= RA_MIN_PASSING_CHILDREN
+        else "FAIL"
+    )
+    return {
+        "name": "MIN_SUBMITTABLE_CHILDREN",
+        "result": result,
+        "value": passing,
+        "limit": RA_MIN_PASSING_CHILDREN,
     }
 
 
@@ -331,14 +334,6 @@ FIXABLE_CHECKS = frozenset(
     }
 )
 
-#: Where an alpha lives on the platform. The consultant submits it there, never here.
-#:
-#: Singular. ``/alphas/:id`` in the router's table is the *list* and its ``:id`` is a tab --
-#: ``/alphas/unsubmitted``, ``/alphas/lists`` -- not an Alpha. A "does not exist or belongs to
-#: another user" from this link means BRAIN no longer keeps that simulation: it retains the
-#: last 10,000, and an account past that loses the oldest.
-PLATFORM_ALPHA_URL = "https://platform.worldquantbrain.com/alpha/"
-
 #: Points in a sparkline. More than this is invisible at the size it is drawn.
 SPARK_POINTS = 120
 
@@ -356,15 +351,23 @@ async def _tally(alphas: AlphaVault, where: str, params: list[Any]) -> tuple[lis
     Judged by :func:`verdict`. A near miss is one or two fixable failures and nothing else
     wrong.
     """
-    keys = await alphas.catalog.query(
+    # Arrow, not a dict per row: this reads every Alpha on every request.
+    table = await alphas.catalog.arrow(
         f"SELECT a.alpha_id, hash(a.checks) AS h, a.simulation_mode FROM alpha a WHERE {where}",  # noqa: S608
         params,
     )
+    keys = list(
+        zip(
+            table.column("alpha_id").to_pylist(),
+            table.column("h").to_pylist(),
+            table.column("simulation_mode").to_pylist(),
+            strict=True,
+        )
+    )
     stale = [
-        str(k["alpha_id"])
-        for k in keys
-        if (seen := _JUDGED.get(str(k["alpha_id"]))) is None
-        or seen[0] != (k["h"], k["simulation_mode"])
+        alpha_id
+        for alpha_id, h, mode in keys
+        if (seen := _JUDGED.get(alpha_id)) is None or seen[0] != (h, mode)
     ]
     columns = "a.alpha_id, a.checks, a.simulation_mode, hash(a.checks) AS h"
     if len(stale) > _RESCAN:
@@ -382,13 +385,13 @@ async def _tally(alphas: AlphaVault, where: str, params: list[Any]) -> tuple[lis
 
     ready: list[str] = []
     pending = near = 0
-    for k in keys:
+    for alpha_id, _, _ in keys:
         # Absent only if the Alpha was deleted between the two reads.
-        if (judged := _JUDGED.get(str(k["alpha_id"]))) is None:
+        if (judged := _JUDGED.get(alpha_id)) is None:
             continue
         _, found, is_near = judged
         if found == "submittable":
-            ready.append(str(k["alpha_id"]))
+            ready.append(alpha_id)
         elif found == "pending":
             pending += 1
         near += is_near

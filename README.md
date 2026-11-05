@@ -1,4 +1,6 @@
-# Alpha Harness
+<p align="center">
+  <img src=".github/banner.png" alt="Alpha Harness" width="1280" />
+</p>
 
 <a href="https://www.star-history.com/?repos=residual-lab%2Falpha-harness&type=date&legend=bottom-right">
  <picture>

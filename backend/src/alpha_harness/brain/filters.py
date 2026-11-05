@@ -22,8 +22,10 @@ from typing import Any, Literal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from .platform import PLATFORM_TIMEZONE
+
 #: Where the platform's calendar lives, for both quota and date filters.
-PLATFORM_TZ = ZoneInfo("America/New_York")
+PLATFORM_TZ = ZoneInfo(PLATFORM_TIMEZONE)
 
 
 def platform_midnight() -> datetime:
@@ -69,7 +71,7 @@ class AlphaQuery:
 
     #: Tri-state on purpose. ``False`` excludes hidden alphas, ``True`` returns only
     #: hidden ones, and ``None`` means "do not filter" — which the platform does *not*
-    #: default to, so it has to be sent explicitly.
+    #: default to, so it is sent as both values.
     hidden: bool | None = False
 
     #: Convenience bounds, normalised to the platform's calendar.
@@ -84,7 +86,9 @@ class AlphaQuery:
 
         tokens.extend(entry.token() for entry in self.filters or [])
 
-        if self.hidden is not None:
+        if self.hidden is None:
+            tokens.append("hidden=true%1Ffalse")
+        else:
             tokens.append(f"hidden={'true' if self.hidden else 'false'}")
 
         if self.created_after is not None:

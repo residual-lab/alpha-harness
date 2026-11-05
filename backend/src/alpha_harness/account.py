@@ -57,6 +57,9 @@ class AuthService:
         #: One session change at a time: a UI sign-in, a silent re-login and a status
         #: refresh would otherwise overwrite each other, leaving the loser's credential current.
         self._lock = asyncio.Lock()
+        #: The login typed for a sign-in BRAIN paused for an identity check. Stored once the
+        #: check is done (:meth:`verify`), since BRAIN has not accepted it before then.
+        self._unverified: tuple[str, str] | None = None
 
     @property
     def session(self) -> SessionInfo:
@@ -111,6 +114,19 @@ class AuthService:
             credential = await _current_credential(session)
             return credential.email if credential else None
 
+    async def can_sign_in_silently(self) -> bool:
+        """Whether there is a stored login the app may use by itself."""
+        async with self.db.session() as session:
+            credential = await _current_credential(session)
+            return credential is not None and credential.silent_off_at is None
+
+    async def _silence(self) -> None:
+        """Stop signing in with the stored login by itself, until the person signs in."""
+        async with self.db.session() as session:
+            credential = await _current_credential(session)
+            if credential is not None:
+                credential.silent_off_at = utcnow()
+
     # -- session ---------------------------------------------------------
 
     async def restore(self) -> SessionInfo:
@@ -127,9 +143,18 @@ class AuthService:
         await self._warm_operators()
         return restored
 
-    async def login(self, email: str | None = None, password: str | None = None) -> SessionInfo:
-        """Sign in, storing the credential if it was supplied here and accepted."""
+    async def login(
+        self, email: str | None = None, password: str | None = None, *, silent: bool = False
+    ) -> SessionInfo:
+        """Sign in, storing the credential if it was supplied here and accepted.
+
+        ``silent`` is the app signing in by itself, which a refused login or Sign out turns
+        off (:meth:`can_sign_in_silently`); checked here too, under the lock, so a Sign out
+        that lands first wins.
+        """
         async with self._lock:
+            if silent and not await self.can_sign_in_silently():
+                return self._session
             supplied = bool(email and password)
             if not supplied:
                 credential = await self.get_credential()
@@ -152,7 +177,12 @@ class AuthService:
             if info is None or not info.authenticated:
                 info = await self.auth.login(email, password)
             self._session = info
+            if info.inquiry and supplied:
+                self._unverified = (email, password)
+            elif info.refused and not supplied:
+                await self._silence()
             if info.authenticated:
+                self._unverified = None
                 # Stored only once BRAIN accepts it: a mistyped password must not become the
                 # credential that silent re-login keeps retrying.
                 if supplied:
@@ -187,8 +217,13 @@ class AuthService:
             self._user_profile = None
             self._session = info
             if info.authenticated:
-                # No credential to store: the sign-in that started this never got far enough
-                # to have one accepted, and the cookie jar is what carries the session now.
+                # The login typed for this sign-in, accepted now that the check is done. Filed
+                # before the cookies, which are kept under the most recent sign-in's login.
+                if self._unverified is not None:
+                    email, password = self._unverified
+                    self._unverified = None
+                    await self.store_credential(email, password)
+                    await self._touch_last_login(email)
                 await self._save_cookies()
                 await self.get_user_profile()
                 await self._warm_operators()
@@ -218,6 +253,8 @@ class AuthService:
     async def logout(self) -> None:
         async with self._lock:
             self._user_profile = None
+            # First, so the stored login stays unused even when BRAIN cannot be told.
+            await self._silence()
             await self.endpoints.logout()
             await self._clear_cookies()
             self._session = SessionInfo.anonymous()
@@ -283,6 +320,8 @@ class AuthService:
             credential = await session.scalar(select(Credential).where(Credential.email == email))
             if credential is not None:
                 credential.last_login_at = utcnow()
+                # A sign-in that worked: the app may use this login by itself again.
+                credential.silent_off_at = None
 
 
 #: How long BRAIN's settings schema is trusted before it is read again.

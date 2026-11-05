@@ -10,26 +10,33 @@
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useNavigate, useSearch } from '@tanstack/react-router'
+import { PencilIcon } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { today } from '@/api/core'
+import {
+  DEFAULT_TRUNCATION,
+  MULTI_SIMULATION_SIZE,
+  RA_CHILDREN,
+  REGION_AGNOSTIC_REGION,
+  TEST_PERIOD_YEARS,
+} from '@/api/platform'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { neutralizationLabel, splitNeutralizations } from '@/lib/neutralization'
 import { useCores } from '@/lib/preferences'
-import {
-  DEFAULT_SCOPE,
-  marketKey,
-  REGION_AGNOSTIC,
-  regionLabel,
-  useScopeOptions,
-} from '@/lib/scope'
+import { DEFAULT_SCOPE, marketKey, regionLabel, useScopeOptions } from '@/lib/scope'
 import { useDebounced } from '@/lib/use-debounced'
+import { alphaIdOf } from '@/screens/pool/api'
+import { AstInspector } from '@/screens/pool/shared'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
-import { SimulationSettingsFields, testPeriodOf } from '@/screens/research-labs/simulation-settings'
+import {
+  SimulationSettingsFields,
+  testPeriodOf,
+  truncationOf,
+} from '@/screens/research-labs/simulation-settings'
 import { templateLab } from '@/screens/research-labs/template/api'
 import { TemplateEditor } from '@/screens/research-labs/template/editor'
 import { Facts } from '@/screens/research-labs/template/gallery'
-import { useMarketScope } from '@/screens/research-labs/template/index'
 import {
   Button,
   Empty,
@@ -46,6 +53,7 @@ import {
   Skeleton,
   Switch,
 } from '@/ui/kit'
+import { Tile, ToggleTitle } from '@/ui/tile'
 import {
   type Holding,
   type MarketPick,
@@ -58,8 +66,7 @@ import {
 
 /** A multi-simulation carries at most ten children, all sharing region and delay. BRAIN fails
  *  a batch of region-agnostic ones, so those go one at a time. */
-const BATCH = 10
-const batchOf = (region: string) => (region === REGION_AGNOSTIC ? 1 : BATCH)
+const batchOf = (region: string) => (region === REGION_AGNOSTIC_REGION ? 1 : MULTI_SIMULATION_SIZE)
 
 /** A plain expression has no template variables; held once so the editor never relints for them. */
 const NO_PRESETS: Record<string, string> = {}
@@ -68,7 +75,7 @@ const NO_INFOS = new Map()
 const NO_PROBLEMS: string[] = []
 
 const REGION_AGNOSTIC_NOTE =
-  'Region Agnostic: each Simulation runs in every Region its Fields reach and uses 4 of the ' +
+  `Region Agnostic: each Simulation runs in every Region its Fields reach and uses ${RA_CHILDREN} of the ` +
   "day's simulations. Not chosen until you tick it."
 
 const pairKey = (p: Pair) => `${p.maxTrade}|${p.maxPosition}`
@@ -128,7 +135,7 @@ function defaults(plan: SettingsPlan) {
   return {
     chosen: new Set(
       allMarkets(plan)
-        .filter((m) => m.region !== REGION_AGNOSTIC)
+        .filter((m) => m.region !== REGION_AGNOSTIC_REGION)
         .map(marketKey),
     ),
     neutralizations: [...new Set(plan.regions.flatMap((r) => r.neutralizations))],
@@ -306,71 +313,6 @@ function GroupChip({
 }
 
 /** One setting in a box of its own: its name and shortcuts on top, its choices below. */
-/**
- * A heading that picks its whole section: clears it when anything in it is on, fills it when
- * it is empty.
- */
-function ToggleTitle({
-  label,
-  any,
-  onToggle,
-  className,
-}: {
-  label: string
-  any: boolean
-  onToggle: () => void
-  className?: string
-}) {
-  return (
-    <button
-      type="button"
-      aria-pressed={any}
-      title={any ? `Clear all ${label}` : `Choose all ${label}`}
-      onClick={onToggle}
-      className={cn(
-        'cursor-pointer whitespace-nowrap underline-offset-4 transition-colors hover:text-ink hover:underline',
-        className,
-      )}
-    >
-      {label}
-    </button>
-  )
-}
-
-function Tile({
-  label,
-  actions,
-  children,
-  className,
-  any,
-  onToggle,
-}: {
-  label: string
-  actions?: ReactNode
-  children: ReactNode
-  className?: string
-  /** With `onToggle`, the heading picks the whole section. */
-  any?: boolean
-  onToggle?: () => void
-}) {
-  return (
-    <section
-      className={cn(
-        'flex min-w-0 flex-col gap-2.5 rounded-md border border-hairline-strong bg-surface-2 p-3',
-        className,
-      )}
-    >
-      <header className="flex min-h-6 items-center justify-between gap-3">
-        <h4 className="text-body-compact font-medium whitespace-nowrap text-ink-muted">
-          {onToggle ? <ToggleTitle label={label} any={any ?? false} onToggle={onToggle} /> : label}
-        </h4>
-        {actions && <div className="flex shrink-0 items-center gap-1">{actions}</div>}
-      </header>
-      {children}
-    </section>
-  )
-}
-
 /** Choices sharing the full width evenly, `columns` to a line; scrolls rather than squeezes. */
 function Spread({
   columns,
@@ -428,7 +370,9 @@ function Tree({
                   label={<span className="font-medium">{regionLabel(branch.region)}</span>}
                   group={branch.group}
                   onChange={onChange}
-                  title={branch.region === REGION_AGNOSTIC ? REGION_AGNOSTIC_NOTE : undefined}
+                  title={
+                    branch.region === REGION_AGNOSTIC_REGION ? REGION_AGNOSTIC_NOTE : undefined
+                  }
                 />
               </div>
               <span />
@@ -490,8 +434,6 @@ export function SettingsSamplerScreen() {
     staleTime: 5 * 60_000,
   })
   const reference = useMemo(() => operators.data?.reference ?? [], [operators.data])
-  // USA D1 holds the most fields, so its catalog answers field completions and hovers.
-  const scope = useMarketScope('USA', 1) ?? null
   // Counted as it is typed, so Power Pool's limits and the dataset count are never a guess.
   const sizing = useDebounced(expression.trim(), 300)
   const sized = useQuery({
@@ -506,10 +448,10 @@ export function SettingsSamplerScreen() {
     placeholderData: keepPreviousData,
   })
   const [decay, setDecay] = useState('0')
-  const [truncation, setTruncation] = useState('0.08')
+  const [truncation, setTruncation] = useState(String(DEFAULT_TRUNCATION))
   const [pasteurization, setPasteurization] = useState<'ON' | 'OFF'>('ON')
   const [nanHandling, setNanHandling] = useState<'ON' | 'OFF'>('ON')
-  const [testYears, setTestYears] = useState('2')
+  const [testYears, setTestYears] = useState(String(TEST_PERIOD_YEARS))
   const [testMonths, setTestMonths] = useState('0')
   /** The expression last analysed; the draft above only counts once Analyse is pressed. */
   const [typed, setTyped] = useState<Source | null>(null)
@@ -529,7 +471,7 @@ export function SettingsSamplerScreen() {
 
   const holding: Holding = {
     decay: Math.max(0, Math.round(Number(decay) || 0)),
-    truncation: Number(truncation) || 0.08,
+    truncation: truncationOf(truncation) ?? DEFAULT_TRUNCATION,
     pasteurization,
     nanHandling,
     testPeriod: testPeriodOf(testYears, testMonths),
@@ -544,23 +486,22 @@ export function SettingsSamplerScreen() {
   const plan = query.data
   const cores = Math.min(wantedCores, plan?.maxCores ?? wantedCores)
 
-  // An Alpha is only a way in: its expression and settings are copied into the Expression tab,
-  // which the sweep then runs like any other.
+  // An Alpha's expression and settings are copied into the Expression tab to adjust. Until the
+  // expression itself is edited and analysed, the sweep still runs the Alpha: the task stays
+  // named for it, and the address keeps it, so a reload opens it again.
   useEffect(() => {
     if (!plan?.alphaId || !plan.expression) return
     const own = plan.settings
     setExpression(plan.expression)
     setDecay(String(own.decay ?? 0))
-    setTruncation(String(own.truncation ?? 0.08))
+    setTruncation(String(own.truncation ?? DEFAULT_TRUNCATION))
     setPasteurization(own.pasteurization === 'OFF' ? 'OFF' : 'ON')
     setNanHandling(own.nanHandling === 'OFF' ? 'OFF' : 'ON')
     const period = /^P(\d+)Y(\d+)M/.exec(own.testPeriod ?? '')
-    setTestYears(period?.[1] ?? '2')
+    setTestYears(period?.[1] ?? String(TEST_PERIOD_YEARS))
     setTestMonths(period?.[2] ?? '0')
-    setTyped({ expression: plan.expression })
-    setMode('expression')
-    void navigate({ to: '/tools/settings-sampler', search: { alpha: undefined }, replace: true })
-  }, [plan, navigate])
+    setTyped({ alphaId: plan.alphaId })
+  }, [plan])
 
   const reset = (from: SettingsPlan) => {
     const start = defaults(from)
@@ -719,7 +660,16 @@ export function SettingsSamplerScreen() {
   const analyse = (event: React.FormEvent) => {
     event.preventDefault()
     if (mode === 'expression') {
-      setTyped({ expression: expression.trim() })
+      const text = expression.trim()
+      // Analysed unchanged, it is still the Alpha; changed, it is an expression of its own.
+      if (typed && 'alphaId' in typed && text === plan?.expression) return
+      setTyped({ expression: text })
+      if (alphaId)
+        void navigate({
+          to: '/tools/settings-sampler',
+          search: { alpha: undefined },
+          replace: true,
+        })
       return
     }
     const next = draft.trim()
@@ -730,12 +680,25 @@ export function SettingsSamplerScreen() {
     })
   }
 
+  // The sweep runs what was last analysed, so an edit since then must be analysed first.
+  const analysed = typed && ('expression' in typed ? typed.expression : plan?.expression)
+  const edited = mode === 'expression' && analysed != null && analysed !== expression.trim()
+  // Said on the Truncation box itself.
+  const badTruncation = !truncationAgent && truncationOf(truncation) === null
+
   return (
     <Page>
       <PageHeader
+        sticky
         title="Settings Sampler"
         description="Run an expression everywhere BRAIN accepts it"
-        actions={<AddTaskButtons add={add} disabled={simulations === 0} />}
+        actions={
+          <AddTaskButtons
+            add={add}
+            disabled={simulations === 0 || edited || badTruncation}
+            blocked={edited ? 'Edited since the last Analyse: Analyse again.' : null}
+          />
+        }
       />
 
       <Panel
@@ -747,7 +710,7 @@ export function SettingsSamplerScreen() {
             <Field label="Alpha ID" className="min-w-48 flex-1">
               <Input
                 value={draft}
-                onChange={(e) => setDraft(e.target.value)}
+                onChange={(e) => setDraft(alphaIdOf(e.target.value))}
                 spellCheck={false}
                 className="num"
               />
@@ -755,6 +718,20 @@ export function SettingsSamplerScreen() {
             <Button type="submit" variant="primary" disabled={!draft.trim()}>
               Analyse
             </Button>
+            {plan?.alphaId && plan.expression && (
+              <div className="flex w-full flex-col gap-2">
+                <AstInspector expression={plan.expression} />
+                <Button
+                  type="button"
+                  size="sm"
+                  className="self-start"
+                  onClick={() => setMode('expression')}
+                >
+                  <PencilIcon />
+                  Edit Expression
+                </Button>
+              </div>
+            )}
           </form>
         ) : (
           <form onSubmit={analyse} className="flex flex-col gap-3">
@@ -768,7 +745,6 @@ export function SettingsSamplerScreen() {
                 variables={NO_VARIABLES}
                 infos={NO_INFOS}
                 problems={NO_PROBLEMS}
-                scope={scope}
               />
             </Fieldset>
             <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
@@ -776,6 +752,11 @@ export function SettingsSamplerScreen() {
                 Analyse
               </Button>
               {expression.trim() && <Facts stats={sized.data?.stats[0]} />}
+              {edited && (
+                <p className="text-body-compact text-ink-subtle">
+                  Edited since the last Analyse. Analyse again to sweep this expression.
+                </p>
+              )}
             </div>
           </form>
         )}
@@ -930,7 +911,9 @@ export function SettingsSamplerScreen() {
                       label={axis.value}
                       group={axis.group}
                       onChange={change}
-                      title={axis.value === REGION_AGNOSTIC ? REGION_AGNOSTIC_NOTE : undefined}
+                      title={
+                        axis.value === REGION_AGNOSTIC_REGION ? REGION_AGNOSTIC_NOTE : undefined
+                      }
                       className="w-full justify-center"
                     />
                   ))}

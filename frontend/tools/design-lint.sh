@@ -36,3 +36,6 @@ pnpm --silent --dir frontend exec design.md lint --format=json "$target" | node 
     }
   })
 '
+
+# The APCA floors themselves, measured from this file's own colours and Floors table.
+node frontend/tools/contrast.ts "$target"

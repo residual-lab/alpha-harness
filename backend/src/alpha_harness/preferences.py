@@ -43,6 +43,9 @@ class Preferences(Out):
     update_check_hours: Literal[0, 1, 6, 24] = 1
     #: Install a new release by itself, once nothing is simulating.
     auto_update: bool = True
+    #: The model that writes Power Pool descriptions, as ``provider:model``; unset, the set-up
+    #: model with the largest daily allowance.
+    description_model: str | None = None
 
 
 async def load(db: Database) -> Preferences:

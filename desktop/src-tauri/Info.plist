@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- BRAIN's identity check takes a selfie in its window; macOS refuses the camera without this. -->
+  <key>NSCameraUsageDescription</key>
+  <string>BRAIN's identity check needs the camera to confirm it is you.</string>
+</dict>
+</plist>

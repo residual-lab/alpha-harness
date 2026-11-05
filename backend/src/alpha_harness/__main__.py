@@ -47,9 +47,15 @@ async def _serve() -> str | None:
     # uvicorn exposes readiness only as the ``started`` flag, never an event.
     while not server.started and not serving.done():  # noqa: ASYNC110
         await asyncio.sleep(0.1)
-    # Straight after an update the page that asked for it reloads onto this one by itself.
-    if server.started and not (updates.page_reloads() and await _page_returns(app)):
-        open_window(f"http://{HOST}:{PORT}")
+    if server.started:
+        updates.served()
+        # Taken on every start, so a desktop window's update never leaves it for a later one.
+        reloads = updates.page_reloads()
+        # Straight after an update the page that asked for it reloads onto this one by itself.
+        if not os.environ.get(updates.SHELL_VARIABLE) and not (
+            reloads and await _page_returns(app)
+        ):
+            open_window(f"http://{HOST}:{PORT}")
     await serving
     if watching is not None:
         watching.cancel()

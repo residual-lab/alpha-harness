@@ -20,14 +20,16 @@ interface Pick<From, Extra> {
   active: boolean
   scope: Scope | null
   ids: string[]
+  /** What was ticked in each region and delay this pick has been to, so going back keeps it. */
+  byMarket: Record<string, string[]>
   from: From
   result: PickResult<From, Extra> | null
   start: (scope: Scope, ids: string[], from: From) => void
   finish: (extra?: Extra) => void
   cancel: () => void
   /**
-   * Moves the pick to `scope`. What was picked belongs to a region and delay, so only a
-   * universe change keeps it.
+   * Moves the pick to `scope`. What was picked belongs to a region and delay, so another one
+   * starts from what was ticked there before, if anything.
    */
   follow: (scope: Scope) => void
   /** The finished pick, once, and only for the lab that started it. */
@@ -42,23 +44,32 @@ export function createPick<From extends string, Extra = never>(name: string, fir
         active: false,
         scope: null,
         ids: [],
+        byMarket: {},
         from: first,
         result: null,
-        start: (scope, ids, from) => set({ active: true, scope, ids, from, result: null }),
+        start: (scope, ids, from) =>
+          set({ active: true, scope, ids, byMarket: {}, from, result: null }),
         finish: (extra) => {
           const { scope, ids, from } = get()
           set({
             active: false,
             scope: null,
             ids: [],
+            byMarket: {},
             result: scope ? { scope, ids, from, extra } : null,
           })
         },
-        cancel: () => set({ active: false, scope: null, ids: [], result: null }),
+        cancel: () => set({ active: false, scope: null, ids: [], byMarket: {}, result: null }),
         follow: (scope) => {
-          const { scope: current, ids } = get()
-          const moved = !current || current.region !== scope.region || current.delay !== scope.delay
-          set({ scope, ids: moved ? [] : ids })
+          const { scope: current, ids, byMarket } = get()
+          const market = `${scope.region}|${scope.delay}`
+          const left = current && `${current.region}|${current.delay}`
+          if (left === market) {
+            set({ scope })
+            return
+          }
+          const kept = left ? { ...byMarket, [left]: ids } : byMarket
+          set({ scope, ids: kept[market] ?? [], byMarket: kept })
         },
         take: (from) => {
           const result = get().result

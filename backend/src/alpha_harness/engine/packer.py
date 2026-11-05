@@ -15,15 +15,12 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ..brain.platform import GLB_REGION, GLB_SLOTS, INSTRUMENT_TYPE, MULTI_SIMULATION_SIZE, RA_SLOTS
 from ..brain.schemas import FULL_MODE, SimulationType
-from .lifecycle import GLB_REGION, GLB_SLOTS, RA_SLOTS
 from .reconcile import same_value, squash
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-#: A multi-simulation may carry at most this many children.
-MAX_BATCH = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +76,7 @@ class BatchKey:
         # and the task's cores (at most three) are what bounds them.
         if self.region_agnostic or self.sim_type == SimulationType.SUPER:
             return 1
-        return MAX_BATCH
+        return MULTI_SIMULATION_SIZE
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +107,7 @@ def key_of(payload: dict[str, Any]) -> BatchKey:
     settings = payload.get("settings") or {}
     return BatchKey(
         sim_type=str(payload.get("type", "REGULAR")),
-        instrument_type=str(settings.get("instrumentType", "EQUITY")),
+        instrument_type=str(settings.get("instrumentType", INSTRUMENT_TYPE)),
         region=str(settings.get("region", "")),
         delay=int(settings.get("delay", 1)),
         language=str(settings.get("language", "FASTEXPR")),
@@ -122,7 +119,7 @@ def pack(
     items: Sequence[WorkItem],
     *,
     free_slots: int,
-    max_batch: int = MAX_BATCH,
+    max_batch: int = MULTI_SIMULATION_SIZE,
     task_capacity: dict[str, int] | None = None,
 ) -> list[Batch]:
     """Choose what to submit next.
@@ -132,8 +129,8 @@ def pack(
     core is one ordinary simulation; a GLB one costs two and a region-agnostic one three, and
     the latter never shares a batch (see :attr:`BatchKey.cost` and :attr:`BatchKey.max_batch`).
 
-    ``task_capacity`` caps how many batches each named task may open in this round; a task
-    absent from the mapping is unconstrained. A batch belongs to the task that opened it,
+    ``task_capacity`` caps the cores each named task may take in this round; a task absent
+    from the mapping is unconstrained. A batch belongs to the task that opened it,
     which holds its core. Seats it leaves empty go to other tasks' simulations that share its
     key, oldest first: they ride in a core already held, so no task holds more cores than it
     was given, and each keeps its own task, so its result is still scored where it belongs.
@@ -184,9 +181,9 @@ def pack(
         if taken + key.cost > free_slots:
             continue
         if task in remaining:
-            if remaining[task] <= 0:
+            if remaining[task] < key.cost:
                 continue
-            remaining[task] -= 1
+            remaining[task] -= key.cost
         opened.append((task, key, members))
         taken += key.cost
 
@@ -209,7 +206,7 @@ def allocate_slots(
 ) -> dict[str, int]:
     """Divide free slots between tasks that want them.
 
-    ``demand`` is how many batches each task could fill right now, ``quotas`` the
+    ``demand`` is how many cores each task's queued work could fill right now, ``quotas`` the
     configured ceiling on *concurrent* slots per task, and ``in_flight`` how many each
     already holds. A task with no quota is unconstrained.
 
@@ -271,7 +268,7 @@ def _round_robin(allocation: dict[str, int], headroom: dict[str, int], free: int
 
 
 def demand_by_task(items: Sequence[WorkItem], max_batch: int) -> dict[str, int]:
-    """How many batches each task could fill right now."""
+    """How many cores each task's queued work could fill right now."""
     counts: dict[tuple[str, BatchKey], int] = defaultdict(int)
     for item in items:
         counts[(item.task, item.key)] += 1
@@ -279,7 +276,7 @@ def demand_by_task(items: Sequence[WorkItem], max_batch: int) -> dict[str, int]:
     demand: dict[str, int] = defaultdict(int)
     for (task, key), n in counts.items():
         size = min(max_batch, key.max_batch)
-        demand[task] += -(-n // size)  # ceiling division
+        demand[task] += -(-n // size) * key.cost  # ceiling division
     return dict(demand)
 
 

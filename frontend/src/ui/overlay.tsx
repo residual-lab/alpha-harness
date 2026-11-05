@@ -9,14 +9,16 @@ import { Dialog as BDialog } from '@base-ui/react/dialog'
 import { Menu as BMenu } from '@base-ui/react/menu'
 import { Select as BSelect } from '@base-ui/react/select'
 import { Tooltip as BTooltip } from '@base-ui/react/tooltip'
-import { CheckIcon, ChevronDownIcon, XIcon } from 'lucide-react'
-import type { ReactElement, ReactNode, RefObject } from 'react'
+import { CheckIcon, ChevronDownIcon, ChevronUpIcon, XIcon } from 'lucide-react'
+import { type ReactElement, type ReactNode, type RefObject, useEffect } from 'react'
 import { cn } from '@/lib/cn'
 import type { Choice } from '@/lib/scope'
 import { Button } from './kit'
 
 /** Behind every modal: the page dims and blurs, so what floats is the only thing in focus. */
 export const BACKDROP = 'fixed inset-0 z-50 bg-black/60 backdrop-blur-sm'
+/** Lighter, and unblurred: a sheet is read against the table it was opened from. */
+const SHEET_BACKDROP = 'fixed inset-0 z-50 bg-black/25'
 
 interface DialogProps {
   open: boolean
@@ -25,6 +27,8 @@ interface DialogProps {
   description?: ReactNode
   children?: ReactNode
   footer?: ReactNode
+  /** Buttons beside Close in the header. */
+  actions?: ReactNode
   className?: string
   /**
    * Where to portal to. Needed only inside an element in fullscreen: the browser renders
@@ -39,6 +43,7 @@ function Frame({
   description,
   children,
   footer,
+  actions,
 }: Omit<DialogProps, 'open' | 'onOpenChange' | 'className'>) {
   return (
     <>
@@ -51,9 +56,12 @@ function Frame({
             </BDialog.Description>
           )}
         </div>
-        <BDialog.Close render={<Button variant="ghost" size="icon-sm" aria-label="Close" />}>
-          <XIcon />
-        </BDialog.Close>
+        <div className="flex shrink-0 items-center gap-1">
+          {actions}
+          <BDialog.Close render={<Button variant="ghost" size="icon-sm" aria-label="Close" />}>
+            <XIcon />
+          </BDialog.Close>
+        </div>
       </div>
       <div className="min-h-0 flex-1 overflow-auto p-4">{children}</div>
       {footer && (
@@ -88,7 +96,7 @@ export function Sheet({ open, onOpenChange, className, container, ...frame }: Di
   return (
     <BDialog.Root open={open} onOpenChange={(next) => onOpenChange(next)}>
       <BDialog.Portal container={container}>
-        <BDialog.Backdrop className={BACKDROP} />
+        <BDialog.Backdrop className={SHEET_BACKDROP} />
         <BDialog.Popup
           className={cn(
             'fixed inset-y-0 right-0 z-50 flex w-full max-w-2xl flex-col border-l border-hairline-strong bg-surface-1 shadow-float outline-none',
@@ -99,6 +107,73 @@ export function Sheet({ open, onOpenChange, className, container, ...frame }: Di
         </BDialog.Popup>
       </BDialog.Portal>
     </BDialog.Root>
+  )
+}
+
+/**
+ * Previous and next for a sheet opened from a table's rows, `ids` in the order shown: on the
+ * buttons, and on K and J as in a mail list (not while typing or in a menu, where they are letters).
+ */
+export function SheetSteps({
+  ids,
+  id,
+  onStep,
+  noun,
+}: {
+  ids: string[]
+  id: string | null
+  onStep: (id: string) => void
+  noun: string
+}) {
+  const at = id === null ? -1 : ids.indexOf(id)
+  const previous = at > 0 ? ids[at - 1] : undefined
+  const next = at >= 0 ? ids[at + 1] : undefined
+  useEffect(() => {
+    if (at < 0) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return
+      const target = event.target as HTMLElement | null
+      // Nor inside an open menu or list, where a letter jumps to the item it starts.
+      if (
+        target?.closest(
+          'input, textarea, select, [contenteditable="true"], [role="menu"], [role="listbox"], [role="combobox"]',
+        )
+      )
+        return
+      const to = event.key === 'j' ? next : event.key === 'k' ? previous : undefined
+      if (to) onStep(to)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [at, next, previous, onStep])
+
+  if (at < 0 || ids.length < 2) return null
+  return (
+    <>
+      <span className="num px-1 text-body-compact text-ink-subtle">
+        {at + 1} / {ids.length}
+      </span>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        aria-label={`Previous ${noun} (K)`}
+        title={`Previous ${noun} (K)`}
+        disabled={!previous}
+        onClick={() => previous && onStep(previous)}
+      >
+        <ChevronUpIcon />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        aria-label={`Next ${noun} (J)`}
+        title={`Next ${noun} (J)`}
+        disabled={!next}
+        onClick={() => next && onStep(next)}
+      >
+        <ChevronDownIcon />
+      </Button>
+    </>
   )
 }
 

@@ -12,7 +12,7 @@ import structlog
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from ..brain.schemas import TEST_PERIOD
+from ..brain.platform import INSTRUMENT_TYPE, TEST_PERIOD
 from ..db.models import Trial, TrialState, utcnow
 from ..labs import ga, scheduler, search
 from ..labs.launch import (
@@ -95,6 +95,8 @@ class SeedRow(Out):
     drawdown: float | None
     margin: float | None
     score: float | None
+    #: The limit each of BRAIN's figure checks names for this Alpha, by check name.
+    limits: dict[str, float] = Field(default_factory=dict)
 
 
 class SeedReason(Out):
@@ -145,7 +147,11 @@ async def _market(
         problems.append(OPERATORS_UNREAD)
     neutralizations = await neutralizations_for(state, region, delay, chosen)
     if not neutralizations:
-        problems.append("BRAIN's settings list is not loaded. Sign in again.")
+        problems.append(
+            f"BRAIN offers none of the chosen neutralizations in {region} delay {delay}."
+            if chosen and await state.metadata.cached_settings_schema()
+            else "BRAIN's settings list is not loaded. Sign in again."
+        )
     market = await ga.market_for(state.catalog, operators, region, delay, universe, neutralizations)
     if market is None and operators:
         problems.append(
@@ -203,9 +209,11 @@ async def _plan(body: EvolutionRequest, state: Any) -> dict[str, Any]:
         run = EvolutionParams(region=body.region, delay=body.delay, universe=body.universe)
         parents = [p for r in seeds if (p := ga.Parent.of(str(r["alpha_id"]), r["expression"], r))]
         bred = market
+        shapes = {p.tree: ga.Shape.of(p.tree, bred) for p in parents}
 
         def draw(rng: random.Random) -> SimulationRequest | None:
-            made = ga.child(rng, rng.choice(parents), rng.choice(parents), bred, body.mutation_rate)
+            a, b = rng.choice(parents), rng.choice(parents)
+            made = ga.child(rng, a, b, bred, body.mutation_rate, shapes)
             return ga.request_for(*made, run) if made else None
 
         sample = preview_samples(draw, tries=50)
@@ -337,7 +345,7 @@ async def add_task(body: EvolutionRequest, state: State) -> AddedTask:
         trials: list[Trial] = []
         for number, seed in enumerate(seeds):
             settings = {
-                "instrumentType": "EQUITY",
+                "instrumentType": INSTRUMENT_TYPE,
                 "region": body.region,
                 "delay": body.delay,
                 "universe": body.universe,

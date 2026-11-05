@@ -16,12 +16,14 @@ why, rather than failing at the last step.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import platform
+import random
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as installed_version
@@ -40,7 +42,11 @@ log = structlog.get_logger(__name__)
 PACKAGE = "alpha-harness"
 REPOSITORY_VARIABLE = "ALPHA_HARNESS_REPOSITORY"
 REPOSITORY = os.environ.get(REPOSITORY_VARIABLE) or "residual-lab/alpha-harness"
-RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+_OWNER, _, _NAME = REPOSITORY.partition("/")
+#: GitHub's latest release, as the release workflow copies it to GitHub Pages. Never the API:
+#: that allows sixty anonymous calls an hour per address, and a college hostel puts hundreds
+#: of people behind one. Pages is a CDN with no such limit.
+LATEST_URL = f"https://{_OWNER.lower()}.github.io/{_NAME}/latest.json"
 #: Where a person goes to fetch a release by hand, when the app cannot do it for them.
 RELEASES_PAGE = f"https://github.com/{REPOSITORY}/releases/latest"
 
@@ -51,23 +57,26 @@ HOME_VARIABLE = "ALPHA_HARNESS_HOME"
 LAUNCHER_VARIABLE = "ALPHA_HARNESS_LAUNCHER"
 #: The launcher's process id, from a launcher new enough to say so.
 PID_VARIABLE = "ALPHA_HARNESS_LAUNCHER_PID"
+#: Set by the desktop app, which shows the app in a window of its own. The PyInstaller
+#: launchers before it never set it.
+SHELL_VARIABLE = "ALPHA_HARNESS_SHELL"
 
-#: The oldest ``AlphaHarness.exe`` this release works fully with.
+#: The oldest desktop app this release works fully with.
 #:
-#: Raised by hand, and only when a launcher change actually matters — the exe is rebuilt every
-#: release, so comparing it to the wheel would nag after every update for nothing. The system
-#: tray arrived in this one, and an older exe simply has no tray.
-LAUNCHER_NEEDED = "2026.9.21.1"
+#: Raised by hand, and only when a desktop app change actually matters — it is rebuilt every
+#: release, so comparing it to the wheel would nag after every update for nothing. Its first
+#: release is all any needs so far.
+LAUNCHER_NEEDED = "2026.10.21rc1"
 
 
 def _launcher_asset() -> str:
     """The release download for this machine, named as the release names it."""
     if sys.platform == "win32":
-        return "AlphaHarness.exe"
+        return "AlphaHarness-windows-x64-setup.exe"
     arm = platform.machine().lower() in ("arm64", "aarch64")
     if sys.platform == "darwin":
-        return f"AlphaHarness-macOS-{'arm64' if arm else 'x86_64'}.zip"
-    return "AlphaHarness-linux-x86_64.tar.gz"
+        return f"AlphaHarness-macOS-{'arm64' if arm else 'x86_64'}.dmg"
+    return "AlphaHarness-linux-amd64.deb"
 
 
 #: The launcher download to fetch for this machine, for the notice that asks for a newer one.
@@ -82,16 +91,23 @@ RELOADING_SECONDS = 1800
 #: Written by the launcher when an install failed, so the app can say why rather than offer
 #: the same update again with no explanation.
 ERROR_FILE = "update-error.json"
+#: Written once the app serves, naming its version: the launcher rolls back a new version
+#: that exits with an error before it ever did.
+SERVED_FILE = "served.json"
+#: The last answer, kept across restarts so that starting the app is no reason to ask again.
+CHECK_FILE = "update-check.json"
 
-#: Hours between scheduled looks at GitHub, from Settings; 0 looks only when asked. Never
-#: under an hour: the anonymous API allows a machine sixty calls an hour, shared with anything
-#: else on it. A failed look waits as long as a good one, so an offline laptop does not spend
-#: the allowance retrying; "Check now" is there for the impatient.
+#: Hours between scheduled looks at GitHub, from Settings; 0 looks only when asked. A failed
+#: look waits as long as a good one, so an offline laptop does not retry all day; "Check now"
+#: is there for the impatient.
 check_hours = 1
 #: Install a newer release by itself once nothing is simulating, from Settings.
 auto_install = True
 #: However often "Check now" is pressed, GitHub is asked at most this often.
 FORCE_GAP_SECONDS = 60.0
+#: The first look waits this long after startup, picked at random, so copies started together
+#: (a lab's machines switched on at nine) do not all ask in the same second.
+STARTUP_DELAY_SECONDS = (5.0, 30.0)
 #: How often the watcher wakes to see whether a look or an install is due.
 WATCH_SECONDS = 60.0
 CHECK_TIMEOUT = 10.0
@@ -115,6 +131,10 @@ _checking = asyncio.Lock()
 
 #: ``(monotonic time, wall-clock ISO time, release, error)`` of the last look at GitHub.
 _cache: tuple[float, str, Release | None, str | None] | None = None
+#: Before this, a look nobody asked for is put off; see :data:`STARTUP_DELAY_SECONDS`.
+_not_before = time.monotonic() + random.uniform(*STARTUP_DELAY_SECONDS)
+#: Whether :data:`CHECK_FILE` was read yet, which happens once, on the first look.
+_restored = False
 
 
 def current() -> str:
@@ -149,6 +169,9 @@ def launcher_outdated() -> bool:
     """
     if launcher_home() is None:
         return False
+    # A PyInstaller launcher, which the desktop app replaces whatever its version.
+    if not os.environ.get(SHELL_VARIABLE):
+        return True
     running = launcher_version()
     return running is None or is_newer(LAUNCHER_NEEDED, running)
 
@@ -176,13 +199,16 @@ async def latest(*, force: bool = False) -> tuple[Release | None, str | None]:
     """The newest published release and why it could not be read, each possibly ``None``.
 
     The last answer, good or failed, holds for :data:`check_hours`; with checks off, GitHub
-    is asked only when forced, and until then both come back ``None``.
+    is asked only when forced.
     """
+    global _restored
     # One caller at a time. Several open tabs poll this at once, and without the gate each
-    # one that arrives while the cache is cold makes its own call — the anonymous allowance
-    # is sixty an hour, and spending it in bursts is how a machine ends up rate limited by
-    # its own UI. Whoever waits reads the answer the first one stored.
+    # one that arrives while the cache is cold makes its own call. Whoever waits reads the
+    # answer the first one stored.
     async with _checking:
+        if not _restored:
+            _restored = True
+            _restore()
         if _cache is not None:
             age = time.monotonic() - _cache[0]
             fresh = check_hours == 0 or age < check_hours * 3600
@@ -190,6 +216,8 @@ async def latest(*, force: bool = False) -> tuple[Release | None, str | None]:
                 return _cache[2], _cache[3]
         elif not force and check_hours == 0:
             return None, None
+        if not force and time.monotonic() < _not_before:
+            return (_cache[2], _cache[3]) if _cache is not None else (None, None)
 
         return await _ask()
 
@@ -208,8 +236,8 @@ async def watch(
     mid-run loses nothing, but it would stall every core for the minute it takes. A version
     whose install already failed is left to the user, or it would be retried forever.
     """
+    await asyncio.sleep(max(0.0, _not_before - time.monotonic()))
     while True:
-        await asyncio.sleep(WATCH_SECONDS)
         try:
             release, _ = await latest()
             if (
@@ -228,6 +256,7 @@ async def watch(
         # One failed look or install must not end the watching.
         except Exception:
             log.warning("update.watch_failed", exc_info=True)
+        await asyncio.sleep(WATCH_SECONDS)
 
 
 async def _ask() -> tuple[Release | None, str | None]:
@@ -235,21 +264,12 @@ async def _ask() -> tuple[Release | None, str | None]:
     release: Release | None = None
     problem: str | None = None
     try:
-        async with httpx2.AsyncClient(timeout=CHECK_TIMEOUT) as client:
+        async with httpx2.AsyncClient(timeout=CHECK_TIMEOUT, follow_redirects=True) as client:
             response = await client.get(
-                RELEASES_URL,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                    # GitHub asks every caller to name itself, and a named one is far easier
-                    # to argue about if this ever does trip a limit.
-                    "User-Agent": f"AlphaHarness/{current()}",
-                },
+                LATEST_URL, headers={"User-Agent": f"AlphaHarness/{current()}"}
             )
         if response.status_code == 404:
             problem = "No release has been published yet."
-        elif response.status_code == 403:
-            problem = "GitHub is rate limiting this machine. It will try again later."
         elif response.status_code >= 400:
             problem = f"GitHub answered {response.status_code}."
         else:
@@ -258,19 +278,54 @@ async def _ask() -> tuple[Release | None, str | None]:
                 problem = "GitHub's answer did not name a version."
     except httpx2.HTTPError as exc:
         problem = f"Could not reach GitHub: {exc}"
+    except ValueError:
+        # A Wi-Fi sign-in page or a proxy, answering in GitHub's place with a page of its own.
+        problem = "Something other than GitHub answered, such as a Wi-Fi sign-in page."
 
-    _cache = (time.monotonic(), datetime.now(UTC).isoformat(timespec="seconds"), release, problem)
+    checked = datetime.now(UTC).isoformat(timespec="seconds")
+    _cache = (time.monotonic(), checked, release, problem)
+    if problem is None:
+        _save(checked, release)
     return release, problem
 
 
+def _save(checked: str, release: Release | None) -> None:
+    """Keep an answer for the next start. Only a real one: a failed look is worth retrying
+    once the app is started again, which is often how someone fixes their connection."""
+    home = launcher_home()
+    if home is None:
+        return
+    body = {"at": time.time(), "checkedAt": checked, "release": release and asdict(release)}
+    with contextlib.suppress(OSError):
+        (home / CHECK_FILE).write_text(json.dumps(body), encoding="utf-8")
+
+
+def _restore() -> None:
+    """The answer a previous run kept, aged by the time since."""
+    global _cache
+    body = _launcher_json(CHECK_FILE)
+    at, checked, raw = body.get("at"), body.get("checkedAt"), body.get("release")
+    age = time.time() - at if isinstance(at, int | float) else -1.0
+    if age < 0 or not isinstance(checked, str):
+        return
+    try:
+        release = Release(**raw) if isinstance(raw, dict) else None
+    except TypeError:
+        return
+    _cache = (time.monotonic() - age, checked, release, None)
+
+
 def _read(body: Any) -> Release | None:
-    # ``/releases/latest`` already skips drafts and pre-releases, so this is belt and braces
-    # — and the belt that matters if this ever reads the full release list instead. A release
-    # candidate reaching consultants is the one mistake this file cannot take back.
+    # The file is what ``/releases/latest`` named, which already skips drafts and pre-releases,
+    # so this is belt and braces. A release candidate reaching consultants is the one mistake
+    # this file cannot take back.
     if not isinstance(body, dict) or body.get("draft") or body.get("prerelease"):
         return None
     tag = body.get("tag_name")
-    if not isinstance(tag, str) or _parse(tag) is None:
+    if not isinstance(tag, str):
+        return None
+    parsed = _parse(tag)
+    if parsed is None or parsed.is_prerelease:
         return None
     return Release(
         version=tag.removeprefix("v"),
@@ -334,6 +389,17 @@ def request(version: str, *, wheel_url: str | None = None) -> Path:
     (home / RELOADING_FILE).write_text(json.dumps({"at": time.time()}), encoding="utf-8")
     log.warning("update.requested", version=version, path=str(path))
     return path
+
+
+def served() -> None:
+    """Tell the launcher this version came up, so a later exit is not taken for a bad update."""
+    home = launcher_home()
+    if home is None:
+        return
+    try:
+        (home / SERVED_FILE).write_text(json.dumps({"version": current()}), encoding="utf-8")
+    except OSError:
+        log.warning("update.served_unwritten", exc_info=True)
 
 
 def page_reloads() -> bool:

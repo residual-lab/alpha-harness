@@ -1,0 +1,40 @@
+[package]
+name = "alpha-harness"
+description = "Alpha Harness on the desktop: installs, updates and supervises the app, and shows it in its own window."
+# Semver for Cargo only; CI gives the installers a semver version made from the tag. The release
+# version itself (dated, possibly with a fourth number or an rc suffix) arrives as
+# ALPHA_HARNESS_VERSION at build time: see build.rs.
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "=2.7.1", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.1", features = ["tray-icon"] }
+tauri-plugin-single-instance = "=2.5.2"
+tauri-plugin-autostart = "=2.7.0"
+tauri-plugin-notification = "=2.5.1"
+tauri-plugin-dialog = "=2.8.1"
+tauri-plugin-opener = "=2.5.5"
+serde_json = "=1.0.151"
+
+# Already in the build through Tauri: for the two calls std leaves out (see supervisor::contain).
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# No LTO and the default codegen units: measured, a release build takes 40% less time for a
+# binary 2 MB bigger, next to the 330 MB the first start downloads anyway.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true

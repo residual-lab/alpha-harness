@@ -10,39 +10,36 @@ import { useCallback, useMemo } from 'react'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { auth } from '@/api/core'
+import { INSTRUMENT_TYPE, RA_REGIONS, REGION_AGNOSTIC_REGION } from '@/api/platform'
 import type { Scope } from '@/api/types'
+import { followOtherTabs } from '@/lib/tabs'
 
 export const DEFAULT_SCOPE: Scope = {
-  instrumentType: 'EQUITY',
+  instrumentType: INSTRUMENT_TYPE,
   region: 'USA',
   delay: 1,
   universe: 'TOP3000',
 }
 
 /**
- * The region that means every region at once. Choosing it makes the simulation
- * region-agnostic: one run across USA, Europe, Asia and Global, submittable when it works
- * in two or more of them. BRAIN offers it under no other simulation type.
+ * Whether this is the region that means every region at once. Choosing it makes the
+ * simulation region-agnostic: one run across USA, Europe, Asia and Global, submittable when
+ * it works in two or more of them. BRAIN offers it under no other simulation type.
  */
-export const REGION_AGNOSTIC = 'ALL'
-
 export const isRegionAgnostic = (scope: { region: string }): boolean =>
-  scope.region === REGION_AGNOSTIC
+  scope.region === REGION_AGNOSTIC_REGION
 
 /**
- * The regions a region-agnostic simulation is translated into: "data fields in a Region
- * Agnostic Alpha are translated into GLB, USA, EUR, and ASI Alphas". Nowhere else can one
- * run, so asking whether a field exists region-agnostically is a question only these four
- * markets can act on.
+ * Whether a region-agnostic simulation can be translated into this market. Nowhere else can
+ * one run, so asking whether a field exists region-agnostically is a question only these
+ * four markets can act on.
  */
-export const RA_MARKETS: readonly string[] = ['USA', 'EUR', 'ASI', 'GLB']
-
 export const runsRegionAgnostic = (scope: { region: string }): boolean =>
-  RA_MARKETS.includes(scope.region)
+  (RA_REGIONS as readonly string[]).includes(scope.region)
 
 /** BRAIN labels the region-agnostic market `ALL`, which says nothing about what it does. */
 export const regionLabel = (region: string): string =>
-  region === REGION_AGNOSTIC ? 'All Regions' : region
+  region === REGION_AGNOSTIC_REGION ? 'All Regions' : region
 
 /** One market as a single string, for sets and select values. */
 export const marketKey = (m: { region: string; delay: number; universe: string }): string =>
@@ -65,6 +62,7 @@ const useScopeStore = create<ScopeStore>()(
     { name: 'alpha-harness-scope' },
   ),
 )
+followOtherTabs(useScopeStore)
 
 /** One screen's scope (`key` = route or lab id) and a setter that merges changes. */
 export function useScope(key: string): [Scope, (change: Partial<Scope>) => void] {

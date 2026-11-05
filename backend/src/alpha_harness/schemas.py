@@ -123,7 +123,6 @@ class SyncRunRow(Out):
     label: str
     status: SyncStatus
     phase: Literal["categories", "datasets", "fields", "details"] | None
-    categories_synced: int
     datasets_synced: int
     fields_synced: int
     fraction: float | None

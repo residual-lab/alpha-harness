@@ -5,14 +5,11 @@
  */
 
 import { useQuery } from '@tanstack/react-query'
-import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
 import { today } from '@/api/core'
 import { useCores } from '@/lib/preferences'
+import { useScopeOptions } from '@/lib/scope'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
 import {
-  LAB_DEFAULTS,
-  type LabDraft,
   labBody,
   MAX_SIMULATIONS,
   simulationsValid,
@@ -21,24 +18,15 @@ import {
   vectorOperatorsOf,
 } from '@/screens/research-labs/lab-task'
 import { type SearchLabRequest, searchLab } from '@/screens/research-labs/search/api'
-import { DatasetsPanel, SettingsPanel } from '@/screens/research-labs/task-settings'
+import { useSearchLab } from '@/screens/research-labs/search/state'
+import { DatasetsPanel, MarketPanel, SettingsPanel } from '@/screens/research-labs/task-settings'
 import { ErrorNotice, Page, PageHeader } from '@/ui/kit'
-
-/** The Search Lab's choices, kept between visits. */
-const useSearchLab = create<LabDraft>()(
-  persist(() => LAB_DEFAULTS, {
-    name: 'alpha-harness-search-lab',
-    // Version 1 leaves cores unchosen, so Settings' default for new tasks applies.
-    version: 1,
-    migrate: (stored) => ({ ...(stored as LabDraft), cores: null }),
-  }),
-)
 
 export function SearchLabScreen() {
   const stored = useSearchLab()
   const set = useSearchLab.setState
   const day = useQuery({ queryKey: ['today'], queryFn: () => today.get() })
-  const { chosen, scope, choose } = useLabMarket(stored, set, '/labs/search')
+  const { chosen, scope, choose, move } = useLabMarket(stored, set, '/labs/search')
 
   const options = useQuery({
     queryKey: ['search-lab', 'options'],
@@ -48,13 +36,17 @@ export function SearchLabScreen() {
   // Until the user types a number, the task takes what is left of today (never stored).
   const maxSimulations = options.data?.maxSimulations ?? MAX_SIMULATIONS
   const unspoken = day.data?.simulations.unspoken ?? 0
-  const draft = {
-    ...stored,
-    simulations: stored.simulations ?? (unspoken > 0 ? Math.min(unspoken, maxSimulations) : null),
-  }
+  const suggested = unspoken > 0 ? Math.min(unspoken, maxSimulations) : null
+  const draft = { ...stored, simulations: stored.simulations ?? suggested }
   const vectorOperators = vectorOperatorsOf(draft, options.data?.vector)
   const cores = useCores(draft.cores)
-  const body: SearchLabRequest = labBody(draft, vectorOperators, cores)
+  const { neutralizations } = useScopeOptions({
+    instrumentType: 'EQUITY',
+    region: draft.region,
+    delay: draft.delay,
+    universe: draft.universe,
+  })
+  const body: SearchLabRequest = labBody(draft, vectorOperators, cores, neutralizations)
   const { preview, current } = useLabPreview('search-lab', body, searchLab.preview, {
     enabled: chosen && options.isSuccess,
   })
@@ -76,35 +68,27 @@ export function SearchLabScreen() {
   return (
     <Page>
       <PageHeader
+        sticky
         title="Search Lab"
-        actions={
-          <>
-            {blocked && (
-              <span id="run-task-blocked" className="text-body-compact text-ink-subtle">
-                {blocked}
-              </span>
-            )}
-            <AddTaskButtons
-              add={add}
-              disabled={!ready}
-              describedBy={blocked ? 'run-task-blocked' : undefined}
-            />
-          </>
-        }
+        actions={<AddTaskButtons add={add} disabled={!ready} blocked={blocked} />}
       />
       {options.isError && (
         <ErrorNotice error={options.error} title="Could not read your operators" />
       )}
+      <MarketPanel scope={scope} onChange={move} />
       <DatasetsPanel
         ids={draft.datasetIds}
         scope={scope}
-        onChoose={choose}
+        onApply={(datasetIds, fieldFilter) => set({ datasetIds, fieldFilter })}
+        onExplore={choose}
         filter={draft.fieldFilter}
         onClearFilter={() => set({ fieldFilter: null })}
         onRemove={(ids) => set({ datasetIds: stored.datasetIds.filter((x) => !ids.includes(x)) })}
       />
       <SettingsPanel
-        draft={draft}
+        // The box holds only what was typed, so it can be emptied; the suggestion shows faintly.
+        draft={stored}
+        suggested={suggested}
         set={set}
         vector={options.data?.vector ?? []}
         chosenVector={vectorOperators}

@@ -1,6 +1,6 @@
 """Correlation Breaker: re-shape a submittable Alpha that BRAIN says is already in the pool.
 
-Failing ``PROD_CORRELATION`` means the daily PnL is Pearson-correlated at 0.70 or more with an
+Failing ``PROD_CORRELATION_CHECK`` means the daily PnL is Pearson-correlated at 0.70 or more with an
 Alpha already in production, and this one's Sharpe is not 10% above it. The signal is sound; it
 is the *exposure* that is shared. So the settings are never touched here — region, delay,
 universe, neutralization, decay and truncation are the source Alpha's, exactly — and only the
@@ -23,19 +23,17 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ..brain.platform import (
+    GROUPING_FIELDS,
+    INSTRUMENT_TYPE,
+    MULTI_COUNTRY_REGIONS,
+    POWER_POOL_MAX_FIELDS,
+    POWER_POOL_MAX_OPERATORS,
+    PROD_CORRELATION_CHECK,
+)
 from ..brain.schemas import FULL_MODE, SimulationRequest, SimulationSettings
 from ..catalog.queries import FieldFilter, Tuple4
-from ..labs.fastexpr import (
-    GROUPING,
-    MAX_FIELDS,
-    MAX_OPERATORS,
-    Node,
-    ParseError,
-    data_fields,
-    operator_count,
-    parse,
-    render,
-)
+from ..labs.fastexpr import Node, ParseError, data_fields, operator_count, parse, render
 from ..labs.launch import OPERATORS_UNREAD, account_operators
 from ..vault.yields import is_power_pool
 
@@ -129,10 +127,6 @@ class Recipe:
     #: Why this market has nothing to build it from, for a recipe listed so its absence is seen.
     missing: str = ""
 
-
-#: Regions that span several countries, where one country's market move rides along with
-#: every industry group unless the two are neutralized together.
-MULTI_COUNTRY = frozenset({"ASI", "EUR", "GLB", "AMR"})
 
 #: Ordered as the research ranks them: residualize, orthogonalize, trade the innovation, gate,
 #: then regroup; :func:`group_recipes` adds this market's own groupings after these. Reshapes
@@ -244,7 +238,7 @@ RECIPES: tuple[Recipe, ...] = (
         tail=f"group_neutralize({ALPHA}, cluster)",
         operators=("densify", "group_cartesian_product", "group_neutralize"),
         fields=("industry", "country"),
-        regions=MULTI_COUNTRY,
+        regions=MULTI_COUNTRY_REGIONS,
     ),
     Recipe(
         id="cluster_zscore",
@@ -307,10 +301,10 @@ async def most_used_group(state: Any, scope: Tuple4, *, exclusive: bool) -> dict
             sort_by="user_count",
             # The standard groupings lead every unfiltered market, so the page has to reach past
             # all of them to hold the first one that is not.
-            limit=len(GROUPING) + 10,
+            limit=len(GROUPING_FIELDS) + 10,
         ),
     )
-    rows = [r for r in page["results"] if r["field_id"] not in GROUPING]
+    rows = [r for r in page["results"] if r["field_id"] not in GROUPING_FIELDS]
     return max(rows, key=_usage) if rows else None
 
 
@@ -439,14 +433,10 @@ def requests(
     ]
 
 
-#: The check this tool exists to get past.
-PROD_CORRELATION = "PROD_CORRELATION"
-
-
 def _correlation(checks: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
     """BRAIN's own production-correlation check, as it last reported it."""
     for check in checks:
-        if str(check.get("name", "")).upper() == PROD_CORRELATION:
+        if str(check.get("name", "")).upper() == PROD_CORRELATION_CHECK:
             return check
     return None
 
@@ -483,7 +473,7 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
     # The Alpha's own market, delay and universe: which groupings are used, and which are
     # exclusive to a region, differ from one to the next.
     scope = Tuple4(
-        instrument_type=str(settings.get("instrumentType") or "EQUITY"),
+        instrument_type=str(settings.get("instrumentType") or INSTRUMENT_TYPE),
         region=region,
         delay=delay,
         universe=universe,
@@ -510,7 +500,7 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
     rows = []
     for recipe, blocked in offered(recipes, operators, fields, region):
         used, read = (
-            (0, 0) if recipe.missing else _counted(compressed.program(recipe.tail, recipe.setup))
+            (0, 0) if recipe.missing else counted(compressed.program(recipe.tail, recipe.setup))
         )
         rows.append(
             {
@@ -524,16 +514,16 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
                 "blocked": blocked,
                 "operators": used,
                 "dataFields": read,
-                "overPowerPool": _over_power_pool(used, read) if power_pool else "",
+                "overPowerPool": over_power_pool(used, read) if power_pool else "",
             }
         )
-    used, read = _counted(expression)
+    used, read = counted(expression)
     return {
         "alphaId": alpha_id,
         "expression": expression,
         #: What ``alpha`` stands for, shown once above the re-shapes.
         "bound": compressed.bound,
-        "settings": _held(settings),
+        "settings": held_settings(settings),
         #: The Alpha's settings whole, which is what every simulation is built from.
         "rawSettings": settings,
         "correlation": _correlation(checks),
@@ -547,22 +537,30 @@ async def plan(state: Any, alpha_id: str) -> dict[str, Any]:
     }
 
 
-def _counted(program: str) -> tuple[int, int]:
+def counted(program: str) -> tuple[int, int]:
     """Operators and data fields, the way Power Pool counts them."""
     tree = parse(program)
     return operator_count(tree), len(data_fields(tree))
 
 
-def _over_power_pool(operators: int, fields: int) -> str:
+def over_power_pool(operators: int, fields: int) -> str:
     """Why a re-shape would stop being a Power Pool Alpha, empty when it would not."""
     over = [
-        *([f"{operators} operators (limit {MAX_OPERATORS})"] if operators > MAX_OPERATORS else []),
-        *([f"{fields} data fields (limit {MAX_FIELDS})"] if fields > MAX_FIELDS else []),
+        *(
+            [f"{operators} operators (limit {POWER_POOL_MAX_OPERATORS})"]
+            if operators > POWER_POOL_MAX_OPERATORS
+            else []
+        ),
+        *(
+            [f"{fields} data fields (limit {POWER_POOL_MAX_FIELDS})"]
+            if fields > POWER_POOL_MAX_FIELDS
+            else []
+        ),
     ]
     return " and ".join(over)
 
 
-def _held(settings: dict[str, Any]) -> dict[str, Any]:
+def held_settings(settings: dict[str, Any]) -> dict[str, Any]:
     """The settings every simulation runs at, which are the Alpha's own and are not editable."""
     return {
         "region": settings.get("region"),
@@ -581,7 +579,7 @@ def _empty(
         "alphaId": alpha_id,
         "expression": "",
         "bound": "",
-        "settings": _held(settings),
+        "settings": held_settings(settings),
         "rawSettings": settings,
         "correlation": _correlation(checks),
         "powerPool": is_power_pool(list(checks)),

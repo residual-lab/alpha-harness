@@ -18,11 +18,22 @@ import { errorMessage } from '@/api/http'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useLive } from '@/lib/live'
+import {
+  AlphaTable,
+  type AlphaTableRow,
+  fromRanked,
+  type Option,
+  option,
+  sortAlphas,
+} from '@/screens/alpha-table'
+import { Correlation } from '@/screens/alpha-table/columns'
 import { BRAIN_ALPHA_URL } from '@/screens/pool/api'
+import { alphaIds } from '@/screens/pool/detail'
 import { labTasks, type RankedAlpha } from '@/screens/tasks/api'
 import { type PowerPoolRow, powerPoolTone, usePowerPool } from '@/screens/tasks/power-pool'
-import { Button, ErrorNotice, LINK, Notice, Panel, Progress } from '@/ui/kit'
-import { type Column, DataTable, type Sort } from '@/ui/table'
+import { MOD } from '@/shell/desktop'
+import { Button, ErrorNotice, Kbd, LINK, Notice, Panel, Progress, Segmented } from '@/ui/kit'
+import type { Sort } from '@/ui/table'
 
 const WORKFLOW = 'power-pool-workflow'
 const PROD_JOB = 'prod-correlation'
@@ -39,37 +50,18 @@ const passesPool = (row: PowerPoolRow | undefined) => {
   return tone === 'clear' || tone === 'beats'
 }
 
-/** `compare`, plus the one column that lives in the Power Pool map rather than on the row. */
-function comparePool(
-  a: RankedAlpha,
-  b: RankedAlpha,
-  sort: Sort,
-  by: ReadonlyMap<string, PowerPoolRow>,
-  compare: (a: RankedAlpha, b: RankedAlpha, sort: Sort) => number,
-): number {
-  if (sort.key !== 'poolCorrelation') return compare(a, b, sort)
-  const pick = (r: RankedAlpha) => (r.alphaId ? by.get(r.alphaId)?.correlation : null) ?? null
-  const x = pick(a)
-  const y = pick(b)
-  // Unmeasured last either way: an Alpha with no correlation is not the least correlated.
-  if (x == null) return y == null ? 0 : 1
-  if (y == null) return -1
-  return sort.desc ? y - x : x - y
-}
-
-function poolColumn(by: ReadonlyMap<string, PowerPoolRow>): Column<RankedAlpha> {
-  return {
-    key: 'poolCorrelation',
-    header: 'Power Pool Correlation',
+/** The pane's own Power Pool Correlation: measured here, and toned by whether the Alpha's
+ *  Sharpe beats the ones it exceeds. */
+function poolOption(by: ReadonlyMap<string, PowerPoolRow>): Option {
+  const found = (r: AlphaTableRow) => (r.alphaId ? by.get(r.alphaId) : undefined)
+  return option('Correlation', 'powerPoolCorrelation', 'Power Pool Correlation', {
     width: 'minmax(120px,1.1fr)',
     align: 'right',
-    sortable: true,
+    value: (r) => found(r)?.correlation ?? null,
     cell: (r) => {
-      const found = r.alphaId ? by.get(r.alphaId) : undefined
-      if (!found || found.correlation == null) {
-        return <span className="text-ink-subtle">{DASH}</span>
-      }
-      const tone = powerPoolTone(found)
+      const row = found(r)
+      if (!row || row.correlation == null) return DASH
+      const tone = powerPoolTone(row)
       return (
         <span
           className={cn(
@@ -78,14 +70,21 @@ function poolColumn(by: ReadonlyMap<string, PowerPoolRow>): Column<RankedAlpha> 
               ? 'text-pnl-positive-text'
               : tone === 'beats'
                 ? 'text-status-warning'
-                : 'text-pnl-negative-text',
+                : tone === 'unmeasured'
+                  ? 'text-ink-subtle'
+                  : 'text-pnl-negative-text',
           )}
+          title={
+            tone === 'unmeasured'
+              ? 'Not against every Power Pool Alpha of its region: some have no PnL stored'
+              : undefined
+          }
         >
-          {fmt.ratio(found.correlation, 4)}
+          <Correlation value={row.correlation} />
         </span>
       )
     },
-  }
+  })
 }
 
 /** The latest job of `kind`, running or just finished, from the shared background task list. */
@@ -108,35 +107,44 @@ function useJob(kind: string) {
  * somewhere else".
  */
 const openRow =
-  (onOpen: ((alphaId: string) => void) | undefined) =>
-  (r: RankedAlpha, event: React.MouseEvent | React.KeyboardEvent) => {
+  (onOpen: ((alphaId: string, ids?: string[]) => void) | undefined) =>
+  (r: AlphaTableRow, event: React.MouseEvent | React.KeyboardEvent, shown: AlphaTableRow[]) => {
     if (!r.alphaId) return
     if (event.ctrlKey || event.metaKey) {
       event.preventDefault()
       window.open(BRAIN_ALPHA_URL(r.alphaId), '_blank', 'noopener,noreferrer')
-    } else onOpen?.(r.alphaId)
+    } else onOpen?.(r.alphaId, alphaIds(shown))
   }
+
+type Stage = 'all' | 'unsubmitted' | 'clean' | 'pool'
+
+const Step = ({ name, count }: { name: string; count: number | null }) => (
+  <>
+    {name} <span className="num text-ink-subtle">{count == null ? DASH : fmt.int(count)}</span>
+  </>
+)
 
 export function AlphaPane({
   title,
+  view,
   rows,
-  columns,
-  compare,
+  offer,
+  defaults,
   sort,
   onSort,
   loading,
   error,
-  poolColumnAfter,
   onRefresh,
   onOpenAlpha,
+  openAlpha,
+  initial = 'pool',
 }: {
   title: string
+  /** Where the table's choice of columns is kept. */
+  view: string
   rows: RankedAlpha[]
-  /** Everything but the Power Pool column, which the pane owns and inserts itself. */
-  columns: () => Column<RankedAlpha>[]
-  /** Where the Power Pool column goes. Defaults to the end. */
-  poolColumnAfter?: string
-  compare: (a: RankedAlpha, b: RankedAlpha, sort: Sort) => number
+  offer: string[]
+  defaults: string[]
   sort: Sort
   onSort: (sort: Sort) => void
   loading?: boolean
@@ -144,9 +152,13 @@ export function AlphaPane({
   /** Re-read the rows themselves: submitting an Alpha changes a flag that lives on the row. */
   onRefresh?: () => Promise<unknown>
   /** Show a row's Alpha in the detail sheet, as the task detail's own table does. */
-  onOpenAlpha?: (alphaId: string) => void
+  onOpenAlpha?: (alphaId: string, ids?: string[]) => void
+  /** The Alpha open in the detail sheet, marked in the table. */
+  openAlpha?: string | null
+  /** The step of the funnel shown first. */
+  initial?: Stage
 }) {
-  const [showAll, setShowAll] = useState(false)
+  const [stage, setStage] = useState<Stage>(initial)
   const [refreshing, setRefreshing] = useState(false)
   const unsubmitted = useMemo(() => rows.filter(isUnsubmitted), [rows])
   const clean = useMemo(() => unsubmitted.filter(isClean), [unsubmitted])
@@ -156,11 +168,11 @@ export function AlphaPane({
     () => clean.filter((r) => passesPool(pool.by.get(r.alphaId))),
     [clean, pool.by],
   )
-  const shown = showAll ? rows : survivors
-  const sorted = useMemo(
-    () => [...shown].sort((a, b) => comparePool(a, b, sort, pool.by, compare)),
-    [shown, sort, pool.by, compare],
+  const shown = useMemo(
+    () => ({ all: rows, unsubmitted, clean, pool: survivors })[stage].map(fromRanked),
+    [stage, rows, unsubmitted, clean, survivors],
   )
+  const overrides = useMemo(() => [poolOption(pool.by)], [pool.by])
 
   const refresh = () => Promise.all([onRefresh?.(), cleanIds.length ? pool.refresh() : null])
 
@@ -197,8 +209,8 @@ export function AlphaPane({
     void onRefresh?.()
   })
   // The rows on show, top first: BRAIN's hourly limit means the ones read first come back first.
-  const unchecked = sorted.flatMap((r) =>
-    isUnsubmitted(r) && r.prodCorrelation == null ? [r.alphaId] : [],
+  const unchecked = sortAlphas(shown, sort, overrides).flatMap((r) =>
+    r.alphaId && !r.submitted && r.prodCorrelation == null ? [r.alphaId] : [],
   )
   const checkProd = useMutation({
     mutationFn: () => labTasks.prodCorrelation(unchecked),
@@ -211,10 +223,14 @@ export function AlphaPane({
     mutationFn: labTasks.stopProdCorrelation,
     onError: (e) => toast.error('Could not stop the check', { description: errorMessage(e) }),
   })
+  const stopWorkflow = useMutation({
+    mutationFn: labTasks.stopPowerPoolWorkflow,
+    onError: (e) => toast.error('Could not stop the workflow', { description: errorMessage(e) }),
+  })
   const start = useMutation({
     // Every Alpha here: the server runs the three steps itself rather than trusting ours.
     mutationFn: () => labTasks.powerPoolWorkflow(rows.flatMap((r) => r.alphaId ?? [])),
-    onSuccess: () => setShowAll(false),
+    onSuccess: () => setStage('pool'),
     onError: (e) => toast.error('Could not start the workflow', { description: errorMessage(e) }),
   })
 
@@ -224,13 +240,15 @@ export function AlphaPane({
     (pool.found?.rows.filter((r) => r.verdict === 'unmeasured').length ?? 0)
   const unsynced = pool.found?.scopes.flatMap((s) => s.poolWithoutPnl).length ?? 0
   const uncosted = survivors.filter((r) => r.afterCostSharpe == null).length
-  const columnsShown = () => {
-    const own = columns()
-    if (!pool.found) return own
-    const at = own.findIndex((c) => c.key === poolColumnAfter)
-    const cut = at === -1 ? own.length : at + 1
-    return [...own.slice(0, cut), poolColumn(pool.by), ...own.slice(cut)]
-  }
+  // Opening on the last step with nothing measured yet would show an empty table over Alphas
+  // that are clean: start one step back then, once, and leave the choice to the reader after.
+  const opened = useRef(false)
+  useEffect(() => {
+    if (opened.current || !pool.found) return
+    opened.current = true
+    if (initial === 'pool' && survivors.length === 0 && clean.length > 0 && unmeasured > 0)
+      setStage('clean')
+  }, [pool.found, initial, survivors.length, clean.length, unmeasured])
 
   return (
     <Panel
@@ -248,15 +266,6 @@ export function AlphaPane({
             }}
           >
             <RefreshCwIcon className={cn((refreshing || pool.refreshing) && 'animate-spin')} />
-          </Button>
-          <Button
-            size="sm"
-            variant={showAll ? 'primary' : 'secondary'}
-            aria-pressed={showAll}
-            onClick={() => setShowAll(!showAll)}
-            title="Every Alpha here, not only the ones the workflow keeps"
-          >
-            Show All
           </Button>
           {prodRunning ? (
             <div className="flex w-52 flex-col gap-1">
@@ -290,10 +299,22 @@ export function AlphaPane({
             </Button>
           )}
           {running ? (
-            <div className="flex w-52 flex-col gap-1">
-              <span className="num text-caption text-ink-muted">{job.detail || job.label}</span>
-              <Progress value={job.progress ?? null} label="Power Pool Workflow progress" />
-            </div>
+            <>
+              <div className="flex w-52 flex-col gap-1">
+                <span className="num text-caption text-ink-muted">{job.detail || job.label}</span>
+                <Progress value={job.progress ?? null} label="Power Pool Workflow progress" />
+              </div>
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={stopWorkflow.isPending}
+                onClick={() => stopWorkflow.mutate()}
+                title="Stop the workflow. Every PnL and turnover already downloaded is kept."
+              >
+                <SquareIcon />
+                Stop
+              </Button>
+            </>
           ) : (
             <Button
               size="sm"
@@ -307,16 +328,44 @@ export function AlphaPane({
               Run Power Pool Workflow
             </Button>
           )}
-          <span className="num text-ink-subtle">{fmt.int(sorted.length)}</span>
         </div>
       }
     >
-      <p className="num mb-3 text-body-compact text-ink-muted">
-        {fmt.int(unsubmitted.length)} Unsubmitted Alphas → {fmt.int(clean.length)} with no Checks
-        FAIL or ERROR → {pool.found ? fmt.int(survivors.length) : DASH} Pass Power Pool Correlation
-        {unmeasured > 0 && ` · ${fmt.int(unmeasured)} not measured yet`}
-        {uncosted > 0 && ` · ${fmt.int(uncosted)} without After-Cost Sharpe yet`}
-      </p>
+      {/* The funnel, each step one click: every Alpha down to the ones worth submitting. */}
+      <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2">
+        <Segmented
+          label="Which Alphas"
+          value={stage}
+          onChange={setStage}
+          items={[
+            { value: 'all', label: <Step name="All" count={rows.length} /> },
+            { value: 'unsubmitted', label: <Step name="Unsubmitted" count={unsubmitted.length} /> },
+            { value: 'clean', label: <Step name="No Checks FAIL or ERROR" count={clean.length} /> },
+            {
+              value: 'pool',
+              label: (
+                <Step
+                  name="Pass Power Pool Correlation"
+                  count={pool.found ? survivors.length : null}
+                />
+              ),
+            },
+          ]}
+        />
+        {(unmeasured > 0 || uncosted > 0) && (
+          <span className="num text-body-compact text-ink-subtle">
+            {[
+              unmeasured > 0 && `${fmt.int(unmeasured)} not measured yet`,
+              uncosted > 0 && `${fmt.int(uncosted)} without After-Cost Sharpe yet`,
+            ]
+              .filter(Boolean)
+              .join(' · ')}
+          </span>
+        )}
+        <span className="ml-auto hidden items-center gap-1 text-caption text-ink-subtle xl:inline-flex">
+          <Kbd>{MOD}Click</Kbd> a row opens it on BRAIN
+        </span>
+      </div>
       {job?.state === 'failed' && (
         <Notice tone="error" className="mb-3" title="The Power Pool Workflow stopped">
           {job.error}
@@ -336,23 +385,28 @@ export function AlphaPane({
       {pool.error != null && (
         <ErrorNotice error={pool.error} title="Could not measure Power Pool correlation" />
       )}
-      <DataTable
+      <AlphaTable
+        view={view}
         label={title}
-        rows={sorted}
-        columns={columnsShown()}
-        rowKey={(r) => String(r.trialId)}
+        rows={shown}
+        offer={offer}
+        defaults={defaults}
+        overrides={overrides}
         onRowClick={openRow(onOpenAlpha)}
+        openAlpha={openAlpha}
         sort={sort}
         onSort={onSort}
-        loading={(loading ?? false) || (!showAll && cleanIds.length > 0 && pool.pending)}
+        loading={(loading ?? false) || (stage === 'pool' && cleanIds.length > 0 && pool.pending)}
         error={error}
         maxHeight="70vh"
         empty={
-          showAll || rows.length === 0
+          rows.length === 0
             ? 'No Alphas back yet.'
-            : unmeasured > 0
-              ? 'Run Power Pool Workflow to measure the rest.'
-              : 'No Alpha here satisfies Power Pool Correlation.'
+            : stage !== 'pool'
+              ? 'No Alpha gets this far.'
+              : unmeasured > 0
+                ? 'Run Power Pool Workflow to measure the rest.'
+                : 'No Alpha here satisfies Power Pool Correlation.'
         }
       />
     </Panel>

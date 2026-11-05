@@ -9,11 +9,12 @@ import { ClockIcon, EllipsisIcon } from 'lucide-react'
 import { type KeyboardEvent, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { simulations } from '@/api/core'
+import { MULTI_SIMULATION_SIZE, SIMULATION_SLOTS } from '@/api/platform'
 import type { SimulationRow } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { DASH, fmt, secondsSince } from '@/lib/format'
 import { useCores, useLive } from '@/lib/live'
-import { blockLabel, type Cell, type CoreBlock, coreBlocks } from '@/lib/matrix'
+import { blockLabel, type Cell, type CoreBlock, coreBlocks, EMPTY } from '@/lib/matrix'
 import { useNow } from '@/lib/now'
 import { useRefetchOn } from '@/lib/ws'
 import {
@@ -116,8 +117,8 @@ function SimulationMatrix() {
 
   const active = live ?? fallback.data
   const status = engine.data
-  const slots = status?.slots ?? 8
-  const maxBatch = status?.maxBatch ?? 10
+  const slots = status?.slots ?? SIMULATION_SLOTS
+  const maxBatch = status?.maxBatch ?? MULTI_SIMULATION_SIZE
   const { cores, overflow } = useCores(active, slots, maxBatch)
   // One row per run rather than per core: a GLB run holds two cores and a region-agnostic one
   // three, and drawing the rest as idle rows would show a matrix with room it does not have.
@@ -189,10 +190,9 @@ function SimulationMatrix() {
       )}
       {overflow > 0 && (
         <Notice tone="warn">
-          <span className="num">{fmt.int(overflow)}</span> more running{' '}
-          {overflow === 1 ? 'slot holder' : 'slot holders'} than the{' '}
-          <span className="num">{slots}</span> cores; only the oldest{' '}
-          <span className="num">{slots}</span> are drawn.
+          <span className="num">{fmt.int(overflow)}</span> running{' '}
+          {overflow === 1 ? 'simulation does' : 'simulations do'} not fit in the{' '}
+          <span className="num">{slots}</span> cores and {overflow === 1 ? 'is' : 'are'} not drawn.
         </Notice>
       )}
 
@@ -217,7 +217,9 @@ function SimulationMatrix() {
         >
           {blocks.map((block, i) => (
             <CoreRow
-              key={block.start}
+              // By what it runs: a row keyed by position handed an open menu to the next batch
+              // when the one it was opened on finished.
+              key={block.holder ? `sim-${block.holder.id}` : `idle-${block.start}`}
               block={block}
               maxBatch={maxBatch}
               onCancel={setTarget}
@@ -363,7 +365,7 @@ function CoreRow({
         className="grid min-w-0 gap-1.5"
         style={{ gridTemplateColumns: `repeat(${maxBatch}, minmax(0, 1fr))` }}
       >
-        {(core?.cells ?? []).map((cell, j) => {
+        {(core?.cells ?? Array.from({ length: maxBatch }, () => EMPTY)).map((cell, j) => {
           const drawn = holder !== null && cell.state !== 'EMPTY'
           const at = drawn ? cellNumber++ : null
           return <MatrixCell key={j} cell={cell} holder={holder} at={at} roving={roving} />

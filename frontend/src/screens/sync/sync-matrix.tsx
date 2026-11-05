@@ -9,12 +9,12 @@ import { RefreshCwIcon, XIcon } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { catalog } from '@/api/catalog'
+import { REGION_AGNOSTIC_REGION } from '@/api/platform'
 import type { Scope, SyncMarket, SyncRun } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useLive } from '@/lib/live'
 import { useNow } from '@/lib/now'
-import { REGION_AGNOSTIC } from '@/lib/scope'
 import { STAT } from '@/screens/data/state'
 import { Button, Empty, ErrorNotice, Metric, Notice, Panel, Progress, Skeleton } from '@/ui/kit'
 import { Confirm } from '@/ui/overlay'
@@ -71,7 +71,7 @@ function ownRun(run: SyncRun | null | undefined, regionAgnostic: boolean) {
   const mine =
     markets.length === 0
       ? !regionAgnostic
-      : markets.every((m) => (m.region === REGION_AGNOSTIC) === regionAgnostic)
+      : markets.every((m) => (m.region === REGION_AGNOSTIC_REGION) === regionAgnostic)
   const full = run?.all && mine ? run : null
   return { full, running: full?.status === 'RUNNING' ? full : null }
 }
@@ -134,14 +134,14 @@ export function SyncHero({
     }
     // Widest markets first, so the tallest columns lead and the grid fills from the left.
     const ordinary = [...universes.keys()]
-      .filter((r) => r !== REGION_AGNOSTIC)
+      .filter((r) => r !== REGION_AGNOSTIC_REGION)
       .sort(
         (a, b) =>
           (universes.get(b)?.length ?? 0) - (universes.get(a)?.length ?? 0) || a.localeCompare(b),
       )
     // All regions is a different kind of market, not a wider one, so it is drawn in its own
     // panel rather than as a tenth column here.
-    const ordinaryMarkets = list.filter((m) => m.region !== REGION_AGNOSTIC)
+    const ordinaryMarkets = list.filter((m) => m.region !== REGION_AGNOSTIC_REGION)
     const exists = new Set(list.map((m) => keyOf(m.region, m.delay, m.universe)))
     return { total: ordinaryMarkets.length, regions: ordinary, delays, universes, exists }
   }, [markets.data])
@@ -168,7 +168,7 @@ export function SyncHero({
 
   // The all-regions market is counted in its own panel, never here, or the totals read as
   // more markets synced than this grid draws.
-  const held = (scopes.data ?? []).filter((r) => r.region !== REGION_AGNOSTIC)
+  const held = (scopes.data ?? []).filter((r) => r.region !== REGION_AGNOSTIC_REGION)
   const syncedMarkets = held.length
   const syncedFields = held.reduce((sum, r) => sum + r.fields, 0)
   const finished = seconds(full?.startedAt, full?.finishedAt)
@@ -422,14 +422,17 @@ export function RegionAgnosticHero({
   })
 
   const universes = useMemo(
-    () => (markets.data ?? []).filter((m) => m.region === REGION_AGNOSTIC).map((m) => m.universe),
+    () =>
+      (markets.data ?? [])
+        .filter((m) => m.region === REGION_AGNOSTIC_REGION)
+        .map((m) => m.universe),
     [markets.data],
   )
   const held = useMemo(
     () =>
       new Map(
         (scopes.data ?? [])
-          .filter((r) => r.region === REGION_AGNOSTIC)
+          .filter((r) => r.region === REGION_AGNOSTIC_REGION)
           .map((r) => [r.universe, r.fields]),
       ),
     [scopes.data],
@@ -438,7 +441,7 @@ export function RegionAgnosticHero({
     () =>
       new Map<string, SyncMarket>(
         (full?.markets ?? [])
-          .filter((m) => m.region === REGION_AGNOSTIC)
+          .filter((m) => m.region === REGION_AGNOSTIC_REGION)
           .map((m) => [m.universe, m] as const),
       ),
     [full],
@@ -493,7 +496,7 @@ export function RegionAgnosticHero({
           const state: TileState =
             live.get(universe)?.state ?? (held.has(universe) ? 'done' : 'waiting')
           const fields = live.get(universe)?.fields ?? held.get(universe) ?? null
-          const selected = scope.region === REGION_AGNOSTIC && scope.universe === universe
+          const selected = scope.region === REGION_AGNOSTIC_REGION && scope.universe === universe
           const label = `All Regions · Delay 1 · ${universe}: ${LABEL[state]}${fields != null ? ` · ${fmt.int(fields)} fields` : ''}${selected ? ' · shown in the Data Explorer' : ''}`
           return (
             <button
@@ -501,7 +504,7 @@ export function RegionAgnosticHero({
               type="button"
               title={label}
               aria-label={label}
-              onClick={() => onPick({ region: REGION_AGNOSTIC, delay: 1, universe })}
+              onClick={() => onPick({ region: REGION_AGNOSTIC_REGION, delay: 1, universe })}
               className={cn(
                 'flex flex-col gap-1.5 rounded-md border border-hairline bg-surface-2 p-2 text-left transition-colors hover:border-hairline-strong',
                 selected && 'ring-2 ring-link ring-offset-1 ring-offset-surface-1',

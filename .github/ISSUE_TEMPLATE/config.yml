@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/residual-lab/alpha-harness/security/advisories/new
+    about: Please review our security policy for more details
+  - name: 💬 Questions & help
+    url: https://github.com/residual-lab/alpha-harness/discussions/categories/q-a
+    about: How do I…? Why does BRAIN…? Is my setup right? Ask here, not in Issues.
+  - name: 💡 Ideas still taking shape
+    url: https://github.com/residual-lab/alpha-harness/discussions/categories/ideas
+    about: Talk an idea through first. Once it has a concrete problem and proposal, file a Feature Request.

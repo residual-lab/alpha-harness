@@ -10,15 +10,15 @@
 # answers the only question a screenshot raises — how old is this build.
 #
 # To publish without offering it to anyone, tag a pre-release: `v2026.9.21rc1`. GitHub keeps
-# it out of /releases/latest, which is the only thing the in-app updater reads.
+# it out of /releases/latest, and only that release is copied to the latest.json the in-app
+# updater reads.
 #
 # The wheel carries the app and its built UI; `constraints.txt` pins every transitive
 # dependency to `uv.lock`, so an install a year from now resolves to what was tested today.
-# The launcher (`AlphaHarness.exe`, `AlphaHarness.app`, the Linux `AlphaHarness`) only changes
-# when the launcher does — users who already have it keep it and take the wheel alone, which is
-# the point of splitting them.
+# The desktop app (`desktop/`, an installer per system) only matters when it changes — users
+# who already have it keep it and take the wheel alone, which is the point of splitting them.
 #
-# Each launcher is built on its own system: neither PyInstaller nor Nuitka cross-compiles.
+# Each installer is built on its own system, which is the only way to bundle a native WebView.
 
 name: release
 
@@ -31,8 +31,11 @@ on:
         description: Version to build, without the leading v
         required: true
 
+# Read only, but for the one job that publishes: every installed copy auto-installs what lands
+# on /releases/latest, so a token that can publish is kept away from the build steps. Actions
+# are pinned to commits for the same reason; a tag can be moved.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   wheel:
@@ -41,18 +44,20 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
       # The pnpm version comes from `packageManager` in the frontend's package.json. Said
       # here because the action looks in the repository root by default, and this repository
       # keeps no package.json there — naming a version inline instead would be a second
       # place to keep in step with the lockfile.
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           package_json_file: frontend/package.json
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: frontend/.node-version
           cache: pnpm
@@ -117,14 +122,14 @@ jobs:
       # in it (`--no-emit-project`) and stays unhashed, so this covers the PyPI leg only.
       - run: cd backend && uv export --frozen --no-dev --no-emit-project -o dist/constraints.txt
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: wheel
           path: backend/dist/*
 
-  launcher:
-    # After the wheel job, so the version baked into the launcher is the one that passed the
-    # canonical check rather than whatever the tag happened to say.
+  desktop:
+    # After the wheel job, so the version built in is the one that passed the canonical check
+    # rather than whatever the tag happened to say.
     needs: wheel
     strategy:
       # One platform failing must not cancel the others: a run should report every build.
@@ -133,126 +138,150 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            asset: AlphaHarness.exe
-          # Apple Silicon.
+            target: x86_64-pc-windows-msvc
+            bundle: nsis
+            built: nsis/*-setup.exe
+            asset: AlphaHarness-windows-x64-setup.exe
+          # Apple Silicon, whose oldest macOS is 11.
           - os: macos-latest
-            asset: AlphaHarness-macOS-arm64.zip
-          # The last Intel label there will be: macOS 26 is the final release for Intel Macs,
-          # and there is no -latest alias for Intel on the standard runners.
-          - os: macos-26-intel
-            asset: AlphaHarness-macOS-x86_64.zip
-          # The binary needs glibc 2.35 or newer, so it runs on Ubuntu 22.04 and later. Measured
-          # on a glibc 2.43 build: the floor is libgcc_s, which PyInstaller bundles from the
-          # runner; uv and the bundled Python need only 2.17.
-          # Archived: a browser downloads a bare binary without its executable bit, and Debian's
-          # file manager then hands it to the software centre instead of running it.
-          - os: ubuntu-latest
-            asset: AlphaHarness-linux-x86_64.tar.gz
+            target: aarch64-apple-darwin
+            macos: "11.0"
+            # The .app too: built alone, the .dmg leaves none behind for the check below.
+            bundle: app,dmg
+            built: dmg/*.dmg
+            asset: AlphaHarness-macOS-arm64.dmg
+          # Intel, built on Apple Silicon: the Intel runner took 8 minutes to compile what an
+          # Apple Silicon one does in under 3, and Apple's toolchain builds for both.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            macos: "10.15"
+            # Its uv is not the runner's own, so it is fetched, and checked against this.
+            uv-sha256: 2e4108f5395397c8bc5d43bf83d3bdbb2d0e92b90d0efa607756be704905fa33
+            # The .app too: built alone, the .dmg leaves none behind for the check below.
+            bundle: app,dmg
+            built: dmg/*.dmg
+            asset: AlphaHarness-macOS-x86_64.dmg
+          # Built against 24.04's glibc 2.39, which is what the .deb then needs (see
+          # tauri.conf.json); 22.04's runner is deprecated. A .deb rather than an AppImage: a
+          # browser drops a download's executable bit, while a .deb opens straight in the
+          # software installer.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundle: deb
+            built: deb/*.deb
+            asset: AlphaHarness-linux-amd64.deb
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     env:
-      VERSION: ${{ needs.wheel.outputs.version }}
+      # Built into the app (see build.rs): what it installs on a fresh machine, and what it
+      # tells the app it is.
+      ALPHA_HARNESS_VERSION: ${{ needs.wheel.outputs.version }}
+      # The oldest macOS the build may need: see Build, and the check after it.
+      MACOS_FLOOR: ${{ matrix.macos }}
+      TARGET: ${{ matrix.target }}
+      # Pinned, not `latest`: uv ships inside the installer, so an upstream release must never
+      # change what a re-run of an old tag produces.
+      UV_VERSION: "0.12.18"
+      BUNDLE: ${{ matrix.bundle }}
+      BUILT: ${{ matrix.built }}
       ASSET: ${{ matrix.asset }}
-      # uv's own Python, never one the runner has installed. Measured on v2026.10.1rc2: the
-      # macOS runners' own Python 3.14 is built for the runner's macOS, and the launchers it
-      # froze ran on macOS 26 or 15 only. uv's own needs 11.0 (Apple Silicon) or 10.15 (Intel).
-      UV_PYTHON_PREFERENCE: only-managed
     steps:
-      - uses: actions/checkout@v7
-      # Pinned, not `latest`: this binary ships inside the exe, so an upstream release must
-      # never change what a re-run of an old tag produces. The action checks its checksum,
-      # and the same uv runs the Python that freezes the launcher below.
-      - id: uv
-        uses: astral-sh/setup-uv@v10.2.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          version: "0.12.18"
-          python-version: "3.14"
-      - name: Bundle uv.exe
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          UV_PATH: ${{ steps.uv.outputs.uv-path }}
-        # setup-uv reports the binary without its extension on Windows (measured: `...\uv`),
-        # while the file on disk is uv.exe.
+          persist-credentials: false
+      # The action checks its checksum.
+      - id: uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          package_json_file: desktop/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version-file: frontend/.node-version
+          cache: pnpm
+          cache-dependency-path: desktop/pnpm-lock.yaml
+      # The version rust-toolchain.toml names, rather than whatever the runner image carries.
+      - run: |
+          cd desktop/src-tauri
+          rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+      - name: Install WebKitGTK and the tray's indicator library
+        if: runner.os == 'Linux'
         run: |
-          $uv = if (Test-Path -LiteralPath $env:UV_PATH -PathType Leaf) { $env:UV_PATH } else { "$env:UV_PATH.exe" }
-          Copy-Item -LiteralPath $uv launcher/uv.exe
-          ./launcher/uv.exe --version
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      # Named for the target, as Tauri looks for a sidecar. setup-uv reports the binary without
+      # its extension on Windows (measured: `...\uv`), while the file on disk is uv.exe. Another
+      # architecture's uv is Astral's own build of the same version, held to its checksum.
       - name: Bundle uv
-        if: runner.os != 'Windows'
         env:
           UV_PATH: ${{ steps.uv.outputs.uv-path }}
+          UV_SHA256: ${{ matrix.uv-sha256 }}
         run: |
-          cp "$UV_PATH" launcher/uv
-          ./launcher/uv --version
+          cd desktop/src-tauri
+          ext=""
+          if [ "$RUNNER_OS" = Windows ]; then ext=.exe; fi
+          sidecar="binaries/alpha-harness-uv-$TARGET$ext"
+          mkdir -p binaries
+          if [ -z "$UV_SHA256" ]; then
+            cp "${UV_PATH%.exe}$ext" "$sidecar"
+            "./$sidecar" --version
+          else
+            curl -fsSL -o "$RUNNER_TEMP/uv.tar.gz" \
+              "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$TARGET.tar.gz"
+            echo "$UV_SHA256  $RUNNER_TEMP/uv.tar.gz" | shasum -a 256 -c -
+            tar -xzf "$RUNNER_TEMP/uv.tar.gz" -C "$RUNNER_TEMP"
+            cp "$RUNNER_TEMP/uv-$TARGET/uv" "$sidecar"
+            file "$sidecar"
+          fi
 
-      # A fresh machine installs exactly the version this launcher shipped with; the in-app
-      # updater moves it on from there.
+      # Installers take semver, so a second release in a day, `.1`, goes in as `+1`: dpkg orders
+      # 2026.10.21 < 2026.10.21+1 < 2026.10.22, and NSIS makes it the fourth number. A candidate
+      # carries its release's version; semver's `-rc.1` would sort *after* it for dpkg. The app
+      # itself knows the full one. A file, not inline JSON, which Windows' quoting mangles.
       #
-      # Python, not `sed -i`: Git Bash rewrites in place by renaming a temp file, which on
-      # Windows contends with the checkout's own handles and mangles CRLF. And a stamp that
-      # silently misses ships BUILD_VERSION = "0.0.0", whose download URL 404s on every fresh
-      # install — so a miss has to fail the build, which `sed` would not do.
-      - name: Stamp the version
-        shell: bash
+      # On macOS the floor goes to Info.plist through the config, and to every C compiler a
+      # crate's build script runs through MACOSX_DEPLOYMENT_TARGET. Info.plist wants plain
+      # numbers, and dragging an app in replaces it whatever its version, so no `+1` there.
+      #
+      # The Mac app keeps the PyInstaller launcher's name, AlphaHarness.app, so dragging it into
+      # Applications replaces that one (and its Dock icon) rather than sitting beside it. Only
+      # there: on Windows the name is the install folder's, and %LOCALAPPDATA%\AlphaHarness is
+      # the data folder.
+      - name: Build
         run: |
-          uv run --no-project python - <<'PY'
-          import os, pathlib
-          path = pathlib.Path("launcher/alpha_harness_launcher.py")
-          text = path.read_text(encoding="utf-8")
-          old = 'BUILD_VERSION = "0.0.0"'
-          if old not in text:
-              raise SystemExit(f"::error::{old!r} not found — the constant was renamed")
-          new = f'BUILD_VERSION = "{os.environ["VERSION"]}"'
-          path.write_text(text.replace(old, new), encoding="utf-8")
-          print(new)
-          PY
+          IFS=. read -r year month day second <<<"$(grep -oE '^[0-9]+(\.[0-9]+)*' <<<"$ALPHA_HARNESS_VERSION")"
+          version="$year.$month.$day${second:++$second}"
+          if [ "$RUNNER_OS" = macOS ]; then
+            export MACOSX_DEPLOYMENT_TARGET="$MACOS_FLOOR"
+            printf '{"productName": "AlphaHarness", "version": "%s", "bundle": {"macOS": {"minimumSystemVersion": "%s"}}}\n' \
+              "$year.$month.$day" "$MACOS_FLOOR" > "$RUNNER_TEMP/version.json"
+          else
+            printf '{"version": "%s"}\n' "$version" > "$RUNNER_TEMP/version.json"
+          fi
+          cat "$RUNNER_TEMP/version.json"
+          pnpm --dir desktop install --frozen-lockfile
+          # --locked: built from Cargo.lock as committed, or not at all.
+          pnpm --dir desktop exec tauri build --target "$TARGET" --bundles "$BUNDLE" \
+            --config "$RUNNER_TEMP/version.json" -- --locked
+          cp desktop/src-tauri/target/$TARGET/release/bundle/$BUILT "$ASSET"
 
-      - name: Build AlphaHarness.exe
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          # Semicolon: PyInstaller splits SOURCE from DEST on os.pathsep, and this runs on
-          # Windows however bash-shaped the step looks.
-          # --paths: the launcher shares one module with the app, alpha_harness.window.
-          # --icon: the tray reads the running exe's own icon, so this is what puts our
-          # mark in the notification area rather than Windows' generic one.
-          uvx --from pyinstaller==6.22.3 pyinstaller --onefile --windowed --name AlphaHarness \
-            --add-binary "launcher/uv.exe;." \
-            --icon launcher/mark.ico \
-            --distpath dist \
-            --paths backend/src \
-            launcher/alpha_harness_launcher.py
-
-      # An .app is a folder, so macOS builds one-folder rather than one-file. LSUIElement keeps
-      # it out of the Dock: it hands itself to a background copy within a second, and a Dock
-      # icon that bounces and vanishes reads as a crash. Editing Info.plist breaks PyInstaller's
-      # ad-hoc signature, and Apple Silicon refuses to run an unsigned binary, so it is
-      # re-signed; ditto keeps the bundle's symlinks, which a plain zip would flatten.
-      # Pillow turns the .ico into the .icns an .app needs.
-      - name: Build AlphaHarness.app
-        if: runner.os == 'macOS'
-        run: |
-          uvx --from pyinstaller==6.22.3 --with pillow==12.3.0 pyinstaller --windowed \
-            --name AlphaHarness \
-            --osx-bundle-identifier io.github.residual-lab.alpha-harness \
-            --add-binary "launcher/uv:." \
-            --icon launcher/mark.ico \
-            --distpath dist \
-            --paths backend/src \
-            launcher/alpha_harness_launcher.py
-          plutil -replace LSUIElement -bool true dist/AlphaHarness.app/Contents/Info.plist
-          codesign --force --deep --sign - dist/AlphaHarness.app
-          ditto -c -k --keepParent dist/AlphaHarness.app "dist/$ASSET"
-
-      # Nothing else would notice a launcher that only opens on the runner's own macOS: CI
-      # builds it without complaint and the Macs it refuses are the users'.
+      # Nothing else would notice an app that only opens on the runner's own macOS: CI builds it
+      # without complaint and the Macs it refuses are the users'.
       - name: Check the oldest macOS it runs on
         if: runner.os == 'macOS'
         run: |
-          uv run --no-project python - <<'PY'
-          import pathlib, struct, sys
+          python3 - <<'PY'
+          import os, pathlib, struct, sys
 
-          FLOOR = (11, 0)
+          FLOOR = tuple(int(n) for n in os.environ["MACOS_FLOOR"].split("."))
 
 
           def minimums(data):
@@ -275,9 +304,14 @@ jobs:
               return found
 
 
+          bundles = pathlib.Path("desktop/src-tauri/target", os.environ["TARGET"], "release/bundle")
+          built = list((bundles / "macos").glob("*.app"))
+          if len(built) != 1:
+              sys.exit(f"::error::expected one .app, found {built}")
+          app = built[0]
           too_new = sorted(
               {(version, file.name)
-               for file in pathlib.Path("dist/AlphaHarness.app").rglob("*")
+               for file in app.rglob("*")
                if file.is_file() and not file.is_symlink()
                for version in minimums(file.read_bytes())
                if version > FLOOR}
@@ -287,35 +321,25 @@ jobs:
           sys.exit(1 if too_new else 0)
           PY
 
-      # The mark goes in for the applications menu entry the launcher writes on first run.
-      - name: Build the Linux launcher
-        if: runner.os == 'Linux'
-        run: |
-          uvx --from pyinstaller==6.22.3 pyinstaller --onefile --name AlphaHarness \
-            --add-binary "launcher/uv:." \
-            --add-data "frontend/public/mark.svg:." \
-            --distpath dist \
-            --paths backend/src \
-            launcher/alpha_harness_launcher.py
-          chmod 755 dist/AlphaHarness
-          tar -czf "dist/$ASSET" -C dist AlphaHarness
-
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: launcher-${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: desktop-${{ matrix.asset }}
+          path: ${{ matrix.asset }}
 
   publish:
-    needs: [wheel, launcher]
+    needs: [wheel, desktop]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: release
           merge-multiple: true
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+          # The checked version, never the raw input, which may already start with `v`.
+          tag_name: v${{ needs.wheel.outputs.version }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
           # Keeps a candidate out of /releases/latest, which is the only thing the in-app
@@ -323,12 +347,46 @@ jobs:
           prerelease: ${{ needs.wheel.outputs.prerelease == 'true' }}
           files: release/*
           body: |
-            **New here?** Download the one for your computer and open it. It installs everything on first start, which takes a couple of minutes, then opens in your browser.
+            **New here?** Download the one for your computer and install it. Its first start downloads Python and the app (about 330 MB), which takes a few minutes, then it opens in its own window.
 
-            - **Windows:** `AlphaHarness.exe`. Windows warns that it does not recognise the app — it is unsigned. Choose **More info**, then **Run anyway**.
-            - **Mac:** `AlphaHarness-macOS-arm64.zip` for Apple Silicon (M1 or later), or `AlphaHarness-macOS-x86_64.zip` for Intel. Open the zip and drag **AlphaHarness** into Applications. The first time, macOS will not open it because it is unsigned: open **System Settings › Privacy & Security**, scroll down, and choose **Open Anyway**.
-            - **Linux:** `AlphaHarness-linux-x86_64.tar.gz`. Extract it, then open **AlphaHarness**. It adds Alpha Harness to your applications menu.
+            - **Windows:** `AlphaHarness-windows-x64-setup.exe`. Windows warns that it does not recognise the app — it is unsigned. Choose **More info**, then **Run anyway**.
+            - **Mac:** `AlphaHarness-macOS-arm64.dmg` for Apple Silicon (M1 or later), or `AlphaHarness-macOS-x86_64.dmg` for Intel. Open it and drag **AlphaHarness** into Applications (if it asks, replace the old one). The first time, macOS will not open it because it is unsigned: open **System Settings › Privacy & Security**, scroll down, and choose **Open Anyway**.
+            - **Linux:** `AlphaHarness-linux-amd64.deb`, for Ubuntu 24.04 or later. Open it to install, or run `sudo apt install ./AlphaHarness-linux-amd64.deb`.
 
-            To close it: the tray icon on Windows, or **Quit Alpha Harness** in the account menu at the bottom of the sidebar.
+            Closing the window keeps Alpha Harness in the tray (the menu bar on a Mac), so your tasks keep simulating. To stop it, choose **Quit Alpha Harness** there.
 
-            **Already have it?** Do nothing. Alpha Harness offers this version in the app.
+            **Already have it?** Alpha Harness offers this version in the app. If it also asks you to install the new desktop app, quit the one you have, then install the one above: your data, Alphas and sign-in all carry over.
+
+  # The file every installed copy reads to learn of a release: what /releases/latest names now,
+  # on GitHub Pages. Never the API itself, which allows sixty anonymous calls an hour per
+  # address; a college hostel puts hundreds of people behind one. Once per repository: Settings
+  # > Pages > Source: GitHub Actions, and allow `v*` tags to deploy to the github-pages
+  # environment, which otherwise takes only the default branch.
+  pages:
+    needs: [wheel, publish]
+    # A candidate is never offered, so the file goes on naming the last real release.
+    if: needs.wheel.outputs.prerelease != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Cut to what the app reads, under the API's own field names.
+      - name: Write latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir site
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+            | jq '{tag_name, body, html_url, published_at, draft, prerelease,
+                   assets: [.assets[] | {name, browser_download_url}]}' > site/latest.json
+          jq -e '.tag_name' site/latest.json
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

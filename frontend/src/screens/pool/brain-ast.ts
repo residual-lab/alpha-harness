@@ -10,7 +10,7 @@ export interface AstToken {
 // The number branch takes an exponent too, so `1e-5` stays one token instead of leaving a
 // stray `e` to be coloured as a data field.
 const TOKEN =
-  /([a-zA-Z_][a-zA-Z0-9_]*(?=\s*\())|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|([a-zA-Z_][a-zA-Z0-9_]*)|([(),])|(\s+)|([^a-zA-Z0-9_\s(),]+)/g
+  /([a-zA-Z_][a-zA-Z0-9_]*(?=\s*\())|((?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)|([a-zA-Z_][a-zA-Z0-9_]*)|([(),])|(\s+)|([^a-zA-Z0-9_\s(),.]+|\.)/g
 
 /** Every character of `expr`, in order: a name followed by `(` is an operator. */
 export function tokenizeBrainAst(expr: string): AstToken[] {

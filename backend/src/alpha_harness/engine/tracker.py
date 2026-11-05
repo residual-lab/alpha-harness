@@ -156,9 +156,7 @@ class SimulationTracker:
                 sent_at=utcnow(),
             )
         if not won:
-            raise SubmissionFailed(
-                "No longer queued; it was removed before it was sent.", record_id=record_id
-            )
+            raise SubmissionFailed("No longer queued; it was removed before it was sent.")
 
         log.info("sim.pending", record_id=record_id, region=request.settings.region)
         await self.notify()
@@ -173,12 +171,7 @@ class SimulationTracker:
             await self._mark(
                 record_id, SimStatus.REJECTED, message=reason, from_=[SimStatus.PENDING]
             )
-            raise SubmissionFailed(
-                f"BRAIN rejected these settings — {reason}",
-                record_id=record_id,
-                cause=exc,
-                fields=exc.fields,
-            ) from exc
+            raise SubmissionFailed(f"BRAIN rejected these settings — {reason}", cause=exc) from exc
         except BrainError as exc:
             if exc.maybe_delivered:
                 # The POST may be running on BRAIN with its id lost in transit. Resending
@@ -208,7 +201,7 @@ class SimulationTracker:
                 await self._mark(
                     record_id, SimStatus.REJECTED, message=exc.message, from_=[SimStatus.PENDING]
                 )
-            raise SubmissionFailed(exc.message, record_id=record_id, cause=exc) from exc
+            raise SubmissionFailed(exc.message, cause=exc) from exc
 
         # --- 3. capture the id immediately ------------------------------
         platform_id = extract_simulation_id(response.location)
@@ -227,8 +220,7 @@ class SimulationTracker:
             )
             log.error("sim.no_location", record_id=record_id, status=response.status)
             raise SubmissionFailed(
-                "Simulation started but its id was not returned; it cannot be cancelled.",
-                record_id=record_id,
+                "Simulation started but its id was not returned; it cannot be cancelled."
             )
 
         async with self.db.session() as session:
@@ -241,7 +233,7 @@ class SimulationTracker:
         ):
             log.info("sim.cancelled_after_send", record_id=record_id, platform_id=platform_id)
             await self.notify()
-            raise SubmissionFailed("Cancelled while it was being sent.", record_id=record_id)
+            raise SubmissionFailed("Cancelled while it was being sent.")
 
         log.info("sim.running", record_id=record_id, platform_id=platform_id)
         self.watch(platform_id, response.retry_after)
@@ -260,8 +252,8 @@ class SimulationTracker:
     async def cancel(self, record_id: int) -> bool:
         """Cancel a simulation and mark it locally.
 
-        Returns ``False`` when there is nothing to cancel — no platform id yet, or the
-        row already reached a terminal state.
+        Returns ``False`` when nothing was cancelled: the row had already ended, or BRAIN did
+        not confirm stopping it.
         """
         record = await self.get(record_id)
         if record is None:
@@ -282,7 +274,8 @@ class SimulationTracker:
                 message="Cancelled before BRAIN returned an id.",
                 from_=[s for s in ACTIVE if s != SimStatus.RUNNING],
             ):
-                return False
+                # Cancelled: never sent, or the send stops it on BRAIN once its id lands.
+                return True
             record = await self.get(record_id)
             if record is None or not record.platform_id or SimStatus(record.status).terminal:
                 return False

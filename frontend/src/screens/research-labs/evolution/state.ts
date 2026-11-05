@@ -3,6 +3,7 @@
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { DEFAULT_SCOPE } from '@/lib/scope'
+import { followOtherTabs } from '@/lib/tabs'
 
 export interface EvolutionDraft {
   region: string
@@ -46,3 +47,4 @@ export const useEvolutionLab = create<EvolutionDraft>()(
     },
   ),
 )
+followOtherTabs(useEvolutionLab)

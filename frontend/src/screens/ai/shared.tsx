@@ -12,6 +12,22 @@ export const useProviders = () =>
   })
 export const useModels = () => useQuery({ queryKey: ['ai', 'models'], queryFn: llm.models })
 
+/**
+ * Set-up models one of the enabled Keys can run, most requests left today first, so the
+ * first is never one already spent. A model set up without such a Key cannot answer, so
+ * nothing that sends a request offers it. `ready` once both lists have loaded.
+ */
+export function useRunnableModels() {
+  const keys = useKeys()
+  const models = useModels()
+  const enabled = new Set(keys.data?.keys.filter((k) => k.enabled).map((k) => k.provider))
+  const left = new Map(keys.data?.budget.map((b) => [b.ref, b.remainingToday]))
+  const runnable = (models.data?.models ?? [])
+    .filter((m) => enabled.has(m.provider))
+    .sort((a, b) => (left.get(b.ref) ?? 0) - (left.get(a.ref) ?? 0))
+  return { runnable, all: models.data?.models ?? [], ready: keys.isSuccess && models.isSuccess }
+}
+
 /** After a Key or a model changes: everything that shows models or what is left of them. */
 export function useInvalidateKeys() {
   const queryClient = useQueryClient()

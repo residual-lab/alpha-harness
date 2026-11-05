@@ -1,6 +1,12 @@
 /** The settings a task holds at one value for every simulation, laid out as BRAIN lays them out. */
 
 import type { ReactNode } from 'react'
+import {
+  DEFAULT_TRUNCATION,
+  MAX_DECAY,
+  MAX_TEST_PERIOD_MONTHS,
+  MAX_TEST_PERIOD_YEARS,
+} from '@/api/platform'
 import { cn } from '@/lib/cn'
 import { Field, Fieldset, Input, Segmented } from '@/ui/kit'
 import { Select } from '@/ui/overlay'
@@ -20,9 +26,19 @@ const TILE = 'rounded-md border border-hairline-strong bg-surface-2 p-3'
 export const clamp = (text: string, max: number) =>
   Math.min(max, Math.max(0, Math.round(Number(text) || 0)))
 
+/**
+ * Truncation as typed: the default when the box is empty, `null` outside BRAIN's 0 to 1. Never
+ * clamped: "8" meant as 8% must not run at 1, and 0 (truncation off) must stay 0.
+ */
+export const truncationOf = (text: string): number | null => {
+  if (!text.trim()) return DEFAULT_TRUNCATION
+  const value = Number(text)
+  return Number.isFinite(value) && value >= 0 && value <= 1 ? value : null
+}
+
 /** BRAIN's `P{years}Y{months}M0D`, from the two boxes. */
 export const testPeriodOf = (years: string, months: string) =>
-  `P${clamp(years, 6)}Y${clamp(months, 11)}M0D`
+  `P${clamp(years, MAX_TEST_PERIOD_YEARS)}Y${clamp(months, MAX_TEST_PERIOD_MONTHS)}M0D`
 
 /**
  * Decay, Truncation, NaN Handling and Test Period — Test Period in years *and* months, as BRAIN
@@ -63,6 +79,7 @@ export function SimulationSettingsFields({
   testMonths: string
   setTestMonths: (v: string) => void
 }) {
+  const badTruncation = !truncationAgent && truncationOf(truncation) === null
   return (
     <div
       className={cn(
@@ -74,13 +91,17 @@ export function SimulationSettingsFields({
         <Input
           type="number"
           min={0}
-          max={512}
+          max={MAX_DECAY}
           step={1}
           value={decay}
           onChange={(e) => setDecay(e.target.value)}
         />
       </Field>
-      <Field label="Truncation" className={TILE}>
+      <Field
+        label="Truncation"
+        className={TILE}
+        error={badTruncation ? 'A number from 0 to 1.' : undefined}
+      >
         <div className="flex flex-col gap-2">
           {/* The value sits beside the mode switch, so Truncation stays one line tall like the
               fields around it; only the agent's summary drops below. */}
@@ -105,6 +126,7 @@ export function SimulationSettingsFields({
                 max={1}
                 step={0.01}
                 aria-label="Truncation"
+                aria-invalid={badTruncation || undefined}
                 className="min-w-0 flex-1"
                 value={truncation}
                 onChange={(e) => setTruncation(e.target.value)}
@@ -140,7 +162,7 @@ export function SimulationSettingsFields({
           <Input
             type="number"
             min={0}
-            max={6}
+            max={MAX_TEST_PERIOD_YEARS}
             step={1}
             aria-label="Test period, years"
             className="min-w-0 flex-1"

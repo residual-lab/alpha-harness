@@ -7,7 +7,7 @@ import type { Scope } from '@/api/types'
 import { DEFAULT_SCOPE, useScope } from '@/lib/scope'
 import { useDebounced } from '@/lib/use-debounced'
 import { type PickFrom, useDatasetPick } from '@/screens/data/dataset-pick'
-import { type FieldFilterState, useFieldFilter } from '@/screens/data/state'
+import { type FieldFilterState, startDatasetPick } from '@/screens/data/state'
 
 export interface LabDraft {
   region: string
@@ -74,14 +74,25 @@ export function useLabMarket(
       })
   }, [from, set])
 
-  const choose = () => {
-    // Back to the filter this lab applies, so the Explorer shows the fields it will use.
-    if (draft.fieldFilter) useFieldFilter.getState().replace({ ...draft.fieldFilter })
-    useDatasetPick.getState().start(scope, draft.datasetIds, from)
+  /** Over to the Data Explorer, from `ids` and `filter`: the lab's own unless given. */
+  const choose = (ids = draft.datasetIds, filter = draft.fieldFilter) => {
+    // On the filter this lab applies, so the Explorer shows the fields it will use.
+    startDatasetPick(scope, ids, from, filter)
     setDataScope(scope)
     void navigate({ to: '/data' })
   }
-  return { chosen, scope, choose }
+  /** To another market. Datasets belong to a region and delay, so leaving one drops them. */
+  const move = (change: Partial<Scope>) => {
+    const next: Partial<LabMarket> = {}
+    if (change.region !== undefined) next.region = change.region
+    if (change.delay !== undefined) next.delay = change.delay
+    if (change.universe !== undefined) next.universe = change.universe
+    const moved =
+      (next.region ?? draft.region) !== draft.region || (next.delay ?? draft.delay) !== draft.delay
+    if (moved) Object.assign(next, { datasetIds: [], fieldFilter: null })
+    if (Object.keys(next).length) set(next)
+  }
+  return { chosen, scope, choose, move }
 }
 
 /**
@@ -91,14 +102,14 @@ export function useLabMarket(
 export function useLabPreview<Body, Plan>(
   lab: string,
   body: Body,
-  preview: (body: Body) => Promise<Plan>,
+  preview: (body: Body, signal: AbortSignal) => Promise<Plan>,
   { enabled = true, wait = 300 }: { enabled?: boolean; wait?: number } = {},
 ) {
   const key = JSON.stringify(body)
   const settled = useDebounced(key, wait)
   const query = useQuery({
     queryKey: [lab, 'preview', settled],
-    queryFn: () => preview(JSON.parse(settled) as Body),
+    queryFn: ({ signal }) => preview(JSON.parse(settled) as Body, signal),
     enabled: enabled && settled === key,
     placeholderData: keepPreviousData,
   })
@@ -110,8 +121,20 @@ export function vectorOperatorsOf(draft: LabDraft, available: string[] | undefin
   return draft.vectorOperators ?? (available?.includes('vec_avg') ? ['vec_avg'] : [])
 }
 
+/**
+ * The chosen values this market offers. One ticked in another market is not shown here, so it
+ * must not be sent either; until the market's list loads, the choice is kept as it is.
+ */
+export const offeredOnly = (chosen: string[], available: readonly { value: string }[]) =>
+  available.length ? chosen.filter((v) => available.some((a) => a.value === v)) : chosen
+
 /** The market and settings both labs send to preview a task. */
-export function labBody(draft: LabDraft, vectorOperators: string[], cores: number) {
+export function labBody(
+  draft: LabDraft,
+  vectorOperators: string[],
+  cores: number,
+  neutralizations: readonly { value: string }[],
+) {
   return {
     region: draft.region,
     delay: draft.delay,
@@ -119,7 +142,7 @@ export function labBody(draft: LabDraft, vectorOperators: string[], cores: numbe
     dataset_ids: draft.datasetIds,
     field_filter: draft.fieldFilter ?? null,
     vector_operators: vectorOperators,
-    neutralizations: draft.neutralizations,
+    neutralizations: offeredOnly(draft.neutralizations, neutralizations),
     decay: draft.decay,
     cores,
   }

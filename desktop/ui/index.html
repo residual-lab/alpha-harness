@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Alpha Harness</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: Canvas;
+        color: CanvasText;
+      }
+      main {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+        max-width: 34rem;
+        padding: 24px;
+        text-align: center;
+      }
+      img {
+        width: 56px;
+        height: 56px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 20px;
+        font-weight: 600;
+      }
+      p {
+        margin: 0;
+        line-height: 1.5;
+        opacity: 0.72;
+      }
+      .bar {
+        width: 240px;
+        height: 3px;
+        overflow: hidden;
+        border-radius: 3px;
+        background: color-mix(in srgb, CanvasText 12%, transparent);
+      }
+      .bar::after {
+        content: "";
+        display: block;
+        width: 40%;
+        height: 100%;
+        background: CanvasText;
+        opacity: 0.55;
+        animation: slide 1.4s ease-in-out infinite;
+      }
+      @keyframes slide {
+        from {
+          transform: translateX(-100%);
+        }
+        to {
+          transform: translateX(250%);
+        }
+      }
+      /* The window has no title bar of its own on Windows and Linux: this one drags it. */
+      .titlebar {
+        position: fixed;
+        inset: 0 0 auto;
+        height: 48px;
+        display: flex;
+        justify-content: flex-end;
+      }
+      .titlebar button {
+        width: 44px;
+        border: 0;
+        background: transparent;
+        color: inherit;
+        opacity: 0.72;
+        display: grid;
+        place-items: center;
+      }
+      .titlebar button[hidden] {
+        display: none;
+      }
+      .titlebar button:hover {
+        opacity: 1;
+        background: color-mix(in srgb, CanvasText 10%, transparent);
+      }
+      .titlebar button.close:hover {
+        background: #e5484d;
+        color: #fff;
+      }
+      .titlebar svg {
+        width: 16px;
+        height: 16px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.5;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .bar::after {
+          animation: none;
+          width: 100%;
+          opacity: 0.3;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="titlebar" data-tauri-drag-region="deep">
+      <button type="button" data-action="minimize" aria-label="Minimise" hidden>
+        <svg viewBox="0 0 16 16"><path d="M3 8h10" /></svg>
+      </button>
+      <button type="button" data-action="toggleMaximize" aria-label="Maximise" hidden>
+        <svg viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9" /></svg>
+      </button>
+      <button type="button" class="close" data-action="close" aria-label="Close to the tray" hidden>
+        <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+      </button>
+    </header>
+    <main>
+      <img src="icon.svg" alt="" />
+      <h1>Alpha Harness</h1>
+      <div class="bar" role="progressbar" aria-label="Starting Alpha Harness"></div>
+      <p id="status" role="status">Starting…</p>
+    </main>
+    <script>
+      // The supervisor reports each step: asked once for the one it is on, then told the rest.
+      const status = document.getElementById("status");
+      const show = (text) => {
+        if (text) status.textContent = text;
+      };
+      const tauri = window.__TAURI__;
+      // macOS draws its own window buttons; elsewhere these stand in for the missing title bar.
+      if (tauri && !navigator.userAgent.includes("Mac")) {
+        const appWindow = tauri.window.getCurrentWindow();
+        for (const button of document.querySelectorAll(".titlebar button")) {
+          button.hidden = false;
+          button.addEventListener("click", () => appWindow[button.dataset.action]());
+        }
+      }
+      if (tauri) {
+        // Asked once listening, and only if nothing newer was heard while asking.
+        let heard = false;
+        tauri.event
+          .listen("startup", (event) => {
+            heard = true;
+            show(event.payload);
+          })
+          .then(() => tauri.core.invoke("startup_status"))
+          .then((text) => heard || show(text));
+      }
+    </script>
+  </body>
+</html>

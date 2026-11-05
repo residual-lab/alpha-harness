@@ -30,6 +30,7 @@ from ..brain.errors import (
     BrainValidationError,
 )
 from ..brain.filters import platform_midnight
+from ..brain.platform import MULTI_SIMULATION_SIZE, SIMULATION_SLOTS
 from ..brain.schemas import QUICK_MODE, SimulationRequest
 from ..db.models import ACTIVE, DedupEntry, SimStatus, SimulationRecord, Study, TaskQuota, utcnow
 from ..tasks import spawn
@@ -48,16 +49,7 @@ from .lifecycle import (
     request_hash,
     transition,
 )
-from .packer import (
-    MAX_BATCH,
-    Batch,
-    WorkItem,
-    allocate_slots,
-    demand_by_task,
-    key_of,
-    match_children,
-    pack,
-)
+from .packer import Batch, WorkItem, allocate_slots, demand_by_task, key_of, match_children, pack
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -70,10 +62,6 @@ log = structlog.get_logger(__name__)
 
 #: Added to a batched simulation's outcome when BRAIN named no child, so it was matched by order.
 POSITIONAL_NOTE = "Matched to this request by submission order."
-
-#: Concurrent simulations the platform allows. Accounts without MULTI_SIMULATION get the
-#: same slots, one simulation per batch.
-DEFAULT_SLOTS = 8
 
 #: How often the engine looks for work.
 TICK_SECONDS = 2.0
@@ -115,7 +103,7 @@ class BatchEngine:
         self.db = db
         self.endpoints = endpoints
         self.tracker = tracker
-        self.slots = DEFAULT_SLOTS
+        self.slots = SIMULATION_SLOTS
         #: Asked while BRAIN refuses the session; True once simulations may be sent again.
         self._on_unauthorized = on_unauthorized
         #: Set when BRAIN answers 401. Sending on stops until the session is usable: every
@@ -133,7 +121,8 @@ class BatchEngine:
         #: Set when the daily cap is hit. Nothing is submitted until it clears, because
         #: retrying before the US-Eastern reset cannot succeed.
         self._daily_limit_hit = False
-        #: Monotonic time of BRAIN's quota reset; the flag clears once it passes.
+        #: Wall-clock time of BRAIN's quota reset; the flag clears once it passes. Not
+        #: monotonic: that clock stops while the computer sleeps, and BRAIN's day does not.
         self._limit_resets_at: float | None = None
         self._enqueue_lock = asyncio.Lock()
         #: Reads finished batches back beside the scheduling round; at most one at a time.
@@ -142,7 +131,7 @@ class BatchEngine:
         #: row, because its batch still has children running.
         self._child_results: dict[str, tuple[dict[str, Any], Outcome]] = {}
         #: Batch size, reduced to 1 for accounts without MULTI_SIMULATION.
-        self.max_batch = MAX_BATCH
+        self.max_batch = MULTI_SIMULATION_SIZE
         #: Set once BRAIN refuses a batch with 403; lasts for the process.
         self._batch_refused = False
         #: Blocks OS sleep while work is pending; checked every AWAKE_TICKS rounds.
@@ -187,7 +176,7 @@ class BatchEngine:
         batches BRAIN already refused.
         """
         allowed = "MULTI_SIMULATION" in permissions and not self._batch_refused
-        self.max_batch = MAX_BATCH if allowed else 1
+        self.max_batch = MULTI_SIMULATION_SIZE if allowed else 1
         self.quick_allowed = "QUICK_MODE" in permissions
 
     def _moded(self, request: SimulationRequest) -> SimulationRequest:
@@ -208,7 +197,7 @@ class BatchEngine:
         self,
         requests: list[SimulationRequest],
         *,
-        task: str = MANUAL_TASK,
+        task: str,
     ) -> dict[str, Any]:
         """Accept work. Returns what was queued and what was skipped as a duplicate.
 
@@ -512,7 +501,7 @@ class BatchEngine:
 
     async def _fill_slots(self) -> int:
         reset = self._limit_resets_at
-        if self._daily_limit_hit and reset is not None and time.monotonic() >= reset:
+        if self._daily_limit_hit and reset is not None and time.time() >= reset:
             # BRAIN's day has turned: the quota is back.
             self._daily_limit_hit = False
             self._limit_resets_at = None
@@ -648,9 +637,6 @@ class BatchEngine:
         try:
             await self.tracker.submit(request, item.record_id)
             return True
-        except BrainDailyLimitReached:
-            await self._on_daily_limit()
-            return False
         except SubmissionFailed as exc:
             # The tracker wraps platform errors, so the daily cap arrives as a cause
             # rather than as itself. Missing it here would march the whole queue into
@@ -889,7 +875,7 @@ class BatchEngine:
 
     async def _on_daily_limit(self) -> None:
         self._daily_limit_hit = True
-        self._limit_resets_at = time.monotonic() + await self._seconds_to_reset()
+        self._limit_resets_at = time.time() + await self._seconds_to_reset()
         log.warning("engine.daily_limit_reached")
         await self.tracker.notify()
 

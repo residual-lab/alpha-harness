@@ -6,20 +6,22 @@ only decides how one point of its search is drawn (its ``draw``).
 """
 
 import asyncio
+import functools
 import json
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import String, func, not_, or_, select, type_coerce, update
 
+from ..brain.platform import MULTI_SIMULATION_SIZE
 from ..brain.schemas import SimulationRequest, SimulationSettings, SimulationType
 from ..brain.settings_schema import validate_settings
 from ..db.models import SimStatus, SimulationRecord, Study, StudyStatus, Trial, TrialState, utcnow
-from ..engine.packer import MAX_BATCH
-from . import ga, search, template, template_v1
+from . import ga, search, template
 from .objectives import StudyNotFoundError
 from .params import (
     CORRELATION_BREAKER,
+    FIELDS_SAMPLER,
     GA_SAMPLER,
     POWER_POOL_SAMPLER,
     SEARCH_SAMPLER,
@@ -51,6 +53,22 @@ PENDING_SEND = "Waiting for cores."
 #: Parks the Full re-run a Quick Alpha that passed is owed, until there is room to send it.
 PENDING_FULL = "Waiting to run in Full mode."
 
+#: Stored for a trial's field slot in place of its distribution, which :func:`field_slots`
+#: rebuilds from the task's own space. Each copy was every field of a universe: 127 KB a trial.
+FROM_SPACE = "space"
+
+
+def field_slots(row: Study) -> dict[str, tuple[str, ...]]:
+    """A Search or Template Lab task's field slots with their choices, fixed with the task.
+
+    Empty for a lab without them, whose trials store their distributions whole.
+    """
+    if row.sampler == SEARCH_SAMPLER:
+        return search.slots(params_of(row, SearchParams).space)
+    if row.sampler == TEMPLATE_SAMPLER:
+        return template.slots(params_of(row, TemplateParams).space)
+    return {}
+
 
 def queued(outcome: dict[str, Any]) -> dict[str, Any]:
     """A trial's fields once the engine has taken its request, per ``enqueue``'s outcome."""
@@ -60,6 +78,27 @@ def queued(outcome: dict[str, Any]) -> dict[str, Any]:
         "alpha_id": outcome.get("alphaId"),
         "message": FREE if outcome.get("status") == str(SimStatus.SKIPPED) else None,
     }
+
+
+def repark(trial: Trial, sampler: str) -> None:
+    """Put a trial whose simulation never left the queue back where it waited to be sent.
+
+    It spent nothing, so it is neither a result nor a failure, and a lab that wrote its work
+    up front has no other copy of it to send.
+    """
+    if (trial.params or {}).get("fullOf") is not None:
+        message = PENDING_FULL
+    elif sampler == POWER_POOL_SAMPLER:
+        from . import power_pool  # imported here: labs.power_pool builds on this module
+
+        message = power_pool.PROPOSED
+    else:
+        message = PENDING_SEND
+    trial.state = TrialState.PRUNED
+    trial.message = message
+    trial.simulation_record_id = None
+    trial.alpha_id = None
+    trial.finished_at = None
 
 
 def request_of(trial: Trial) -> SimulationRequest:
@@ -118,6 +157,56 @@ def to_ask(batch_size: int, in_flight: int, left: int) -> int:
     return max(0, min(room - room % 10, left))
 
 
+async def _still_sending(optimizer: Optimizer, rows: list[Study]) -> set[int]:
+    """The running tasks with simulations left to send: short of their target, holding parked
+    work, or with work queued in the engine. The rest only wait on what is out."""
+    ids = [r.id for r in rows]
+    tasks = [r.task for r in rows]
+    async with optimizer.db.session() as session:
+        spent = dict(
+            (
+                await session.execute(
+                    select(
+                        Trial.study_id,
+                        func.count().filter(
+                            Trial.state != TrialState.PRUNED, _not_free(), not_(full_run())
+                        ),
+                    )
+                    .where(Trial.study_id.in_(ids))
+                    .group_by(Trial.study_id)
+                )
+            )
+            .tuples()
+            .all()
+        )
+        parked = set(
+            await session.scalars(
+                select(Trial.study_id)
+                .where(
+                    Trial.study_id.in_(ids),
+                    Trial.state == TrialState.PRUNED,
+                    Trial.message.in_([PENDING_SEND, PENDING_FULL]),
+                )
+                .distinct()
+            )
+        )
+        queued = set(
+            await session.scalars(
+                select(SimulationRecord.task)
+                .where(
+                    SimulationRecord.task.in_(tasks), SimulationRecord.status == SimStatus.QUEUED
+                )
+                .distinct()
+            )
+        )
+    return {
+        r.id
+        for r in rows
+        if not task_params(r).stopping
+        and (spent.get(r.id, 0) < r.max_trials or r.id in parked or r.task in queued)
+    }
+
+
 async def start_waiting(optimizer: Optimizer) -> int:
     """Start queued tasks while their cores fit in the engine's slots. Returns how many."""
     async with scheduling:
@@ -132,7 +221,14 @@ async def start_waiting(optimizer: Optimizer) -> int:
                     )
                 ).all()
             )
-        used = sum(cores_of(r) for r in rows if r.status == StudyStatus.RUNNING)
+        running = [r for r in rows if r.status == StudyStatus.RUNNING]
+        if optimizer.engine.lend_idle_cores and running:
+            # Lending: a task that has sent everything holds no cores, only the batches still
+            # out, which the engine never takes back. Otherwise a task waiting for its cores
+            # stands idle beside them until the last of those batches returns.
+            sending = await _still_sending(optimizer, running)
+            running = [r for r in running if r.id in sending]
+        used = sum(cores_of(r) for r in running)
         waiting = sorted(
             (r for r in rows if r.status == StudyStatus.QUEUED),
             key=lambda r: (task_params(r).queued_at or "", r.id),
@@ -180,12 +276,15 @@ def ask_points(
     seen: dict[tuple[str, str], float | bool],
     cover: list[str],
     schema: dict[str, Any] | None = None,
-) -> list[tuple[Any, dict[str, Any], SimulationRequest]]:
+) -> tuple[list[tuple[Any, dict[str, Any], SimulationRequest]], str | None]:
     """Ask for ``want`` new simulations. Runs off the event loop.
 
     A point this task already scored is answered with its score, one that failed is told as
     failed, and a repeat, or a point its lab cannot write, is pruned; each time another
     point is asked, so quota is only spent on Alphas the task has not seen.
+
+    Also returns the first setting BRAIN refused, so a task left with nothing to ask can say
+    whether BRAIN withdrew what it searches or the search ran out of new points.
     """
     from optuna.trial import TrialState as OptunaState
 
@@ -197,6 +296,7 @@ def ask_points(
     choices = lab.field_choices(space)
     picked: list[tuple[Any, dict[str, Any], SimulationRequest]] = []
     keys: set[tuple[str, str]] = set()
+    withdrawn: str | None = None
     for _ in range(want * 5):
         if len(picked) >= want:
             break
@@ -210,6 +310,7 @@ def ask_points(
             # A task's space is fixed when it is added, but BRAIN withdraws settings. Sent,
             # the point is only rejected; pruned, it costs nothing and the search asks again.
             log.warning("tasks.point_unavailable", problem=problems[0])
+            withdrawn = withdrawn or problems[0]
             study.tell(trial, state=OptunaState.PRUNED)
             continue
         key = (
@@ -230,7 +331,7 @@ def ask_points(
             continue
         keys.add(key)
         picked.append((trial, params, request))
-    return picked
+    return picked, withdrawn
 
 
 async def advance(optimizer: Optimizer, study_id: int) -> int:
@@ -277,7 +378,7 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
     last_number = -1 if last is None else int(last)
     # Borrowed cores only run what is queued, so a task queues for them too; the engine then
     # hands them to whichever tasks have work beyond their own cores.
-    room = row.batch_size + optimizer.lendable_cores * MAX_BATCH
+    room = row.batch_size + optimizer.lendable_cores * MULTI_SIMULATION_SIZE
     space = room - int(in_flight or 0)
     if not stopping and space > 0:
         # Ahead of the task's own budget: a passing Quick Alpha is only submittable once it is
@@ -303,7 +404,8 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
         return 0
     want = to_ask(room, int(in_flight or 0), row.max_trials - committed)
     if row.sampler in (GA_SAMPLER, SEARCH_SAMPLER, TEMPLATE_SAMPLER) and want > 0:
-        # Only after a crash between writing a round's trials and sending them (`_queue`).
+        # Put back by a pause (`repark`), or left by a crash between writing a round's
+        # trials and sending them (`_queue`).
         async with optimizer.db.session() as session:
             leftovers = (
                 await session.scalars(
@@ -325,8 +427,16 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
         from . import power_pool  # imported here: labs.power_pool builds on this module
 
         return await power_pool.refill(optimizer, row, want, waiting)
-    # Both write every simulation up front, so both are drained the same way.
-    if row.sampler in (SETTINGS_SAMPLER, CORRELATION_BREAKER, SUPER_LAB):
+    if row.sampler == FIELDS_SAMPLER:
+        from ..tools import fields_sampler  # same cycle as settings_sampler below
+
+        return await fields_sampler.refill(optimizer, row, want, waiting)
+    # These write every simulation up front, so all are drained the same way.
+    if row.sampler in (
+        SETTINGS_SAMPLER,
+        CORRELATION_BREAKER,
+        SUPER_LAB,
+    ):
         from ..tools import settings_sampler  # same cycle: it builds on this module
 
         return await settings_sampler.refill(optimizer, row, want, waiting)
@@ -334,9 +444,8 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
         return 0
 
     if row.sampler == TEMPLATE_SAMPLER:
-        typed = params_of(row, TemplateParams)
-        lab = template_v1 if typed.tree else template
-        run: SearchParams = typed
+        lab = template
+        run: SearchParams = params_of(row, TemplateParams)
     else:
         lab = search
         run = params_of(row, SearchParams)
@@ -364,11 +473,21 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
 
     study = await optimizer.optuna_study(study_id, row)
     schema = await optimizer.metadata.cached_settings_schema()
-    picked = await asyncio.to_thread(ask_points, study, lab, run, want, seen, cover, schema)
+    picked, withdrawn = await asyncio.to_thread(
+        ask_points, study, lab, run, want, seen, cover, schema
+    )
     if not picked:
         # Nothing new left to ask: the task is done once what is out has come back.
         if not waiting:
-            await optimizer.set_status(study_id, StudyStatus.COMPLETE)
+            await finish(
+                optimizer,
+                study_id,
+                StudyStatus.COMPLETE,
+                f"Stopped early: BRAIN no longer accepts a setting this task searches "
+                f"({withdrawn})."
+                if withdrawn
+                else "Stopped early: every point the search drew had been simulated already.",
+            )
         return 0
 
     return await _queue(optimizer, row, last_number, picked)
@@ -395,13 +514,19 @@ def _search_memory(
     """The fields tried as ``covers`` and every point already scored, from unpruned trials.
 
     Runs in a worker thread: identity keys validate each trial's settings, which costs
-    seconds at the largest task sizes.
+    seconds at the largest task sizes. A task reuses a few settings many times over, so each
+    is validated once: measured, a seventh of the time.
     """
+
+    @functools.cache
+    def settings_of(raw: str | None) -> str:
+        return search.settings_identity(json.loads(raw or "null"))
+
     tried: set[Any] = set()
     seen: dict[tuple[str, str], float | bool] = {}
     for state, params, expression, settings, values in rows:
         tried.add((json.loads(params or "null") or {}).get(covers))
-        key = search.identity_of(expression, json.loads(settings or "null"))
+        key = (expression or "", settings_of(settings))
         scores = json.loads(values or "null")
         if state == TrialState.COMPLETE and scores:
             seen[key] = float(scores[0])
@@ -424,6 +549,7 @@ async def _queue(
     from optuna.distributions import distribution_to_json
 
     live = optimizer.open_trials.setdefault(row.id, {})
+    slots = field_slots(row)
     number = last_number
     async with optimizer.db.session() as session:
         batch: list[Trial] = []
@@ -435,7 +561,7 @@ async def _queue(
                     number=number,
                     params=params,
                     distributions={
-                        name: distribution_to_json(distribution)
+                        name: FROM_SPACE if name in slots else distribution_to_json(distribution)
                         for name, distribution in (asked.distributions.items() if asked else ())
                     },
                     expression=request.regular,
@@ -576,9 +702,8 @@ async def resize_task(
             stored = await session.get(Study, row.id)
             if stored is None:
                 raise StudyNotFoundError(row.id)
-            # The Settings Sampler keeps its spare batch (see api/tools.py).
-            spare = 1 if stored.sampler == SETTINGS_SAMPLER else 0
-            stored.batch_size = (cores + spare) * 10
+            # By the change in cores, so a task created with a spare batch keeps it.
+            stored.batch_size += (cores - task_params(stored).cores) * MULTI_SIMULATION_SIZE
             if simulations is not None:
                 stored.max_trials = simulations
             params = task_params(stored)
@@ -588,6 +713,34 @@ async def resize_task(
         await optimizer.engine.set_quota(row.task, cores)
     await optimizer.notify()
     return None
+
+
+#: Why a Template Lab task added while templates were built from blocks was closed.
+BLOCK_TEMPLATE = (
+    "Added with an older Template Lab that no longer runs. Add the template again to carry on."
+)
+
+
+async def retire_block_templates(optimizer: Optimizer) -> int:
+    """Close every unfinished Template Lab task added while templates were built from blocks:
+    nothing can run one now. Their Alphas stay where they are."""
+    async with optimizer.db.session() as session:
+        old = list(
+            (
+                await session.scalars(
+                    select(Study.id).where(
+                        Study.sampler == TEMPLATE_SAMPLER,
+                        Study.status != StudyStatus.COMPLETE,
+                        func.json_extract(Study.sampler_params, "$.tree").is_not(None),
+                    )
+                )
+            ).all()
+        )
+    for study_id in old:
+        await finish(optimizer, study_id, StudyStatus.COMPLETE, BLOCK_TEMPLATE)
+    if old:
+        log.info("tasks.block_templates_closed", count=len(old))
+    return len(old)
 
 
 async def finish(optimizer: Optimizer, study_id: int, status: StudyStatus, message: str) -> None:
@@ -613,21 +766,22 @@ async def finish(optimizer: Optimizer, study_id: int, status: StudyStatus, messa
 
 
 async def prune_unsent(optimizer: Optimizer, study_id: int, *, everything: bool = False) -> int:
-    """Mark trials whose simulation was taken off the queue as never run.
+    """Put back the trials whose simulation was taken off the queue before it was sent.
 
-    They spent nothing, so they are pruned rather than failed: failing them would teach the
-    search that these points score badly.
+    They spent nothing, so each waits to be sent when the task next runs (:func:`repark`).
+    Failing them would teach the search that these points score badly.
 
-    ``everything`` closes every open trial regardless of what its simulation is doing, for
-    a forced stop. Pruned rather than failed for the same reason: an unscored point is not
-    evidence that the point is bad.
+    ``everything`` also closes every trial already sent, for a forced stop. Pruned rather than
+    failed for the same reason: an unscored point is not evidence that the point is bad.
     """
     from optuna.trial import TrialState as OptunaState
 
     live = optimizer.open_trials.get(study_id, {})
     study = optimizer.studies.get(study_id)
-    pruned = 0
+    closed = 0
     async with optimizer.db.session() as session:
+        row = await session.get(Study, study_id)
+        sampler = row.sampler if row is not None else ""
         open_trials = list(
             (
                 await session.scalars(
@@ -639,30 +793,53 @@ async def prune_unsent(optimizer: Optimizer, study_id: int, *, everything: bool 
             ).all()
         )
         ids = [t.simulation_record_id for t in open_trials if t.simulation_record_id]
-        cancelled = set(
+        never_sent = set(
             (
                 await session.scalars(
                     select(SimulationRecord.id).where(
                         SimulationRecord.id.in_(ids),
                         SimulationRecord.status == SimStatus.CANCELLED,
+                        SimulationRecord.sent_at.is_(None),
                     )
                 )
             ).all()
         )
         for trial in open_trials:
-            unsent = not trial.simulation_record_id or trial.simulation_record_id in cancelled
-            if not (unsent or everything):
+            if not trial.simulation_record_id or trial.simulation_record_id in never_sent:
+                # Its live Optuna trial stays open, to be told when the resend comes back.
+                repark(trial, sampler)
+            elif everything:
+                trial.state = TrialState.PRUNED
+                trial.message = "The task was stopped before this finished."
+                trial.finished_at = utcnow()
+                optuna_trial = live.pop(trial.number, None)
+                if study is not None and optuna_trial is not None:
+                    study.tell(optuna_trial, state=OptunaState.PRUNED, skip_if_finished=True)
+            else:
                 continue
-            trial.state = TrialState.PRUNED
-            trial.message = (
-                "Taken off the queue before it was sent."
-                if unsent
-                else "The task was stopped before this finished."
-            )
-            trial.finished_at = utcnow()
-            pruned += 1
-            optuna_trial = live.pop(trial.number, None)
-            if study is not None and optuna_trial is not None:
-                study.tell(optuna_trial, state=OptunaState.PRUNED, skip_if_finished=True)
+            closed += 1
         await session.commit()
-    return pruned
+    return closed
+
+
+async def pause(optimizer: Optimizer, study_id: int) -> int | None:
+    """Queue nothing more for a task: what is out finishes, the rest waits for it to run again.
+
+    Returns how many queued simulations came off the queue, or ``None`` when the task is not
+    running or waiting, or is already stopping.
+    """
+    # Read under the lock: checked outside it, a task that finished its last trial in the
+    # meantime was written back to PAUSED, and a finished task holds no cores.
+    async with optimizer.lock(study_id):
+        row = await optimizer.get(study_id)
+        if (
+            row is None
+            or row.status not in (StudyStatus.RUNNING, StudyStatus.QUEUED)
+            or task_params(row).stopping
+        ):
+            return None
+        await optimizer.set_status(study_id, StudyStatus.PAUSED)
+        dropped = await optimizer.engine.drop_queued(row.task)
+        await prune_unsent(optimizer, study_id)
+    await start_waiting(optimizer)
+    return dropped

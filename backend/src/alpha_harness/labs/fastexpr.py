@@ -13,27 +13,12 @@ import re
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
+from ..brain.platform import GROUPING_FIELDS, UNCOUNTED_OPERATORS
+
 if TYPE_CHECKING:
     import random
     from collections.abc import Set as AbstractSet
 
-#: Excluded from BRAIN's operator count, and never mutated: they fill gaps, not signal.
-UNCOUNTED = frozenset({"ts_backfill", "group_backfill"})
-#: A Power Pool Alpha's most operators and unique data fields, as :func:`operator_count` and
-#: :func:`data_fields` count them.
-MAX_OPERATORS, MAX_FIELDS = 8, 3
-#: Grouping fields, which never count as data fields (``interpret-results/alpha-submission.md``).
-GROUPING = (
-    "market",
-    "sector",
-    "industry",
-    "subindustry",
-    "country",
-    "exchange",
-    "currency",
-    "split",
-    "adjfactor",
-)
 COMPARISONS = ("==", "!=", "<", "<=", ">", ">=")
 
 
@@ -354,10 +339,46 @@ def walk(node: Node, path: Path = ()) -> list[tuple[Path, Node]]:
     return found
 
 
+def walk_with_parents(
+    node: Node, path: Path = (), parent: Node | None = None
+) -> list[tuple[Path, Node, Node | None]]:
+    """:func:`walk` with each node's parent beside it, ``None`` at the root: found on the way
+    down rather than by descending from the root again for every node."""
+    found = [(path, node, parent)]
+    for index, child in enumerate(children(node)):
+        found.extend(walk_with_parents(child, (*path, index), node))
+    return found
+
+
 def node_at(node: Node, path: Path) -> Node:
     for index in path:
         node = children(node)[index]
     return node
+
+
+def relabel(node: Node, values: dict[Path, str]) -> Node:
+    """``node`` with the value at each of ``values``' paths replaced, in one pass. The shape
+    never changes, so this is :func:`replace_at` once per path, without rebuilding the way down
+    from the root again for each."""
+    if not values:
+        return node
+    own = values.get(())
+    below: dict[int, dict[Path, str]] = {}
+    for path, value in values.items():
+        if path:
+            below.setdefault(path[0], {})[path[1:]] = value
+    if not below:
+        return replace(node, value=own) if own is not None else node
+    count = len(node.args)
+    return replace(
+        node,
+        value=node.value if own is None else own,
+        args=tuple(relabel(a, below[i]) if i in below else a for i, a in enumerate(node.args)),
+        kwargs=tuple(
+            (key, relabel(v, below[count + i])) if count + i in below else (key, v)
+            for i, (key, v) in enumerate(node.kwargs)
+        ),
+    )
 
 
 def replace_at(node: Node, path: Path, new: Node) -> Node:
@@ -382,25 +403,20 @@ def data_fields(tree: Node, *, grouping: bool = False) -> list[str]:
     keeps the grouping fields: they do not count, but they still have to exist where the
     expression runs, and some (``currency``, ``split``) are missing from some markets.
     """
-    nodes = walk(tree)
-    assigned = {n.value for _, n in nodes if n.kind == "assign"}
+    nodes = walk_with_parents(tree)
+    assigned = {n.value for _, n, _ in nodes if n.kind == "assign"}
     # In order of first appearance, left to right, as the reader wrote them.
     return list(
         dict.fromkeys(
             n.value
-            for path, n in nodes
+            for path, n, parent in nodes
             if n.kind == "name"
-            and not (path and path[-1] >= len(node_at(tree, path[:-1]).args))
+            and not (parent is not None and path[-1] >= len(parent.args))
             and n.value not in assigned
-            and (grouping or n.value not in GROUPING)
+            and (grouping or n.value not in GROUPING_FIELDS)
             and n.value.lower() not in ("true", "false", "nan")
         )
     )
-
-
-def operator_names(tree: Node) -> list[str]:
-    """Each operator the expression calls, once, in order of first appearance."""
-    return list(dict.fromkeys(n.value for _, n in walk(tree) if n.kind == "call"))
 
 
 def operator_count(node: Node) -> int:
@@ -411,7 +427,7 @@ def operator_count(node: Node) -> int:
     """
     negative = node.kind == "unary" and node.value == "-" and node.args[0].kind == "num"
     own = int(
-        (node.kind == "call" and node.value not in UNCOUNTED)
+        (node.kind == "call" and node.value not in UNCOUNTED_OPERATORS)
         or (node.kind in ("unary", "binary", "ternary") and not negative)
     )
     return own + sum(operator_count(child) for child in children(node))
@@ -419,9 +435,13 @@ def operator_count(node: Node) -> int:
 
 def protected(tree: Node, path: Path) -> bool:
     """A grouping input or a keyword value: slots that must not receive a signal."""
-    if not path:
+    return guarded(node_at(tree, path[:-1]) if path else None, path)
+
+
+def guarded(parent: Node | None, path: Path) -> bool:
+    """:func:`protected`, for a node whose ``parent`` is already known."""
+    if parent is None:
         return False
-    parent = node_at(tree, path[:-1])
     if path[-1] >= len(parent.args):
         return True
     return parent.kind == "call" and parent.value.startswith("group_") and path[-1] >= 1
@@ -436,11 +456,27 @@ def crossover(rng: random.Random, left: Node, right: Node) -> Node | None:
     The left root is never replaced (that would just be the other parent), and grouping
     and keyword slots are never exchanged.
     """
-    mine = [p for p, n in walk(left) if p and n.kind == "call" and not protected(left, p)]
-    theirs = [n for p, n in walk(right) if n.kind == "call" and not protected(right, p)]
-    if not mine or not theirs:
+    return graft(rng, left, graft_sites(left), grafts(right))
+
+
+def graft_sites(tree: Node) -> list[Path]:
+    """Where :func:`crossover` may graft into ``tree``: any call but the root, outside the
+    grouping and keyword slots."""
+    return [
+        p for p, n, up in walk_with_parents(tree) if p and n.kind == "call" and not guarded(up, p)
+    ]
+
+
+def grafts(tree: Node) -> list[Node]:
+    """The calls :func:`crossover` may take from ``tree``."""
+    return [n for p, n, up in walk_with_parents(tree) if n.kind == "call" and not guarded(up, p)]
+
+
+def graft(rng: random.Random, left: Node, sites: list[Path], taken: list[Node]) -> Node | None:
+    """:func:`crossover` with both lists already read off the parents."""
+    if not sites or not taken:
         return None
-    child = replace_at(left, rng.choice(mine), rng.choice(theirs))
+    child = replace_at(left, rng.choice(sites), rng.choice(taken))
     return None if child == left else child
 
 
@@ -449,20 +485,29 @@ def validate(
 ) -> list[str]:
     """Why BRAIN would reject this tree, or nothing."""
     problems: list[str] = []
-    assigned = {node.value for _, node in walk(tree) if node.kind == "assign"}
-    for path, node in walk(tree):
+    nodes = walk_with_parents(tree)
+    assigned = {node.value for _, node, _ in nodes if node.kind == "assign"}
+    for path, node, parent in nodes:
         if node.kind == "call":
             info = table.get(node.value)
             if info is None:
                 problems.append(f"{node.value} is not an operator on BRAIN.")
                 continue
             count = len(node.args)
-            if count < info.required or (info.maximum is not None and count > info.maximum):
-                problems.append(f"{node.value} does not take {count} inputs.")
+            supplied = count + len(node.kwargs)
+            # A required input may be named rather than placed: kth_element(x, 15, k = 1).
+            names = [p.split("=")[0].strip() for p in info.params]
+            given = {*names[:count], *(key for key, _ in node.kwargs)}
+            required = [
+                n for p, n in zip(info.params, names, strict=True) if "=" not in p and ".." not in p
+            ]
+            short = any(n not in given for n in required) if info.params else count < info.required
+            if short or (info.maximum is not None and supplied > info.maximum):
+                problems.append(f"{node.value} does not take {supplied} inputs.")
         elif (
             node.kind == "name"
             # A keyword value names an option (``driver=gaussian``), not a data field.
-            and not (path and path[-1] >= len(node_at(tree, path[:-1]).args))
+            and not (parent is not None and path[-1] >= len(parent.args))
             and node.value not in known_names
             and node.value not in assigned
             and node.value.lower() not in ("true", "false", "nan")

@@ -15,6 +15,7 @@ fails past 8,000 operators in all, and drops what does not fit.
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ..brain.platform import SUPER_ALPHA_MIN_SELECTION, SUPER_ALPHA_OPERATOR_LIMIT
 from ..brain.schemas import FULL_MODE, SimulationRequest, SimulationSettings, SimulationType
 from ..db.models import Trial, TrialState
 from .scheduler import PENDING_SEND
@@ -22,10 +23,6 @@ from .scheduler import PENDING_SEND
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-#: BRAIN's own ceiling on operators across every selected Alpha.
-OPERATOR_LIMIT = 8000
-#: The least ``selectionLimit`` BRAIN accepts.
-MIN_SELECTION = 10
 #: Combo smoothing, each pairing at both: lighter keeps fast components' edge, heavier pulls an
 #: over-trading combination under the 40% Turnover ceiling.
 DECAYS = (4, 10)
@@ -46,7 +43,7 @@ def selections(limit: int) -> list[Recipe]:
     ``{cap}`` bounds an Alpha's operators so the kept ones never pass 8,000 between them.
     Products of gates and scores: a gate that fails scores 0, which ``POSITIVE`` drops.
     """
-    cap = OPERATOR_LIMIT // max(limit, MIN_SELECTION)
+    cap = SUPER_ALPHA_OPERATOR_LIMIT // max(limit, SUPER_ALPHA_MIN_SELECTION)
     budget = f"(operator_count <= {cap})"
     return [
         Recipe(
@@ -199,7 +196,8 @@ if __name__ == "__main__":
         == len(selections(limit)) * len(COMBOS) * len(DECAYS) * 2,
         "no two alike": len({request_hash(c.request) for c in found}) == len(found),
         "operators capped at 8,000 / limit": all(
-            f"(operator_count <= {OPERATOR_LIMIT // limit})" in r.code for r in selections(limit)
+            f"(operator_count <= {SUPER_ALPHA_OPERATOR_LIMIT // limit})" in r.code
+            for r in selections(limit)
         ),
         "SUPER, Full, Positive, as asked": all(
             w["type"] == "SUPER"

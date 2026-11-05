@@ -15,6 +15,7 @@ Deliberately standard library only: it is frozen separately from the app and mus
 working when the venv it manages does not.
 """
 
+import contextlib
 import ctypes
 import json
 import os
@@ -47,11 +48,17 @@ LAUNCHER_VARIABLE = "ALPHA_HARNESS_LAUNCHER"
 PID_VARIABLE = "ALPHA_HARNESS_LAUNCHER_PID"
 REQUEST_FILE = "update-request.json"
 ERROR_FILE = "update-error.json"
+#: Written by the app once it serves, naming its version; kept in step with ``updates.py``.
+SERVED_FILE = "served.json"
 #: The exe version that last installed itself over an older install, so it tries once only.
 OUTGROWN_FILE = "launcher-upgrade.txt"
 ACTIVE_FILE = "active-slot.txt"
 LOCK_FILE = "running.lock"
 LOG_FILE = "launcher.log"
+#: Past this the log starts afresh beside one previous file: the app writes to it as it works.
+LOG_LIMIT = 10 * 1024 * 1024
+#: What a failure box reads from the end of the log: plenty for its last lines.
+LOG_TAIL = 64 * 1024
 #: Where the app serves; kept in step with ``alpha_harness.__main__``.
 APP_PORT = 8000
 
@@ -72,9 +79,6 @@ SLOTS = ("a", "b")
 
 #: Long enough for a cold ``uv`` to fetch CPython and ~330 MB of wheels on a slow line.
 INSTALL_TIMEOUT = 1800
-#: An app that exits faster than this, right after an update, never came up at all. A real
-#: session outlives it even if the user closes the browser immediately.
-BOOT_SECONDS = 20.0
 
 
 def home() -> Path:
@@ -101,11 +105,21 @@ def say(root: Path, message: str) -> None:
 def recent(root: Path, lines: int = 8) -> str:
     """The tail of the log, for a message box. A traceback's last lines carry the reason."""
     try:
-        return "\n".join(
-            (root / LOG_FILE).read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
-        )
+        with (root / LOG_FILE).open("rb") as handle:
+            handle.seek(max(0, handle.seek(0, os.SEEK_END) - LOG_TAIL))
+            tail = handle.read().decode("utf-8", errors="replace")
     except OSError as exc:
         return f"(the log could not be read: {exc})"
+    return "\n".join(tail.splitlines()[-lines:])
+
+
+def rotate_log(root: Path) -> None:
+    """Start the log afresh once it passes :data:`LOG_LIMIT`, keeping the one before."""
+    log = root / LOG_FILE
+    # Missing, or held open by another copy: the next start tries again.
+    with contextlib.suppress(OSError):
+        if log.stat().st_size > LOG_LIMIT:
+            log.replace(log.with_name(f"{LOG_FILE}.1"))
 
 
 def fail(root: Path, message: str) -> None:
@@ -291,6 +305,23 @@ def slot_version(root: Path, slot: str) -> str | None:
     return recorded if isinstance(recorded, str) else None
 
 
+def proven(root: Path, slot: str) -> bool:
+    """Whether the slot's version has served the app at least once.
+
+    Only an install that recorded otherwise is unproven: a slot installed before this was
+    recorded was already running, so it counts as proven.
+    """
+    return read_json(root / f"slot-{slot}.json").get("served") is not False
+
+
+def prove(root: Path, slot: str) -> None:
+    """Record that the slot's version served, so a later failed exit is not blamed on it."""
+    marker = root / f"slot-{slot}.json"
+    body = read_json(marker)
+    if body.get("served") is False:
+        marker.write_text(json.dumps({**body, "served": True}), encoding="utf-8")
+
+
 def read_json(path: Path) -> dict[str, object]:
     try:
         body = json.loads(path.read_text(encoding="utf-8"))
@@ -400,7 +431,9 @@ def install(root: Path, uv: Path, slot: str, version: str, wheel: str | None = N
     # Constrained to the versions the release was locked against, so a transitive dependency
     # publishing a breaking version cannot break an install that worked yesterday.
     run("pip", "install", "--python", str(venv_python(root, slot)), "-c", constraints, wheel)
-    (root / f"slot-{slot}.json").write_text(json.dumps({"version": version}), encoding="utf-8")
+    (root / f"slot-{slot}.json").write_text(
+        json.dumps({"version": version, "served": False}), encoding="utf-8"
+    )
     say(root, f"installed {version} into slot {slot}")
 
 
@@ -861,22 +894,36 @@ def start(root: Path, slot: str) -> int:
         LAUNCHER_VARIABLE: BUILD_VERSION,
         PID_VARIABLE: str(os.getpid()),
         "PYTHONUTF8": "1",
+        # ``-m`` puts the working folder (Downloads, wherever the exe sits) first on the
+        # import path, so a stray ``random.py`` or ``secrets.py`` there replaces the real one.
+        "PYTHONSAFEPATH": "1",
     }
+    rotate_log(root)
     say(root, f"starting app from slot {slot}")
+    (root / SERVED_FILE).unlink(missing_ok=True)
     with (root / LOG_FILE).open("a", encoding="utf-8") as handle:
-        _child = subprocess.Popen(  # noqa: S603 - the venv this launcher built
-            [str(venv_pythonw(root, slot)), "-m", "alpha_harness"],
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            env=environment,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        try:
+            _child = subprocess.Popen(  # noqa: S603 - the venv this launcher built
+                [str(venv_pythonw(root, slot)), "-m", "alpha_harness"],
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            # Antivirus holding a freshly installed pythonw.exe, say. A failed exit rather
+            # than an exception, so supervise() can still roll back and say why.
+            say(root, f"could not start the app: {exc}")
+            return 1
         adopt(root, _child.pid)
         try:
             code = _child.wait()
         finally:
             _child = None
     say(root, f"app exited {code}")
+    served = read_json(root / SERVED_FILE).get("version")
+    if served is not None and served == slot_version(root, slot):
+        prove(root, slot)
     return code
 
 
@@ -991,11 +1038,36 @@ def take_claim(root: Path) -> bool:
     return True
 
 
+def outdated_windows() -> str | None:
+    """The name of a Windows older than 10, or None.
+
+    Python 3.14 and the wheels built for it target Windows 10; on 8.1 they install fine and
+    then fail to load their DLLs. ``platform_version`` is read from kernel32.dll itself, so
+    unlike ``major`` it cannot be shimmed down by a missing compatibility manifest.
+    """
+    if not WINDOWS:
+        return None
+    major, minor, _ = sys.getwindowsversion().platform_version
+    if major >= 10:
+        return None
+    return {(6, 1): "Windows 7", (6, 2): "Windows 8", (6, 3): "Windows 8.1"}.get(
+        (major, minor), f"Windows {major}.{minor}"
+    )
+
+
 def main() -> int:
     clean_environment()
     root = home()
     root.mkdir(parents=True, exist_ok=True)
     say(root, f"launcher {BUILD_VERSION}")
+    if old := outdated_windows():
+        fail(
+            root,
+            f"Alpha Harness needs Windows 10 or newer, and this PC runs {old}.\n\n"
+            "The Python it runs on no longer supports older Windows, so it would install "
+            "and then crash.",
+        )
+        return 1
     handed_over = bool(os.environ.get(DETACHED_VARIABLE))
     if not (take_claim(root) if handed_over else claim(root)):
         # Double-clicking a second time is not an error, it is someone asking to see the app.
@@ -1035,11 +1107,10 @@ def supervise(root: Path, uv: Path) -> int:
         slot = active(root)
         running = slot_version(root, slot)
         wanted = requested(root) or running or BUILD_VERSION
-        if requested(root) is None and outgrown(root, running):
-            (root / OUTGROWN_FILE).write_text(BUILD_VERSION, encoding="utf-8")
+        upgrading = requested(root) is None and outgrown(root, running)
+        if upgrading:
             say(root, f"launcher {BUILD_VERSION} is newer than {running}; installing it")
             wanted = BUILD_VERSION
-        swapped = False
 
         if running != wanted:
             # The empty slot, so the one in use survives a failure untouched. With nothing
@@ -1048,7 +1119,11 @@ def supervise(root: Path, uv: Path) -> int:
             try:
                 install(root, uv, target, wanted, requested_wheel(root))
                 activate(root, target)
-                slot, swapped = target, True
+                slot = target
+                # Only once installed: a download that failed has tried nothing, and this exe
+                # is the person's way out of an install too broken to update itself.
+                if upgrading:
+                    (root / OUTGROWN_FILE).write_text(BUILD_VERSION, encoding="utf-8")
             except Exception as exc:  # noqa: BLE001 - every failure ends the same way
                 if running is None:
                     fail(root, f"Could not install Alpha Harness {wanted}.\n{exc}")
@@ -1063,25 +1138,26 @@ def supervise(root: Path, uv: Path) -> int:
             # leaving a half-built slot. Nothing is started now.
             return 0
 
-        began = time.monotonic()
         code = start(root, slot)
-        alive = time.monotonic() - began
 
         if _quitting.is_set():
             say(root, "closed from the notification area")
             return 0
 
         # A version that dies on the way up cannot report anything itself: no server, no page,
-        # no button. The launcher is the only thing left that can notice, so it does.
-        if swapped and code != 0 and alive < BOOT_SECONDS and slot_version(root, other(slot)):
-            previous = other(slot)
-            say(root, f"{wanted} exited {code} after {alive:.1f}s; reverting to {previous}")
-            activate(root, previous)
+        # no button. The launcher is the only thing left that can notice, so it does. Judged
+        # by whether it ever served, not by a timer: a first start copies and migrates the
+        # database before serving, which can take any length of time.
+        back = slot_version(root, other(slot))
+        if code != 0 and not proven(root, slot) and back:
+            failed = slot_version(root, slot) or wanted
+            say(root, f"{failed} exited {code} before it ever served; reverting to {back}")
+            activate(root, other(slot))
             note_failure(
                 root,
-                wanted,
-                f"It closed straight after starting (exit code {code}). "
-                f"Alpha Harness went back to {slot_version(root, previous)}.",
+                failed,
+                f"It closed before it could start (exit code {code}). "
+                f"Alpha Harness went back to {back}.",
             )
             continue
 

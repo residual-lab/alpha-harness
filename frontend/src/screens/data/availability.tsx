@@ -4,10 +4,11 @@ import { useQuery } from '@tanstack/react-query'
 import { GlobeIcon, MapPinIcon } from 'lucide-react'
 import { type ReactNode, useEffect } from 'react'
 import { type CatalogFacets, catalog } from '@/api/catalog'
+import { REGION_AGNOSTIC_REGION } from '@/api/platform'
 import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { fmt } from '@/lib/format'
-import { isRegionAgnostic, REGION_AGNOSTIC, regionLabel, runsRegionAgnostic } from '@/lib/scope'
+import { isRegionAgnostic, regionLabel, runsRegionAgnostic } from '@/lib/scope'
 import { Button } from '@/ui/kit'
 import { type FieldFilterState, useFieldFilter } from './state'
 
@@ -69,7 +70,7 @@ export function AvailabilityFilters({
   // Region ALL arrives by its own download; without it no field can be found there.
   const allDownloaded = scopes.data
     ? scopes.data.some(
-        (s) => s.region === REGION_AGNOSTIC && s.instrument_type === scope.instrumentType,
+        (s) => s.region === REGION_AGNOSTIC_REGION && s.instrument_type === scope.instrumentType,
       )
     : true
 

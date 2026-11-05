@@ -10,6 +10,7 @@ import contextlib
 import itertools
 import json
 import math
+from collections import Counter
 from typing import Annotated, Any, Literal
 
 import structlog
@@ -18,6 +19,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, update
 
 from ..brain.errors import BrainError, BrainRateLimited
+from ..brain.platform import (
+    POWER_POOL_CORRELATION_CEILING,
+    POWER_POOL_ESCAPE,
+    REGION_AGNOSTIC_REGION,
+    SIMULATION_SLOTS,
+    SUPER_ALPHA_SLOTS,
+)
 from ..db.models import (
     BrainCache,
     SimStatus,
@@ -33,7 +41,9 @@ from ..labs import scheduler, search
 from ..labs.objectives import FAILURE, OBJECTIVES, StudyNotFoundError
 from ..labs.params import (
     CORRELATION_BREAKER,
+    FIELDS_SAMPLER,
     SETTINGS_SAMPLER,
+    SUPER_LAB,
     TASK_SAMPLERS,
     TEMPLATE_SAMPLER,
     task_params,
@@ -42,7 +52,6 @@ from ..labs.study import ranked
 from ..schemas import Out
 from ..tasks import Task
 from ..tools import power_pool
-from ..tools.submission_planner import ESCAPE
 from ..vault.yields import checks_of, clean, is_submitted, verdict
 from .deps import State, refuse
 
@@ -52,7 +61,7 @@ router = APIRouter(prefix="/api/lab-tasks", tags=["lab-tasks"])
 
 #: Labs that vary settings around one fixed expression, so ``template_source`` is that
 #: expression rather than a skeleton to search.
-ONE_EXPRESSION = frozenset({SETTINGS_SAMPLER, CORRELATION_BREAKER})
+ONE_EXPRESSION = frozenset({SETTINGS_SAMPLER, CORRELATION_BREAKER, FIELDS_SAMPLER})
 
 #: Where a task can be run from: never started, paused, or failed. A failed task may have
 #: sent simulations that finished after it stopped; running it again scores them.
@@ -61,9 +70,9 @@ FINISHED = (StudyStatus.COMPLETE, StudyStatus.FAILED)
 
 
 class TaskChange(BaseModel):
-    #: Up to the engine's slots, checked in the route: a lab starts at ``search.MAX_CORES``
-    #: at most, but an edit may hand it the whole engine.
-    cores: int | None = Field(default=None, ge=1)
+    #: Up to the engine's slots, or BRAIN's SuperAlpha limit for a Super Lab task (checked in
+    #: the route, which knows the task).
+    cores: int | None = Field(default=None, ge=1, le=SIMULATION_SLOTS)
     simulations: int | None = Field(default=None, ge=1, le=search.MAX_SIMULATIONS)
 
 
@@ -144,6 +153,8 @@ class LabTask(Out):
     #: When it first began running, which is where elapsed time is measured from.
     started_at: str | None
     finished_at: str | None
+    #: LLM Power Pool Lab only: answered calls by the model that answered them.
+    llm_models: dict[str, int] = Field(default_factory=dict[str, int])
 
 
 class LabTasks(Out):
@@ -172,9 +183,8 @@ class RankedAlpha(Out):
     #: From the vault, which holds every simulated Alpha; a trial's own stats may lack them.
     long_count: int | None = None
     short_count: int | None = None
-    #: The after-cost t-stat over sqrt(10): the Sharpe once 5 bps is charged against each
-    #: day's own turnover, scaled by sqrt(years of data / 10) so fewer years prove less. Null
-    #: until the daily PnL *and* turnover are stored.
+    #: The Sharpe once 5 bps is charged against each day's own turnover. Null until the daily
+    #: PnL *and* turnover are stored.
     after_cost_sharpe: float | None = None
     #: The held-out test years, from the vault: where an Alpha that only fits its train years
     #: shows it. Shown, never searched on, so they stay out of sample. Null without a test period.
@@ -183,7 +193,6 @@ class RankedAlpha(Out):
     #: The highest correlation with any consultant Alpha in production, which BRAIN wants
     #: below 0.7. Null until BRAIN has been asked: it limits these checks per hour.
     prod_correlation: float | None = None
-    feasible: bool | None
     failed_checks: list[str]
     #: Of ``failed_checks``, those that gate submission. A check BRAIN fails for a reason
     #: that is nothing to do with the Alpha is left out, so an empty list means submittable.
@@ -194,8 +203,7 @@ class RankedAlpha(Out):
     submitted: bool = False
     #: Nothing BRAIN has reported refuses it: no FAIL and no ERROR.
     submittable: bool
-    #: Submittable only because a check has not answered yet. The Submission Planner waits for
-    #: these rather than planning a permanent submission on them.
+    #: Submittable only because a check has not answered yet: not a promise to submit on.
     pending: bool = False
     #: Simulated in Quick mode: the figures stand, but BRAIN submits it only once it is
     #: simulated again in Full. The task does that for every one that passes, and the Full
@@ -204,6 +212,8 @@ class RankedAlpha(Out):
     #: A check that decides submission came back ERROR: BRAIN could not judge it, which is
     #: told apart from an Alpha a check refused.
     errored: bool = False
+    #: The limit each of BRAIN's figure checks names for this Alpha, by check name.
+    limits: dict[str, float] = Field(default_factory=dict)
 
 
 class WorkflowStarted(Out):
@@ -288,18 +298,30 @@ async def _one(state: Any, task_id: int) -> Study:
     return row
 
 
-async def _progress(state: Any, ids: list[int]) -> dict[int, dict[str, Any]]:
+#: Progress of complete tasks, which nothing changes once complete: by task, with the status,
+#: target and update time it was counted at, so a task extended or edited is counted again.
+_COMPLETE_PROGRESS: dict[int, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+
+
+async def _progress(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
     """Trials by state, trials answered for free, and the best value per task, counted in SQL.
 
     A long task holds tens of thousands of trials; reading them all to count them would
-    slow the list down with every day the task runs.
+    slow the list down with every day the task runs. A complete task is counted once.
     """
-    out: dict[int, dict[str, Any]] = {
-        i: {"states": {}, "free": 0, "fullRuns": 0, "best": None, "failures": {}} for i in ids
-    }
+    out: dict[int, dict[str, Any]] = {}
+    ids: list[int] = []
+    for row in rows:
+        kept = _COMPLETE_PROGRESS.get(row.id)
+        if kept is not None and kept[0] == _settled_key(row):
+            out[row.id] = kept[1]
+        else:
+            out[row.id] = {"states": {}, "free": 0, "fullRuns": 0, "best": None, "failures": {}}
+            ids.append(row.id)
     if not ids:
         return out
     value = func.json_extract(Trial.values, "$[0]")
+    answered = Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL])
     async with state.db.session() as session:
         states = await session.execute(
             select(Trial.study_id, Trial.state, func.count())
@@ -308,17 +330,31 @@ async def _progress(state: Any, ids: list[int]) -> dict[int, dict[str, Any]]:
         )
         for study_id, trial_state, n in states.all():
             out[study_id]["states"][str(trial_state)] = int(n)
-        free = await session.execute(
-            select(Trial.study_id, func.count())
-            .where(
-                Trial.study_id.in_(ids),
-                Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL]),
-                Trial.message == scheduler.FREE,
+        # Three counts in one pass over the trials rather than one pass each.
+        counted = await session.execute(
+            select(
+                Trial.study_id,
+                func.count().filter(answered, Trial.message == scheduler.FREE),
+                func.count().filter(
+                    answered,
+                    or_(Trial.message.is_(None), Trial.message != scheduler.FREE),
+                    scheduler.full_run(),
+                ),
+                # An Alpha that returned no value is scored at the failure value, so it is not
+                # a best; nor is a seed, which was scored before the task began.
+                func.max(value).filter(
+                    Trial.state == TrialState.COMPLETE,
+                    value > FAILURE,
+                    or_(Trial.generation.is_(None), Trial.generation != 0),
+                ),
             )
+            .where(Trial.study_id.in_(ids))
             .group_by(Trial.study_id)
         )
-        for study_id, n in free.all():
-            out[study_id]["free"] = int(n)
+        for study_id, free, full_runs, best in counted.all():
+            out[study_id]["free"] = int(free or 0)
+            out[study_id]["fullRuns"] = int(full_runs or 0)
+            out[study_id]["best"] = None if best is None else float(best)
         failures = await session.execute(
             select(Trial.study_id, Trial.message, func.count())
             .where(Trial.study_id.in_(ids), Trial.state == TrialState.FAIL)
@@ -327,33 +363,14 @@ async def _progress(state: Any, ids: list[int]) -> dict[int, dict[str, Any]]:
         for study_id, message, n in failures.all():
             found = out[study_id]["failures"]
             found[_reason(message)] = found.get(_reason(message), 0) + int(n)
-        full_runs = await session.execute(
-            select(Trial.study_id, func.count())
-            .where(
-                Trial.study_id.in_(ids),
-                Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL]),
-                or_(Trial.message.is_(None), Trial.message != scheduler.FREE),
-                scheduler.full_run(),
-            )
-            .group_by(Trial.study_id)
-        )
-        for study_id, n in full_runs.all():
-            out[study_id]["fullRuns"] = int(n)
-        # An Alpha that returned no value is scored at the failure value, so it is not a best;
-        # nor is a seed, which was scored before the task began.
-        best = await session.execute(
-            select(Trial.study_id, func.max(value))
-            .where(
-                Trial.study_id.in_(ids),
-                Trial.state == TrialState.COMPLETE,
-                value > FAILURE,
-                or_(Trial.generation.is_(None), Trial.generation != 0),
-            )
-            .group_by(Trial.study_id)
-        )
-        for study_id, value in best.all():
-            out[study_id]["best"] = None if value is None else float(value)
+    for row in rows:
+        if row.id in ids and row.status == StudyStatus.COMPLETE:
+            _COMPLETE_PROGRESS[row.id] = (_settled_key(row), out[row.id])
     return out
+
+
+def _settled_key(row: Study) -> tuple[Any, ...]:
+    return (row.status, row.max_trials, row.updated_at)
 
 
 def _fields(space: Any) -> int:
@@ -404,6 +421,7 @@ def _task(row: Study, progress: dict[str, Any]) -> LabTask:
             "datasetIds": params.get("datasetIds") or [],
             "fields": _fields(params.get("space")),
             "target": row.max_trials,
+            "llmModels": (params.get("llm") or {}).get("byModel") or {},
             # What spent quota, as the scheduler counts toward the target.
             "simulated": told - progress["free"] - progress["fullRuns"],
             "cached": progress["free"],
@@ -429,14 +447,14 @@ def _task(row: Study, progress: dict[str, Any]) -> LabTask:
 
 async def _payload(state: Any, task_id: int) -> LabTask:
     row = await _one(state, task_id)
-    return _task(row, (await _progress(state, [row.id]))[row.id])
+    return _task(row, (await _progress(state, [row]))[row.id])
 
 
 @router.get("")
 async def list_tasks(state: State) -> LabTasks:
     """Every task, newest first, and the slots they share."""
     rows = await _rows(state)
-    progress = await _progress(state, [r.id for r in rows])
+    progress = await _progress(state, rows)
     return LabTasks(slots=state.engine.slots, tasks=[_task(r, progress[r.id]) for r in rows])
 
 
@@ -608,6 +626,12 @@ async def check_prod_correlation(body: AlphaIds, state: State) -> WorkflowStarte
     return WorkflowStarted(task_id=started)
 
 
+@router.post("/power-pool-workflow/stop", status_code=204)
+async def stop_power_pool_workflow(state: State) -> None:
+    """Stop the workflow. PnL and turnover already downloaded stay."""
+    state.backfill.cancel_job("power-pool-workflow")
+
+
 @router.post("/prod-correlation/stop", status_code=204)
 async def stop_prod_correlation(state: State) -> None:
     """Stop asking BRAIN. Every answer already back is kept."""
@@ -618,6 +642,77 @@ async def stop_prod_correlation(state: State) -> None:
 async def power_pool_correlation_for(body: AlphaIds, state: State) -> PowerPoolCorrelation:
     """The same measurement over an explicit set of Alphas, for the panes that span tasks."""
     return await _power_pool(state, body.alpha_ids)
+
+
+class SubmissionPick(Out):
+    """One Alpha of the simulated order, as it stood when its turn came."""
+
+    alpha_id: str
+    region: str | None
+    sharpe: float | None
+    after_cost_sharpe: float | None
+    #: Its highest Power Pool Correlation with the pool and every earlier pick.
+    correlation: float | None
+    closest: str | None
+    verdict: str
+    #: Candidates its submission would block.
+    blocks: int
+
+
+class Blocked(Out):
+    alpha_id: str
+    #: The pick whose submission blocks it.
+    by: str
+
+
+class SubmissionOrder(Out):
+    """Greedy submission, best After-Cost Sharpe first, worked out without submitting."""
+
+    candidates: int
+    picks: list[SubmissionPick]
+    blocked: list[Blocked]
+    #: Could not be measured against an earlier pick: no stored daily PnL.
+    unmeasured: list[str]
+
+
+@router.post("/power-pool-order")
+async def power_pool_order(body: AlphaIds, state: State) -> SubmissionOrder:
+    """How many of these Alphas could be submitted one after another: each pick joins its
+    region's Power Pool, and the rest are judged again against it, as BRAIN would after a
+    submission and a Portfolio sync. Nothing is submitted and nothing is downloaded."""
+    pool_meta = await _pool_members(state)
+    stored = await state.alphas.by_ids(list(dict.fromkeys(body.alpha_ids)))
+    candidates = {
+        a: r for a, r in stored.items() if power_pool.is_power_pool(r) and not is_submitted(r)
+    }
+    grid = await state.alphas.pnl_grid([*candidates, *pool_meta])
+    pools: dict[str, list[str]] = {}
+    for alpha_id, row in pool_meta.items():
+        if (region := power_pool.scope_of(row)) is not None:
+            pools.setdefault(region, []).append(alpha_id)
+    meta = candidates | pool_meta
+    picks, blocked, unmeasured = await asyncio.to_thread(
+        power_pool.submission_order, grid, meta, list(candidates), pools
+    )
+    blocks = Counter(blocked.values())
+    return SubmissionOrder(
+        candidates=len(candidates),
+        picks=[
+            SubmissionPick(
+                alpha_id=row["alphaId"],
+                region=power_pool.scope_of(meta[row["alphaId"]]),
+                sharpe=row.get("sharpe"),
+                after_cost_sharpe=meta[row["alphaId"]].get("after_cost_5bps"),
+                correlation=row.get("correlation"),
+                closest=row.get("closest"),
+                verdict=row.get("verdict", "clear"),
+                blocks=blocks[row["alphaId"]],
+            )
+            for row in picks
+        ],
+        blocked=[Blocked(alpha_id=a, by=by) for a, by in blocked.items()],
+        unmeasured=unmeasured,
+    )
 
 
 @router.post("/{task_id}/run")
@@ -632,18 +727,10 @@ async def run(task_id: int, state: State) -> LabTask:
 
 @router.post("/{task_id}/pause")
 async def pause(task_id: int, state: State) -> LabTask:
-    """Queue nothing more for now. Simulations already sent finish; the rest come off."""
-    # Read under the lock: checked outside it, a task that finished its last trial in the
-    # meantime was written back to PAUSED, and a finished task holds no cores.
-    async with state.optimizer.lock(task_id):
-        row = await _one(state, task_id)
-        stopping = task_params(row).stopping
-        if row.status not in (StudyStatus.RUNNING, StudyStatus.QUEUED) or stopping:
-            raise refuse(409, "not_running", "Only a running or waiting task can pause.")
-        await state.optimizer.set_status(task_id, StudyStatus.PAUSED)
-        await state.engine.drop_queued(row.task)
-        await scheduler.prune_unsent(state.optimizer, task_id)
-    await scheduler.start_waiting(state.optimizer)
+    """Queue nothing more for now. Simulations already sent finish; the rest wait for Run."""
+    await _one(state, task_id)  # 404 for an unknown task
+    if await scheduler.pause(state.optimizer, task_id) is None:
+        raise refuse(409, "not_running", "Only a running or waiting task can pause.")
     return await _payload(state, task_id)
 
 
@@ -669,11 +756,12 @@ async def change(task_id: int, body: TaskChange, state: State) -> LabTask:
     row = await _one(state, task_id)
     if row.status in FINISHED:
         raise refuse(409, "finished", "A finished task can't change.")
-    if body.cores and body.cores > state.engine.slots:
+    if body.cores and row.sampler == SUPER_LAB and body.cores > SUPER_ALPHA_SLOTS:
         raise refuse(
             422,
             "too_many_cores",
-            f"The engine has {state.engine.slots} slots, so a task cannot hold {body.cores}.",
+            f"BRAIN runs {SUPER_ALPHA_SLOTS} SuperAlpha simulations at once, so a Super Lab "
+            f"task cannot hold {body.cores} cores.",
         )
     cores = body.cores or scheduler.cores_of(row)
     free = await scheduler.resize_task(state.optimizer, row, cores, body.simulations)
@@ -716,6 +804,7 @@ async def remove(task_id: int, state: State) -> TaskRemoved:
         await state.engine.drop_queued(row.task)
         await state.optimizer.delete(task_id)
         await state.engine.set_quota(row.task, 0, enabled=False)
+    _COMPLETE_PROGRESS.pop(task_id, None)
     await state.optimizer.notify()
     return TaskRemoved(removed=task_id)
 
@@ -747,26 +836,33 @@ async def top(
         )
     stored = await state.alphas.by_ids([t.alpha_id for t in best if t.alpha_id])
     current = {a: checks_of(r.get("checks")) for a, r in stored.items() if r.get("checks")}
+    # A region-agnostic parent is judged on its children, as BRAIN judges it.
+    current |= await state.alphas.family_checks(stored)
     prod = await _prod_correlations(state, list(stored), current)
     # No download is started from here. Reading a page is not asking for one, and these are
-    # three BRAIN requests per Alpha: enough of them earns a 429, which pauses *every* caller
-    # of the shared client -- the simulation engine's dispatch and polling included. Calculate
-    # After-Cost Sharpe is the way to ask, and it says how many it will fetch before it does.
+    # three BRAIN requests per Alpha: enough of them earns a 429, which holds up every read of
+    # an Alpha, captures included. Calculate After-Cost Sharpe is the way to ask, and it says
+    # how many it will fetch before it does.
     return [
-        RankedAlpha.model_validate(
-            r
-            | {
-                "longCount": (stored.get(r["alphaId"]) or {}).get("long_count"),
-                "shortCount": (stored.get(r["alphaId"]) or {}).get("short_count"),
-                "afterCostSharpe": (stored.get(r["alphaId"]) or {}).get("after_cost_t10"),
-                "testSharpe": (stored.get(r["alphaId"]) or {}).get("test_sharpe"),
-                "testFitness": (stored.get(r["alphaId"]) or {}).get("test_fitness"),
-                "prodCorrelation": prod.get(r["alphaId"]),
-                "submitted": is_submitted(stored.get(r["alphaId"])),
-            }
-        )
+        RankedAlpha.model_validate(r | _from_vault(r["alphaId"], stored, prod))
         for r in ranked(best, current)
     ]
+
+
+def _from_vault(
+    alpha_id: str, stored: dict[str, dict[str, Any]], prod: dict[str, float]
+) -> dict[str, Any]:
+    """What a ranked row adds from the vault and from BRAIN's correlation check."""
+    vault = stored.get(alpha_id) or {}
+    return {
+        "longCount": vault.get("long_count"),
+        "shortCount": vault.get("short_count"),
+        "afterCostSharpe": vault.get("after_cost_5bps"),
+        "testSharpe": vault.get("test_sharpe"),
+        "testFitness": vault.get("test_fitness"),
+        "prodCorrelation": prod.get(alpha_id),
+        "submitted": is_submitted(vault),
+    }
 
 
 #: Verdicts that let an Alpha into the Power Pool on correlation.
@@ -847,8 +943,8 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
         )
 
     return PowerPoolCorrelation(
-        ceiling=power_pool.CEILING,
-        sharpe_edge=ESCAPE,
+        ceiling=POWER_POOL_CORRELATION_CEILING,
+        sharpe_edge=POWER_POOL_ESCAPE,
         pool_size=len(pool_meta),
         power_pool_alphas=len(candidates),
         other_alphas=len(stored) - len(candidates),
@@ -877,19 +973,26 @@ _REFUSED: dict[tuple[int, str | None], bool] = {}
 async def _not_refused(session: Any, ids: list[tuple[int, str | None]]) -> list[int]:
     """The trials of ``ids`` BRAIN did not refuse when they ran, judged once per trial."""
     unknown = [i for i, alpha_id in ids if (i, alpha_id) not in _REFUSED]
-    raw: list[tuple[int, str | None, str | None]] = []
+    raw: list[tuple[int, str | None, str | None, str | None]] = []
     for chunk in itertools.batched(unknown, TRIAL_CHUNK, strict=False):
         raw += (
             await session.execute(
-                select(Trial.id, Trial.alpha_id, func.json_extract(Trial.result, "$.checks")).where(
-                    Trial.id.in_(chunk)
-                )
+                select(
+                    Trial.id,
+                    Trial.alpha_id,
+                    func.json_extract(Trial.result, "$.checks"),
+                    func.json_extract(Trial.settings, "$.region"),
+                ).where(Trial.id.in_(chunk))
             )
         ).tuples()
 
     def judge() -> None:
-        for trial_id, alpha_id, checks in raw:
-            refused = verdict(json.loads(checks) if checks else []) == "refused"
+        for trial_id, alpha_id, checks, region in raw:
+            # A region-agnostic trial ran with one child's checks standing in; the family is
+            # judged on all its children once read, so it is never dropped here.
+            refused = region != REGION_AGNOSTIC_REGION and (
+                verdict(json.loads(checks) if checks else []) == "refused"
+            )
             _REFUSED[trial_id, alpha_id] = refused
 
     # Off the event loop: the first refresh after a start judges every finished trial.
@@ -930,6 +1033,8 @@ async def submittable_alphas(state: State) -> list[TaskAlpha]:
     trials.sort(key=lambda t: (t.study_id, t.number))
     stored = await state.alphas.by_ids(list({str(t.alpha_id) for t in trials}))
     current = {a: checks_of(r.get("checks")) for a, r in stored.items() if r.get("checks")}
+    # A region-agnostic parent is judged on its children, as BRAIN judges it.
+    current |= await state.alphas.family_checks(stored)
     prod = await _prod_correlations(state, list(stored), current)
     by_trial = {t.id: t.study_id for t in trials}
     out: list[TaskAlpha] = []
@@ -940,18 +1045,11 @@ async def submittable_alphas(state: State) -> list[TaskAlpha]:
             continue
         seen.add(alpha_id)
         task = tasks[by_trial[r["trialId"]]]
-        vault = stored.get(alpha_id) or {}
         out.append(
             TaskAlpha.model_validate(
                 r
+                | _from_vault(alpha_id, stored, prod)
                 | {
-                    "longCount": vault.get("long_count"),
-                    "shortCount": vault.get("short_count"),
-                    "afterCostSharpe": vault.get("after_cost_t10"),
-                    "testSharpe": vault.get("test_sharpe"),
-                    "testFitness": vault.get("test_fitness"),
-                    "prodCorrelation": prod.get(alpha_id),
-                    "submitted": is_submitted(vault),
                     "taskId": task.id,
                     "taskName": task.label
                     or task.template_name

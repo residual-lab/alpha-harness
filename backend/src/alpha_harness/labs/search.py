@@ -13,18 +13,21 @@ every field one trial, budget permitting; after that the sampler concentrates on
 scores.
 """
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ..brain.platform import DEFAULT_TRUNCATION, SIMULATION_SLOTS
 from ..brain.schemas import SimulationRequest, SimulationSettings
 from ..catalog.queries import FieldFilter, Tuple4
 from .fastexpr import OperatorInfo, operator_table
 
 if TYPE_CHECKING:  # pragma: no cover
     import random
+    from collections.abc import Sequence
 
     from ..catalog.queries import CatalogQueries
     from .params import SearchParams
@@ -38,11 +41,11 @@ LOOKBACKS = (5, 21, 63, 126, 252)
 #: Grouping fields for group operators; they do not count as data fields.
 GROUPS = ("market", "sector", "industry", "subindustry")
 DECAYS = (0, 3, 5, 7, 10)
-TRUNCATION = 0.08
+TRUNCATION = DEFAULT_TRUNCATION
 NEUTRALIZATIONS = ("MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY")
 #: Most concurrent slots one lab task may hold: all of the engine's, so a single sweep
 #: can use the whole account when nothing else is running.
-MAX_CORES = 8
+MAX_CORES = SIMULATION_SLOTS
 #: A task's simulations. A big task carries on through the next days' allowances.
 MAX_SIMULATIONS = 100_000
 FAMILIES = ("cs", "ts", "group", "cs_ts", "ts_ts", "group_ts")
@@ -160,18 +163,24 @@ def render(params: dict[str, Any]) -> str:
             raise ValueError(f"Unknown shape {params['family']!r}")
 
 
-def field_choices(space: dict[str, Any]) -> dict[str, list[str]]:
+def field_choices(space: dict[str, Any]) -> dict[str, tuple[str, ...]]:
     """Per searched universe, the fields it has, in the pool's order.
 
     Frozen with the task, so every ``field@universe`` slot keeps one distribution. A task
     added before fields were paired with universes has no ``absent`` and offers them all.
+    Tuples, which Optuna keeps as given rather than copying for every trial it asks.
     """
     absent = space.get("absent") or {}
-    choices: dict[str, list[str]] = {}
+    choices: dict[str, tuple[str, ...]] = {}
     for universe in space["universes"]:
         missing: set[str] = set(absent.get(universe) or ())
-        choices[universe] = [f for f in space["fields"] if f not in missing]
+        choices[universe] = tuple(f for f in space["fields"] if f not in missing)
     return choices
+
+
+def slots(space: dict[str, Any]) -> dict[str, tuple[str, ...]]:
+    """Every field slot, by the name :func:`suggest` asks it under, with its choices."""
+    return {f"field@{universe}": choices for universe, choices in field_choices(space).items()}
 
 
 def coverage(space: dict[str, Any]) -> tuple[str, list[str]]:
@@ -189,7 +198,9 @@ def first_pass(space: dict[str, Any], field_id: str) -> dict[str, Any]:
     return {"universe": universe, f"field@{universe}": field_id}
 
 
-def suggest(trial: Any, space: dict[str, Any], choices: dict[str, list[str]]) -> dict[str, Any]:
+def suggest(
+    trial: Any, space: dict[str, Any], choices: dict[str, tuple[str, ...]]
+) -> dict[str, Any]:
     """One point, asked define-by-run: each choice exists only where its shape needs it.
 
     Names are shared across shapes (``ts`` and ``d`` are the same slot in every shape that
@@ -235,7 +246,7 @@ class RandomTrial:
     def __init__(self, rng: random.Random) -> None:
         self.rng = rng
 
-    def suggest_categorical(self, _name: str, choices: list[Any]) -> Any:
+    def suggest_categorical(self, _name: str, choices: Sequence[Any]) -> Any:
         return self.rng.choice(choices)
 
 
@@ -254,11 +265,15 @@ def request_for(params: dict[str, Any], run: SearchParams) -> SimulationRequest:
 
 
 def identity_of(expression: str | None, settings: dict[str, Any] | None) -> tuple[str, str]:
-    """What makes two trials the same simulation: the expression and the settings.
+    """What makes two trials the same simulation: the expression and the settings."""
+    return expression or "", settings_identity(settings)
 
-    Settings go through the request model first: seeds keep the short dict stored with the
-    Alpha and children the full request, so compared raw a child identical to a seed looks
-    new.
+
+def settings_identity(settings: dict[str, Any] | None) -> str:
+    """Settings as :func:`identity_of` compares them.
+
+    They go through the request model first: seeds keep the short dict stored with the Alpha
+    and children the full request, so compared raw a child identical to a seed looks new.
     """
     try:
         normal = SimulationSettings.model_validate(settings or {}).model_dump(
@@ -266,7 +281,7 @@ def identity_of(expression: str | None, settings: dict[str, Any] | None) -> tupl
         )
     except ValueError:
         normal = settings or {}
-    return expression or "", json.dumps(normal, sort_keys=True, default=str)
+    return json.dumps(normal, sort_keys=True, default=str)
 
 
 # --- the field pool ---------------------------------------------------------
@@ -307,21 +322,27 @@ async def field_pool(
     types = [t for t in ("MATRIX", "VECTOR") if t in wanted]
     if not types:
         return Pool({}, (), {}, 0)
-    found: dict[str, dict[str, str]] = {}
-    for universe in universes:
-        page = await queries.fields(
-            Tuple4(region=region, delay=delay, universe=universe),
-            (narrow or FieldFilter()).model_copy(
-                update={
-                    "dataset_ids": list(dataset_ids),
-                    "field_types": types,
-                    "sort_by": "coverage",
-                    "sort_desc": True,
-                    "limit": POOL_LIMIT,
-                    "offset": 0,
-                }
-            ),
+    wanted_page = (narrow or FieldFilter()).model_copy(
+        update={
+            "dataset_ids": list(dataset_ids),
+            "field_types": types,
+            "sort_by": "coverage",
+            "sort_desc": True,
+            "limit": POOL_LIMIT,
+            "offset": 0,
+        }
+    )
+    # Every universe at once, and no count: only the rows are read.
+    pages = await asyncio.gather(
+        *(
+            queries.fields(
+                Tuple4(region=region, delay=delay, universe=universe), wanted_page, counted=False
+            )
+            for universe in universes
         )
+    )
+    found: dict[str, dict[str, str]] = {}
+    for universe, page in zip(universes, pages, strict=True):
         rows = page.get("results") or []
         if rows:
             found[universe] = {str(r["field_id"]): str(r["field_type"]) for r in rows}
@@ -343,7 +364,7 @@ async def field_pool(
 
 
 def draw(
-    trial: Any, run: SearchParams, choices: dict[str, list[str]]
+    trial: Any, run: SearchParams, choices: dict[str, tuple[str, ...]]
 ) -> tuple[dict[str, Any], SimulationRequest | None]:
     """One point of the search and the simulation it becomes (see ``labs.scheduler``)."""
     params = suggest(trial, run.space, choices)

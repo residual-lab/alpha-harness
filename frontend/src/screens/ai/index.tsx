@@ -24,7 +24,8 @@ import { Prompts } from './prompts'
 import { Providers } from './providers'
 import { useKeys } from './shared'
 
-const SCREENS = { keys: Keys, models: Models, budget: Budget, prompts: Prompts } as const
+const SCREENS = { keys: Keys, models: Models, budget: Budget } as const
+const KEYLESS = new Set(['providers', 'prompts'])
 
 export function AiScreen() {
   const params = useParams({ strict: false })
@@ -33,21 +34,23 @@ export function AiScreen() {
   const tab = params.threadId ? 'assistant' : params.tab
   const Screen = tab && tab in SCREENS ? SCREENS[tab as keyof typeof SCREENS] : null
   const hasKeys = (keys.data?.keys.length ?? 0) > 0
+  // Without a Key, only what needs none: adding one, and reading what would be sent.
+  const tabs = hasKeys ? AI_TABS : AI_TABS.filter((t) => KEYLESS.has(t.tab))
 
   // Every branch keeps its slot, so the provider grid (and its open popup) stays mounted when
-  // the first key lands and the tab bar appears above it. Without a key every tab shows that
-  // grid, so the URL is moved to it too: otherwise the first key switches `/ai/keys` over to
-  // the Keys screen and takes the popup, mid-setup, with it.
+  // the first key lands and the tab bar fills in above it. Without a key every tab but Prompts
+  // shows that grid, so the URL is moved to it too: otherwise the first key switches `/ai/keys`
+  // over to the Keys screen and takes the popup, mid-setup, with it.
   return (
     <Page>
-      {keys.isSuccess && !hasKeys && tab !== 'providers' && (
+      {keys.isSuccess && !hasKeys && !KEYLESS.has(tab ?? '') && (
         <Navigate to="/ai/$tab" params={{ tab: 'providers' }} replace />
       )}
       <PageHeader title="LLM Integration" />
       {keys.isError && <ErrorNotice title="Could not load the Keys" error={keys.error} />}
-      {hasKeys && (
+      {keys.isSuccess && (
         <TabBar>
-          {AI_TABS.map((t) => (
+          {tabs.map((t) => (
             <TabLink key={t.tab} to="/ai/$tab" params={{ tab: t.tab }}>
               {t.label}
             </TabLink>
@@ -56,6 +59,8 @@ export function AiScreen() {
       )}
       {keys.isPending ? (
         <Skeleton className="h-64" />
+      ) : tab === 'prompts' ? (
+        <Prompts />
       ) : !hasKeys || tab === 'providers' ? (
         <Providers />
       ) : tab === 'assistant' ? (

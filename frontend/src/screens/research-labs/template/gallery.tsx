@@ -5,7 +5,7 @@
  */
 
 import { Dialog as BDialog } from '@base-ui/react/dialog'
-import { ChevronRightIcon, FilePlusIcon, XIcon } from 'lucide-react'
+import { ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, FilePlusIcon, XIcon } from 'lucide-react'
 import { type ReactNode, useRef, useState } from 'react'
 import { cn } from '@/lib/cn'
 import { fmt } from '@/lib/format'
@@ -160,6 +160,7 @@ export function TemplatesPanel({
   onOpenText,
   onOpenSaved,
   onNew,
+  writing,
 }: {
   saved: TemplateSummary[]
   savedState: { pending: boolean; error: unknown }
@@ -170,91 +171,109 @@ export function TemplatesPanel({
   onOpenText: (text: string) => void
   onOpenSaved: (template: TemplateSummary) => void
   onNew: () => void
+  /** A template is open in the editor: the gallery starts folded, out of its way. */
+  writing: boolean
 }) {
   const [family, setFamily] = useState<number | null>(null)
+  const [open, setOpen] = useState(!writing)
+  // Opening one folds the gallery, so the editor it opened into is what follows.
+  const folding =
+    <A extends unknown[]>(then: (...args: A) => void) =>
+    (...args: A) => {
+      setOpen(false)
+      then(...args)
+    }
   return (
     <Panel
       title="Templates"
       actions={
-        <Button size="sm" variant="ghost" onClick={onNew}>
-          <FilePlusIcon />
-          New Template
-        </Button>
+        <>
+          <Button size="sm" variant="ghost" onClick={folding(onNew)}>
+            <FilePlusIcon />
+            New Template
+          </Button>
+          <Button size="sm" variant="ghost" aria-expanded={open} onClick={() => setOpen(!open)}>
+            {open ? <ChevronUpIcon /> : <ChevronDownIcon />}
+            {open ? 'Hide' : 'Show'}
+          </Button>
+        </>
       }
     >
-      <div className="flex flex-col gap-4">
-        <section className="flex flex-col gap-2">
-          <h3 className="text-caption font-medium text-ink-subtle">Built-in</h3>
-          <div className="grid gap-2 lg:grid-cols-2">
-            {GALLERY.map((f, index) => (
-              <button
-                key={f.text}
-                type="button"
-                className={cn(CARD, IDLE)}
-                onClick={() => setFamily(index)}
-              >
-                <Expression>{f.shown}</Expression>
-                <span className="flex w-full flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
-                  <Facts stats={cards.get(galleryKey(index, null))?.stats} />
-                  {f.variations.length > 0 && (
-                    <span className="inline-flex items-center gap-0.5 text-body-compact text-ink-subtle">
-                      {fmt.int(f.variations.length)} Variation
-                      {f.variations.length === 1 ? '' : 's'}
-                      <ChevronRightIcon className="size-3.5" aria-hidden />
-                    </span>
-                  )}
-                </span>
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section className="flex flex-col gap-2">
-          <h3 className="text-caption font-medium text-ink-subtle">Saved</h3>
-          {savedState.error ? (
-            <ErrorNotice error={savedState.error} title="Could not load templates" />
-          ) : savedState.pending ? (
-            <Skeleton className="h-20" />
-          ) : saved.length === 0 ? (
-            <p className="text-body-compact text-ink-subtle">
-              Nothing saved yet. Save As keeps the template you are writing here.
-            </p>
-          ) : (
-            <div className="-m-1 grid max-h-96 gap-2 overflow-y-auto p-1 sm:grid-cols-2 xl:grid-cols-3">
-              {saved.map((template) => {
-                const open = template.id === selected
-                return (
-                  <button
-                    key={template.id}
-                    type="button"
-                    aria-pressed={open}
-                    onClick={() => onOpenSaved(template)}
-                    className={cn(CARD, open ? 'border-hairline-strong bg-surface-2' : IDLE)}
-                  >
-                    <span className="flex w-full items-center justify-between gap-2">
-                      <span className="text-title min-w-0 truncate" title={template.name}>
-                        {template.name}
-                      </span>
-                      {open && dirty && (
-                        <span className="shrink-0 text-body-compact text-ink-subtle">Edited</span>
-                      )}
-                    </span>
-                    {template.description && (
-                      <span className="line-clamp-2 text-body-compact text-ink-subtle">
-                        {template.description}
+      {open && (
+        <div className="flex flex-col gap-4">
+          <section className="flex flex-col gap-2">
+            <h3 className="text-caption font-medium text-ink-subtle">Built-in</h3>
+            <div className="grid gap-2 lg:grid-cols-2">
+              {GALLERY.map((f, index) => (
+                <button
+                  key={f.text}
+                  type="button"
+                  className={cn(CARD, IDLE)}
+                  onClick={() => setFamily(index)}
+                >
+                  <Expression>{f.shown}</Expression>
+                  <span className="flex w-full flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
+                    <Facts stats={cards.get(galleryKey(index, null))?.stats} />
+                    {f.variations.length > 0 && (
+                      <span className="inline-flex items-center gap-0.5 text-body-compact text-ink-subtle">
+                        {fmt.int(f.variations.length)} Variation
+                        {f.variations.length === 1 ? '' : 's'}
+                        <ChevronRightIcon className="size-3.5" aria-hidden />
                       </span>
                     )}
-                    <span className="line-clamp-3">
-                      <Expression>{template.text}</Expression>
-                    </span>
-                    <Facts stats={cards.get(savedKey(template.id))?.stats} />
-                  </button>
-                )
-              })}
+                  </span>
+                </button>
+              ))}
             </div>
-          )}
-        </section>
-      </div>
+          </section>
+
+          <section className="flex flex-col gap-2">
+            <h3 className="text-caption font-medium text-ink-subtle">Saved</h3>
+            {savedState.error ? (
+              <ErrorNotice error={savedState.error} title="Could not load templates" />
+            ) : savedState.pending ? (
+              <Skeleton className="h-20" />
+            ) : saved.length === 0 ? (
+              <p className="text-body-compact text-ink-subtle">
+                Nothing saved yet. Save As keeps the template you are writing here.
+              </p>
+            ) : (
+              <div className="-m-1 grid max-h-96 gap-2 overflow-y-auto p-1 sm:grid-cols-2 xl:grid-cols-3">
+                {saved.map((template) => {
+                  const open = template.id === selected
+                  return (
+                    <button
+                      key={template.id}
+                      type="button"
+                      aria-pressed={open}
+                      onClick={() => folding(onOpenSaved)(template)}
+                      className={cn(CARD, open ? 'border-hairline-strong bg-surface-2' : IDLE)}
+                    >
+                      <span className="flex w-full items-center justify-between gap-2">
+                        <span className="text-title min-w-0 truncate" title={template.name}>
+                          {template.name}
+                        </span>
+                        {open && dirty && (
+                          <span className="shrink-0 text-body-compact text-ink-subtle">Edited</span>
+                        )}
+                      </span>
+                      {template.description && (
+                        <span className="line-clamp-2 text-body-compact text-ink-subtle">
+                          {template.description}
+                        </span>
+                      )}
+                      <span className="line-clamp-3">
+                        <Expression>{template.text}</Expression>
+                      </span>
+                      <Facts stats={cards.get(savedKey(template.id))?.stats} />
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </section>
+        </div>
+      )}
       {family !== null && GALLERY[family] && (
         <FamilyDialog
           family={GALLERY[family]}
@@ -263,7 +282,7 @@ export function TemplatesPanel({
           onClose={() => setFamily(null)}
           onOpen={(text) => {
             setFamily(null)
-            onOpenText(text)
+            folding(onOpenText)(text)
           }}
         />
       )}

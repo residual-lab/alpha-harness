@@ -8,9 +8,6 @@ let a checked-out repository sign in as its owner.
 from dataclasses import dataclass
 from pathlib import Path
 
-# Not a setting: the sign-in screen sends the password here, so no file may redirect it.
-BRAIN_API_BASE = "https://api.worldquantbrain.com"
-
 #: The pages that may open the telemetry socket: the Vite dev server, and the built UI the
 #: backend serves itself.
 ALLOWED_ORIGINS = frozenset(

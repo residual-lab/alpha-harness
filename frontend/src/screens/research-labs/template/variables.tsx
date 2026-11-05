@@ -3,31 +3,16 @@
  * chosen datasets or as typed values, with what it holds in this market beside it.
  */
 
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { DatabaseIcon, FilterIcon, PencilIcon, RotateCcwIcon } from 'lucide-react'
-import { useMemo, useState } from 'react'
-import { catalog, type DatasetRow } from '@/api/catalog'
+import { DatabaseIcon, PencilIcon, RotateCcwIcon } from 'lucide-react'
+import { useState } from 'react'
+import type { DatasetRow } from '@/api/catalog'
 import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { fmt } from '@/lib/format'
-import { AvailabilityFilters } from '@/screens/data/availability'
 import { DatasetChips, useDatasetTree } from '@/screens/data/dataset-chips'
-import { datasetNames } from '@/screens/data/dataset-tree'
+import { DatasetPicker } from '@/screens/data/dataset-picker'
 import { describeFilter, type FieldFilterState } from '@/screens/data/state'
-import { DatasetTree } from '@/screens/data/tree-view'
-import {
-  Badge,
-  Button,
-  Chips,
-  Empty,
-  ErrorNotice,
-  Field,
-  Fieldset,
-  Panel,
-  Segmented,
-  Skeleton,
-  Textarea,
-} from '@/ui/kit'
+import { Badge, Button, Chips, Empty, Field, Fieldset, Panel, Segmented, Textarea } from '@/ui/kit'
 import { Sheet } from '@/ui/overlay'
 import type { FieldsVariable, VariableDef, VariableInfo } from './api'
 
@@ -447,104 +432,51 @@ function FieldsChoice({
   setWraps: (ops: string[]) => void
   onMoreFilters: () => void
 }) {
-  const active: FieldFilterState = { ...filter, field_types: types, dataset_ids: datasetIds }
-  // The market's whole tree, so ticking a category takes every dataset in it.
-  const source = useQuery({
-    queryKey: ['catalog', 'facets', scope, {}],
-    queryFn: () => catalog.facets(scope, {}),
-  })
-  const counts = useQuery({
-    queryKey: ['catalog', 'facets', scope, active],
-    queryFn: () => catalog.facets(scope, active),
-    placeholderData: keepPreviousData,
-  })
-  const datasets = useQuery({
-    queryKey: ['catalog', 'datasets', scope, ''],
-    queryFn: () => catalog.datasets(scope),
-  })
-  const names = useMemo(() => datasetNames(datasets.data ?? []), [datasets.data])
-  const byType = new Map(counts.data?.types.map((t) => [t.id, t.n]))
-  const matching = datasetIds.length
-    ? types.reduce((sum, t) => sum + (byType.get(t) ?? 0), 0)
-    : null
-  // Region Exclusive, coverage and the rest of the Data Explorer's filters, less what has
-  // its own control here.
-  const more = describeFilter(
-    { ...filter, field_types: [], region_exclusive: false, region_agnostic: false },
-    scope.region,
-  )
-
   return (
-    <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <span className="text-body text-ink">
-          {matching === null ? (
-            'Tick categories, subcategories or datasets.'
-          ) : (
-            <>
-              <span className="num font-medium">{fmt.int(matching)}</span> field
-              {matching === 1 ? '' : 's'} match
-            </>
+    <DatasetPicker
+      scope={scope}
+      datasetIds={datasetIds}
+      setDatasetIds={setDatasetIds}
+      filter={filter}
+      setFilter={setFilter}
+      types={types}
+      onMoreFilters={onMoreFilters}
+    >
+      {(byType) => (
+        <>
+          <Fieldset legend="Field Type">
+            <Chips
+              label="Field Type"
+              value={types}
+              onChange={setTypes}
+              items={TYPES.map((t) => ({
+                value: t,
+                label: (
+                  <span>
+                    {TYPE_LABELS[t]}{' '}
+                    <span className="num text-ink-subtle">
+                      {fmt.int(byType ? (byType.get(t) ?? 0) : null)}
+                    </span>
+                  </span>
+                ),
+              }))}
+            />
+          </Fieldset>
+          {types.includes('MATRIX') && types.includes('VECTOR') && (
+            <Fieldset
+              legend="Vector Operators"
+              hint="A vector field is reduced with one of these; matrix fields are used as they are."
+            >
+              <Chips
+                label="Vector Operators"
+                value={wraps}
+                onChange={setWraps}
+                items={vector.map((op) => ({ value: op, label: op }))}
+              />
+            </Fieldset>
           )}
-        </span>
-        <Button size="sm" variant="ghost" onClick={onMoreFilters}>
-          <FilterIcon />
-          More Filters in Data Explorer
-        </Button>
-      </div>
-      {more.length > 0 && (
-        <p className="text-body-compact text-ink-subtle">Also narrowed by {more.join(' · ')}</p>
+        </>
       )}
-      <Fieldset legend="Field Type">
-        <Chips
-          label="Field Type"
-          value={types}
-          onChange={setTypes}
-          items={TYPES.map((t) => ({
-            value: t,
-            label: (
-              <span>
-                {TYPE_LABELS[t]}{' '}
-                <span className="num text-ink-subtle">
-                  {fmt.int(counts.data ? (byType.get(t) ?? 0) : null)}
-                </span>
-              </span>
-            ),
-          }))}
-        />
-      </Fieldset>
-      {types.includes('MATRIX') && types.includes('VECTOR') && (
-        <Fieldset
-          legend="Vector Operators"
-          hint="A vector field is reduced with one of these; matrix fields are used as they are."
-        >
-          <Chips
-            label="Vector Operators"
-            value={wraps}
-            onChange={setWraps}
-            items={vector.map((op) => ({ value: op, label: op }))}
-          />
-        </Fieldset>
-      )}
-      <AvailabilityFilters
-        scope={scope}
-        counts={counts.data?.availability}
-        value={filter}
-        onChange={(change) => setFilter((f) => ({ ...f, ...change }))}
-      />
-      {source.isError && <ErrorNotice error={source.error} title="Could not load the datasets" />}
-      {source.data ? (
-        <DatasetTree
-          scope={scope}
-          source={source.data}
-          counts={counts.data}
-          names={names}
-          value={datasetIds}
-          onChange={setDatasetIds}
-        />
-      ) : (
-        !source.isError && <Skeleton className="h-40" />
-      )}
-    </div>
+    </DatasetPicker>
   )
 }

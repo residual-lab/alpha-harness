@@ -127,7 +127,7 @@ export const SPEC: Record<string, string> = {
   'status-running': '#3b82f6',
   'status-queued': '#8a8f98',
   'status-warning': '#f59e0b',
-  'status-idle': '#23252a',
+  'status-idle': '#34343a',
 }
 
 /** Every Tier 1 primitive, name → value, in declaration order. */

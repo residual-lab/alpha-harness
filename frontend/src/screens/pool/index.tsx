@@ -4,23 +4,22 @@
  */
 
 import { Link, useParams } from '@tanstack/react-router'
-import { useState } from 'react'
 import { POOL_TABS } from '@/shell/nav'
 import { Empty, LINK, Page, PageHeader, Panel, TabBar, TabLink } from '@/ui/kit'
-import { DetailSheet } from './detail'
+import { useDetailSheet } from './detail'
 import { Stored } from './stored'
 import { Submittable } from './submittable'
 import { AlphaCounts, SyncAlphasButton } from './vault'
 
 export function PoolScreen() {
   const { tab } = useParams({ from: '/pool/$tab' })
-  const [detailId, setDetailId] = useState<string | null>(null)
+  const detail = useDetailSheet()
 
   const body =
     tab === 'stored' ? (
-      <Stored onOpen={setDetailId} />
+      <Stored onOpen={detail.open} openId={detail.openId} />
     ) : tab === 'submittable' ? (
-      <Submittable onOpen={setDetailId} />
+      <Submittable onOpen={detail.open} />
     ) : (
       <Panel>
         <Empty title={`No tab called “${tab}”`}>
@@ -43,7 +42,7 @@ export function PoolScreen() {
         ))}
       </TabBar>
       {body}
-      <DetailSheet alphaId={detailId} onClose={() => setDetailId(null)} />
+      {detail.sheet}
     </Page>
   )
 }

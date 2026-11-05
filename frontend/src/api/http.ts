@@ -86,7 +86,12 @@ export function normalise(status: number, raw: unknown): ApiErrorBody {
   return { code: `http_${status}`, message: describe(status) }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   // Serialised before the request: a body that cannot be turned into JSON throws a TypeError
   // too, which inside the fetch below would read as an unreachable backend.
   const payload = body === undefined ? null : JSON.stringify(body)
@@ -94,6 +99,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   try {
     response = await fetch(path, {
       method,
+      // A query superseded by a newer one is dropped here rather than read to its end.
+      ...(signal ? { signal } : {}),
       // X-Harness-Client: the backend refuses writes without it (cross-site forms can't set it).
       headers: {
         'X-Harness-Client': '1',
@@ -102,8 +109,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       body: payload,
     })
   } catch (failure) {
-    // Only a failed fetch is a TypeError; anything else must not be reported as "the backend
-    // is not running".
+    // Only a failed fetch is a TypeError; anything else, a cancelled request's AbortError
+    // included, must not be reported as "the backend is not running".
     if (!(failure instanceof TypeError)) throw failure
     throw new ApiError(0, {
       code: 'backend_unreachable',
@@ -128,9 +135,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 export const http = {
-  get: <T>(path: string) => request<T>('GET', path),
+  get: <T>(path: string, signal?: AbortSignal) => request<T>('GET', path, undefined, signal),
   /** Bodies default to `{}`: several routes require a body even when every field is optional. */
-  post: <T>(path: string, body: unknown = {}) => request<T>('POST', path, body),
+  post: <T>(path: string, body: unknown = {}, signal?: AbortSignal) =>
+    request<T>('POST', path, body, signal),
   put: <T>(path: string, body: unknown = {}) => request<T>('PUT', path, body),
   patch: <T>(path: string, body: unknown = {}) => request<T>('PATCH', path, body),
   del: <T>(path: string) => request<T>('DELETE', path),

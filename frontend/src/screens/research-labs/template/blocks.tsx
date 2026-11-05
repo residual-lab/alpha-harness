@@ -7,12 +7,13 @@
 import { Popover } from '@base-ui/react/popover'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { Command } from 'cmdk'
-import { CodeIcon, EraserIcon, SearchIcon, Undo2Icon } from 'lucide-react'
+import { CodeIcon, EraserIcon, PlusIcon, Redo2Icon, SearchIcon, Undo2Icon } from 'lucide-react'
 import { createContext, type ReactNode, use, useState } from 'react'
 import { catalog } from '@/api/catalog'
 import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
-import { Button, Notice, Skeleton } from '@/ui/kit'
+import { MOD } from '@/shell/desktop'
+import { Button, Notice, Segmented, Skeleton } from '@/ui/kit'
 import { type TreeNode, templateLab } from './api'
 import { GROUPS, inputsOf, type OperatorDoc, WORDS } from './fast-expression'
 
@@ -149,6 +150,29 @@ function placed(pick: Pick, current: TreeNode): TreeNode {
   }
 }
 
+/**
+ * `pick` in place of the operator `current`, on the same inputs: `ts_rank(close, 20)` becomes
+ * `ts_zscore(close, 20)`. Inputs past the new one's count are dropped, missing ones left empty,
+ * and options go: they belong to the operator being replaced.
+ */
+function swapped(pick: Pick, current: TreeNode): TreeNode {
+  const take = (count: number) => Array.from({ length: count }, (_, i) => current.args[i] ?? hole())
+  switch (pick.kind) {
+    case 'call':
+      return { kind: 'call', value: pick.name, args: take(pick.inputs), kwargs: [] }
+    case 'binary':
+      return { kind: 'binary', value: pick.symbol, args: take(2), kwargs: [] }
+    case 'ternary':
+      return { kind: 'ternary', value: '', args: take(3), kwargs: [] }
+    case 'negate':
+      return { kind: 'unary', value: '-', args: take(1), kwargs: [] }
+    case 'leaf':
+      return pick.node
+  }
+}
+
+const OPERATOR_KINDS: TreeNode['kind'][] = ['call', 'binary', 'unary', 'ternary']
+
 const ARITHMETIC = ['+', '-', '*', '/', '^']
 const LOGICAL = ['>', '<', '>=', '<=', '==', '!=', '&&', '||']
 const NUMBER = /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/
@@ -221,7 +245,7 @@ export function TemplateBlocks({
   const blank = text.trim() === ''
   const read = useQuery({
     queryKey: ['template-lab', 'tree', text],
-    queryFn: () => templateLab.tree(text),
+    queryFn: ({ signal }) => templateLab.tree(text, signal),
     enabled: !blank,
     staleTime: Number.POSITIVE_INFINITY,
     placeholderData: keepPreviousData,
@@ -229,7 +253,12 @@ export function TemplateBlocks({
   // The tree just built here, shown at once rather than after the text is read back.
   const [mine, setMine] = useState<{ text: string; tree: TreeNode } | null>(null)
   const [history, setHistory] = useState<{ before: string; after: string }[]>([])
+  const [undone, setUndone] = useState<{ before: string; after: string }[]>([])
   const last = history.at(-1)
+  const next = undone.at(-1)
+  // Only while the text is still what the step left: an edit in Code since makes it stale.
+  const canUndo = last?.after === text
+  const canRedo = next?.before === text
 
   const fresh = read.data && !read.isPlaceholderData ? read.data : undefined
   const root = mine?.text === text ? mine.tree : blank ? hole() : fresh?.tree
@@ -240,7 +269,20 @@ export function TemplateBlocks({
     if (written === text) return
     setMine({ text: written, tree: next })
     setHistory((h) => [...h.slice(-49), { before: text, after: written }])
+    setUndone([])
     onChange(written)
+  }
+  const undo = () => {
+    if (!last || !canUndo) return
+    setHistory((h) => h.slice(0, -1))
+    setUndone((u) => [...u, last])
+    onChange(last.before)
+  }
+  const redo = () => {
+    if (!next || !canRedo) return
+    setUndone((u) => u.slice(0, -1))
+    setHistory((h) => [...h, next])
+    onChange(next.after)
   }
 
   if (!root) {
@@ -264,30 +306,63 @@ export function TemplateBlocks({
   }
 
   const statements = root.kind === 'seq' ? root.args : [root]
+  // A named step before the last line, which stays the Alpha: `step1 = …;`.
+  const addStep = () => {
+    const taken = new Set(namesOf(root, 'assign', () => true))
+    let n = 1
+    while (taken.has(`step${n}`)) n += 1
+    const step: TreeNode = { kind: 'assign', value: `step${n}`, args: [hole()], kwargs: [] }
+    const alpha = statements.at(-1) ?? hole()
+    change({ kind: 'seq', value: '', args: [...statements.slice(0, -1), step, alpha], kwargs: [] })
+  }
   // Strings may hold `#`; only code outside them counts.
   const commented = COMMENT.test(text.replace(/"[^"]*"|'[^']*'/g, ''))
 
   return (
     <BlocksContext value={{ root, change, operators, variables, scope }}>
-      <div className="flex flex-col gap-2">
-        <div className="flex flex-wrap items-center justify-end gap-1">
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={last?.after !== text}
-            onClick={() => {
-              if (!last) return
-              setHistory((h) => h.slice(0, -1))
-              onChange(last.before)
-            }}
-          >
-            <Undo2Icon />
-            Undo
+      {/* ⌘Z and ⇧⌘Z (Ctrl on Windows) while working in the blocks; a text box keeps its own. */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: listens for keys from the blocks inside */}
+      <div
+        className="flex flex-col gap-2"
+        onKeyDown={(e) => {
+          if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'z') return
+          if ((e.target as HTMLElement).closest('input, textarea')) return
+          e.preventDefault()
+          if (e.shiftKey) redo()
+          else undo()
+        }}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-1">
+          <Button size="sm" variant="secondary" onClick={addStep}>
+            <PlusIcon />
+            Add Step
           </Button>
-          <Button size="sm" variant="ghost" disabled={blank} onClick={() => change(hole())}>
-            <EraserIcon />
-            Clear
-          </Button>
+          <span className="flex flex-wrap items-center gap-1">
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={!canUndo}
+              title={`Undo (${MOD}Z)`}
+              onClick={undo}
+            >
+              <Undo2Icon />
+              Undo
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={!canRedo}
+              title={`Redo (⇧${MOD}Z)`}
+              onClick={redo}
+            >
+              <Redo2Icon />
+              Redo
+            </Button>
+            <Button size="sm" variant="ghost" disabled={blank} onClick={() => change(hole())}>
+              <EraserIcon />
+              Clear
+            </Button>
+          </span>
         </div>
         {commented && (
           <Notice tone="info" title="A change here drops this template's comments">
@@ -416,6 +491,10 @@ function Handle({
     setOpen(false)
   }
   const kept = node.args[0]
+  // On an operator, swapping it for another is the usual edit; wrapping is one click away.
+  const operator = OPERATOR_KINDS.includes(node.kind)
+  const [mode, setMode] = useState<'replace' | 'wrap'>('replace')
+  const replacing = operator && mode === 'replace'
   return (
     <Floating
       open={open}
@@ -433,10 +512,27 @@ function Handle({
       }
     >
       <div className="flex w-80 max-w-full flex-col">
-        <p className="border-b border-hairline px-3 pt-2 pb-1.5 text-caption text-ink-subtle">
-          An operator wraps this block; anything else replaces it.
-        </p>
-        <BlockSearch onPick={(pick) => done(placed(pick, node))} />
+        <div className="flex flex-col gap-1.5 border-b border-hairline px-3 pt-2 pb-1.5">
+          {operator && (
+            <Segmented
+              label="What an operator picked here does"
+              value={mode}
+              onChange={setMode}
+              items={[
+                { value: 'replace', label: 'Replace Operator' },
+                { value: 'wrap', label: 'Wrap in Operator' },
+              ]}
+            />
+          )}
+          <p className="text-caption text-ink-subtle">
+            {replacing
+              ? 'An operator takes this one’s place, on the same inputs; anything else replaces the block.'
+              : 'An operator wraps this block; anything else replaces it.'}
+          </p>
+        </div>
+        <BlockSearch
+          onPick={(pick) => done(replacing ? swapped(pick, node) : placed(pick, node))}
+        />
         <div className="flex flex-wrap gap-2 border-t border-hairline p-2">
           {node.kind === 'call' && (
             <Button

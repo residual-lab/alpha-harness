@@ -24,7 +24,6 @@ from ..brain.errors import (
     BrainValidationError,
     BrainVerificationRequired,
 )
-from ..engine.lifecycle import SubmissionFailed
 from ..labs.objectives import StudyError, StudyNotFoundError
 from ..llm.keys import BudgetExhaustedError, LLMError, NoKeysError
 from ..state import AppState
@@ -164,16 +163,6 @@ def install_exception_handlers(app: FastAPI) -> None:
             "BRAIN is throttling requests. Wait a moment and try again.",
             retryable=True,
             retryAfter=exc.retry_after,
-        )
-
-    @app.exception_handler(SubmissionFailed)
-    async def _submission(_r: Request, exc: SubmissionFailed) -> JSONResponse:
-        return _problem(
-            422,
-            "submission_failed",
-            str(exc),
-            recordId=exc.record_id,
-            fields=exc.fields,
         )
 
     @app.exception_handler(BudgetExhaustedError)

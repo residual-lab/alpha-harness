@@ -1,0 +1,57 @@
+name: ⭐ Feature or enhancement request
+description: Propose something new.
+labels: ["type: feature", "status: needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A request is judged on the problem it solves, so lead with the problem. Requests are accepted, declined, or closed as duplicates; a closed request is a decision, not neglect.
+
+        Still forming the idea? Talk it through in [Ideas](https://github.com/residual-lab/alpha-harness/discussions/categories/ideas) first. Search [open and closed issues](https://github.com/residual-lab/alpha-harness/issues?q=is%3Aissue) too, and add to an existing request rather than opening another.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Simulation Matrix and Tasks
+        - Research Labs (Search, Template, Evolution, LLM Power Pool, Super Alpha)
+        - Tools (Settings Sampler, Correlation Breaker, Fields Sampler)
+        - Pool and Portfolio
+        - Data catalog
+        - AI keys and models
+        - Install, start-up or updates
+        - Something new
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today? A real example beats a general one.
+      placeholder: "Every morning I re-run the same five Template Lab templates by hand, which takes 15 minutes."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like
+      description: "How it would work from your side: what you'd click and what you'd see."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today
+      description: Workarounds you use, or other options you considered.
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched open and closed issues and this isn't already requested.
+          required: true

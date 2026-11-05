@@ -9,7 +9,7 @@ import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { saveText } from '@/lib/download'
 import { fmt } from '@/lib/format'
-import { Button, Input } from '@/ui/kit'
+import { Button, Checkbox, Input } from '@/ui/kit'
 import { ContextMenu } from '@/ui/overlay'
 import { DatasetChips } from './dataset-chips'
 import { buildTree } from './dataset-tree'
@@ -269,7 +269,7 @@ function TreeRow({
     >
       <div
         className={cn(
-          'flex h-7 shrink-0 items-center gap-1 pr-3 text-body-compact transition-colors hover:bg-surface-2 data-[popup-open]:bg-surface-2',
+          'group/row flex h-7 shrink-0 items-center gap-1 pr-3 text-body-compact transition-colors hover:bg-surface-2 data-[popup-open]:bg-surface-2',
           depth === 0 ? 'pl-1.5' : depth === 1 ? 'pl-6' : 'pl-10.5',
         )}
       >
@@ -289,29 +289,34 @@ function TreeRow({
         ) : (
           <span className="w-4.5 shrink-0" aria-hidden />
         )}
-        <label
-          title={title ?? label}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2"
+        <Checkbox
+          className="min-w-0 flex-1"
+          checked={all}
+          indeterminate={some}
+          onChange={onToggle}
+          label={
+            <span
+              title={title ?? label}
+              className={cn(
+                'truncate text-body-compact',
+                depth === 0 && 'font-medium',
+                on > 0 ? 'text-ink' : 'text-ink-muted',
+              )}
+            >
+              {label}
+            </span>
+          }
+        />
+        {/* The right-click menu's first item, in sight on hover so it can be found at all. */}
+        <button
+          type="button"
+          aria-label={`Copy the Data Fields of ${label}`}
+          title="Copy Data Fields · right-click for more"
+          onClick={onCopy}
+          className="shrink-0 rounded-xs p-0.5 text-ink-subtle opacity-0 transition-opacity group-hover/row:opacity-100 hover:text-ink focus-visible:opacity-100"
         >
-          <input
-            type="checkbox"
-            className="size-3.5 shrink-0"
-            checked={all}
-            ref={(el) => {
-              if (el) el.indeterminate = some
-            }}
-            onChange={(e) => onToggle(e.target.checked)}
-          />
-          <span
-            className={cn(
-              'truncate',
-              depth === 0 && 'font-medium',
-              on > 0 ? 'text-ink' : 'text-ink-muted',
-            )}
-          >
-            {label}
-          </span>
-        </label>
+          <CopyIcon className="size-3.5" aria-hidden />
+        </button>
         {count != null && <span className="num shrink-0 text-ink-subtle">{fmt.int(count)}</span>}
       </div>
     </ContextMenu>

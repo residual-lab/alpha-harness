@@ -7,6 +7,8 @@ them to HTTP responses in exactly one place.
 from typing import Any
 from urllib.parse import quote, urljoin
 
+from .platform import PLATFORM_SIGN_IN
+
 DAILY_LIMIT_DETAIL = "DAILY_SIMULATION_LIMIT_EXCEEDED"
 
 #: BRAIN's 403 ``detail`` for an inquiry that is unfinished rather than dead: complete it,
@@ -15,10 +17,6 @@ INQUIRY_INCOMPLETE_DETAIL = "INQUIRY_INCOMPLETE"
 
 #: Where an inquiry is completed and closed.
 PERSONA_PATH = "/authentication/persona"
-
-#: Fallback only, for a 401 that carried no inquiry location: it cannot resume a specific
-#: inquiry.
-PLATFORM_SIGN_IN = "https://platform.worldquantbrain.com/sign-in"
 
 
 def persona_url(base_url: str, inquiry: str) -> str:

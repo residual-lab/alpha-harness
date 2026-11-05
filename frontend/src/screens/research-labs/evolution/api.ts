@@ -35,7 +35,8 @@ export const evolutionLab = {
   /** The markets holding Alphas, and what a task can be set to. */
   options: () => http.get<EvolutionOptions>(`${B}/options`),
   /** Free; queues nothing. */
-  preview: (body: EvolutionRequest) => http.post<EvolutionPreview>(`${B}/preview`, body),
+  preview: (body: EvolutionRequest, signal?: AbortSignal) =>
+    http.post<EvolutionPreview>(`${B}/preview`, body, signal),
   /** Chooses seeds in the background. Downloads daily PnL where missing; never simulates. */
   autoSeeds: (body: { region: string; delay: number; universe: string; count: number }) =>
     http.post<Schemas['AutoSeedsStarted']>(`${B}/seeds/auto`, body),

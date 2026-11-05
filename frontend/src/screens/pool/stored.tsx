@@ -6,22 +6,22 @@ import { CopyIcon, SearchIcon } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
+import { REGION_AGNOSTIC_REGION } from '@/api/platform'
 import type { Scope } from '@/api/types'
-import { fmt } from '@/lib/format'
-import { REGION_AGNOSTIC, regionLabel } from '@/lib/scope'
+import { CORE_ORDER, fmt } from '@/lib/format'
+import { regionLabel } from '@/lib/scope'
 import { useDebounced } from '@/lib/use-debounced'
 import { useRefetchOn } from '@/lib/ws'
+import { AlphaTable, fromStored } from '@/screens/alpha-table'
+import { OPTIONS } from '@/screens/alpha-table/columns'
 import {
   type AlphaMetricKey,
   type AlphaPageRequest,
-  type AlphaRow,
   type AlphaSortKey,
   pool,
 } from '@/screens/pool/api'
 import { MAX_SEEDS, MIN_SEEDS, useSeedPick } from '@/screens/research-labs/evolution/seed-pick'
-import { SharpeCell } from '@/screens/tasks/columns'
 import {
-  Badge,
   Button,
   Chips,
   Disclosure,
@@ -31,13 +31,10 @@ import {
   Metric,
   Panel,
   Segmented,
-  STATUS,
-  signTone,
-  TEXT_TONE,
 } from '@/ui/kit'
-import { type Column, DataTable, Pager, type Sort } from '@/ui/table'
+import { Pager, type Sort } from '@/ui/table'
 import { alphasMarkdown } from './copy'
-import { AlphaActionsMenu } from './shared'
+import { alphaIds } from './detail'
 
 /** Bounds as the user types them; `div` converts the display unit to the wire fraction. */
 const BOUNDS: { key: AlphaMetricKey; label: string; div: number }[] = [
@@ -50,122 +47,58 @@ const BOUNDS: { key: AlphaMetricKey; label: string; div: number }[] = [
   { key: 'operator_count', label: 'Operators', div: 1 },
 ]
 
-const COLUMNS: Column<AlphaRow>[] = [
-  {
-    key: 'alpha_id',
-    header: 'Alpha',
-    width: '96px',
-    cell: (r) => <span className="num text-ink-muted">{r.alphaId}</span>,
-  },
-  {
-    key: 'expression',
-    header: 'Expression',
-    width: 'minmax(240px,2fr)',
-    cell: (r) => (
-      <span className="num truncate" title={r.expression ?? undefined}>
-        {r.expression ?? '—'}
-      </span>
-    ),
-  },
-  {
-    key: 'market',
-    header: 'Region · Universe',
-    width: '190px',
-    cell: (r) => (
-      <span className="num text-ink-subtle">
-        {r.region ?? '—'}
-        {/* A region-agnostic seed's figures are one region's: name it. */}
-        {r.standingRegion && <span className="text-ink"> → {r.standingRegion}</span>} ·{' '}
-        {r.universe ?? '—'} · D{r.delay ?? '—'}
-      </span>
-    ),
-  },
-  {
-    key: 'sharpe',
-    header: 'Sharpe',
-    width: '90px',
-    align: 'right',
-    sortable: true,
-    cell: (r) => <SharpeCell value={r.sharpe} />,
-  },
-  {
-    key: 'fitness',
-    header: 'Fitness',
-    width: '80px',
-    align: 'right',
-    sortable: true,
-    cell: (r) => fmt.ratio(r.fitness),
-  },
-  {
-    key: 'turnover',
-    header: 'Turnover',
-    width: '88px',
-    align: 'right',
-    sortable: true,
-    cell: (r) => fmt.pct(r.turnover),
-  },
-  {
-    key: 'returns',
-    header: 'Returns',
-    width: '88px',
-    align: 'right',
-    sortable: true,
-    cell: (r) => <span className={TEXT_TONE[signTone(r.returns)]}>{fmt.pct(r.returns)}</span>,
-  },
-  {
-    key: 'drawdown',
-    header: 'Drawdown',
-    width: '92px',
-    align: 'right',
-    sortable: true,
-    cell: (r) => fmt.pct(r.drawdown),
-  },
-  {
-    key: 'margin',
-    header: 'Margin',
-    width: '92px',
-    align: 'right',
-    sortable: true,
-    cell: (r) => fmt.bps(r.margin),
-  },
-  {
-    key: 'operator_count',
-    header: 'Operators',
-    width: '88px',
-    align: 'right',
-    sortable: true,
-    cell: (r) => fmt.int(r.operatorCount),
-  },
-  {
-    key: 'date_created',
-    header: 'Created',
-    width: '112px',
-    align: 'right',
-    sortable: true,
-    cell: (r) => fmt.date(r.dateCreated),
-  },
-  {
-    key: 'pnl',
-    header: 'Daily PnL',
-    width: '88px',
-    cell: (r) =>
-      r.hasPnl ? <Badge tone="muted">stored</Badge> : <span className="text-ink-subtle">—</span>,
-  },
-  {
-    key: 'actions',
-    header: '',
-    width: '44px',
-    align: 'right',
-    cell: (r) => <AlphaActionsMenu alphaId={r.alphaId} />,
-  },
+const OFFER = [
+  'alphaId',
+  'expression',
+  'name',
+  'dateCreated',
+  'dateSubmitted',
+  'classifications',
+  'pyramids',
+  'operatorCount',
+  'hasPnl',
+  'region',
+  'delay',
+  'universe',
+  'investability',
+  'neutralization',
+  'decay',
+  'truncation',
+  ...CORE_ORDER,
+  'trainSharpe',
+  'testSharpe',
+  'longCount',
+  'shortCount',
+  'imbalance',
 ]
+
+const DEFAULTS = [
+  'alphaId',
+  'expression',
+  'region',
+  'delay',
+  'universe',
+  ...CORE_ORDER,
+  'operatorCount',
+  'dateCreated',
+  'hasPnl',
+]
+
+const serverKey = (key: string) =>
+  (OPTIONS.find((o) => o.key === key)?.serverKey ?? 'sharpe') as AlphaSortKey
 
 /** Selection actions: clickable, so a lifted surface that brightens on hover, like pressed chips. */
 const SELECTION_ACTION = 'border-hairline-strong bg-surface-2 text-ink hover:bg-surface-3'
 
 const unique = <T,>(values: (T | null)[]) => [...new Set(values.filter((v): v is T => v != null))]
 
-export function Stored({ onOpen }: { onOpen: (alphaId: string) => void }) {
+export function Stored({
+  onOpen,
+  openId,
+}: {
+  onOpen: (alphaId: string, ids?: string[]) => void
+  openId: string | null
+}) {
   const overview = useQuery({
     queryKey: ['pool', 'overview'],
     queryFn: pool.overview,
@@ -180,7 +113,6 @@ export function Stored({ onOpen }: { onOpen: (alphaId: string) => void }) {
   const [sort, setSort] = useState<Sort>({ key: 'sharpe', desc: true })
   const [limit, setLimit] = useState(100)
   const [offset, setOffset] = useState(0)
-  const [selected, setSelected] = useState<Set<string>>(new Set())
   // Debounced rather than deferred: `useDeferredValue` still asks the backend once per keystroke.
   const quietSearch = useDebounced(search, 300)
   const quietBounds = useDebounced(bounds, 400)
@@ -203,7 +135,7 @@ export function Stored({ onOpen }: { onOpen: (alphaId: string) => void }) {
     // combo, not a regular expression, so it can never be bred from — offering it here and
     // rejecting it on submit is the table misleading the user.
     evolvable: Boolean(market),
-    sort_by: sort.key as AlphaSortKey,
+    sort_by: serverKey(sort.key),
     sort_desc: sort.desc,
     regions: market ? [market.region] : regions.length ? regions : null,
     delays: market ? [market.delay] : delays.length ? delays.map(Number) : null,
@@ -233,6 +165,7 @@ export function Stored({ onOpen }: { onOpen: (alphaId: string) => void }) {
   // An Alpha simulated from the app is signalled here once it is stored locally.
   useRefetchOn('simulations', ['pool', 'stored'], 5000)
   const rows = useMemo(() => page.data?.results ?? [], [page.data])
+  const shaped = useMemo(() => rows.map(fromStored), [rows])
 
   const scopes = overview.data?.scopes ?? []
   const regionItems = unique(scopes.map((s) => s.region)).map((v) => ({
@@ -247,23 +180,11 @@ export function Stored({ onOpen }: { onOpen: (alphaId: string) => void }) {
     label: v,
   }))
 
-  const chosen = market ? picked : selected
-  const toggle = (ids: string[], on: boolean) => {
-    if (market) {
-      useSeedPick.setState((s) => ({
-        ids: on ? [...new Set([...s.ids, ...ids])] : s.ids.filter((id) => !ids.includes(id)),
-      }))
-      return
-    }
-    setSelected((prev) => {
-      const next = new Set(prev)
-      for (const id of ids) {
-        if (on) next.add(id)
-        else next.delete(id)
-      }
-      return next
-    })
-  }
+  // Rows are ticked only to pick seeds; anywhere else a tick would lead nowhere.
+  const toggle = (ids: string[], on: boolean) =>
+    useSeedPick.setState((s) => ({
+      ids: on ? [...new Set([...s.ids, ...ids])] : s.ids.filter((id) => !ids.includes(id)),
+    }))
   const activeBounds =
     BOUNDS.filter((b) => bounds[b.key]?.min || bounds[b.key]?.max).length +
     (market ? 0 : regions.length + delays.length + universes.length)
@@ -385,53 +306,56 @@ export function Stored({ onOpen }: { onOpen: (alphaId: string) => void }) {
           </div>
         </Disclosure>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {!market && (
-            <span className={STATUS}>
-              <span className="num text-ink">{fmt.int(selected.size)}</span> selected
-            </span>
-          )}
-          <Button
-            size="sm"
-            className={SELECTION_ACTION}
-            disabled={rows.length === 0}
-            onClick={() =>
-              toggle(
-                rows.map((r) => r.alphaId),
-                true,
-              )
-            }
-          >
-            Select page
-          </Button>
-          {chosen.size > 0 && (
+        {market && (
+          <div className="flex flex-wrap items-center gap-2">
             <Button
               size="sm"
               className={SELECTION_ACTION}
-              onClick={() => toggle([...chosen], false)}
+              disabled={rows.length === 0}
+              onClick={() =>
+                toggle(
+                  rows.map((r) => r.alphaId),
+                  true,
+                )
+              }
             >
-              Clear
+              Select page
             </Button>
-          )}
-        </div>
+            {picked.size > 0 && (
+              <Button
+                size="sm"
+                className={SELECTION_ACTION}
+                onClick={() => toggle([...picked], false)}
+              >
+                Clear
+              </Button>
+            )}
+          </div>
+        )}
         {page.isError && rows.length > 0 && (
           <ErrorNotice error={page.error} title="Could not read stored Alphas" />
         )}
 
-        <DataTable
+        <AlphaTable
+          view="stored"
           label="Stored Alphas"
-          rows={rows}
-          columns={COLUMNS}
-          rowKey={(r) => r.alphaId}
-          onRowClick={(r) => onOpen(r.alphaId)}
+          rows={shaped}
+          offer={OFFER}
+          defaults={DEFAULTS}
+          serverSort
+          page={offset}
+          openAlpha={openId}
+          onRowClick={(r, _event, shown) => r.alphaId && onOpen(r.alphaId, alphaIds(shown))}
           sort={sort}
           onSort={(s) => {
             setSort(s)
             setOffset(0)
           }}
-          selected={chosen}
-          onSelect={(key, on) => toggle([key], on)}
-          loading={page.isPending}
+          {...(market && {
+            selected: picked,
+            onSelect: toggle,
+          })}
+          loading={page.isPending || page.isPlaceholderData}
           error={page.error}
           empty={
             overview.data?.counts.alphas === 0
@@ -480,7 +404,7 @@ function SeedPickBar({ market }: { market: Scope }) {
         label="Market"
         value={`${regionLabel(market.region)} · D${market.delay} · ${market.universe}`}
       />
-      {market.region === REGION_AGNOSTIC ? (
+      {market.region === REGION_AGNOSTIC_REGION ? (
         <span className="min-w-60 flex-1 text-body-compact text-pretty text-ink-subtle">
           Each region-agnostic Alpha shows the region it is scored on: its second-best, since BRAIN
           submits one only when two regions pass.
@@ -501,7 +425,7 @@ function SeedPickBar({ market }: { market: Scope }) {
         disabled={count < MIN_SEEDS || count > MAX_SEEDS}
         onClick={() => back(true)}
       >
-        Done
+        Use in Evolution Lab
       </Button>
     </div>
   )

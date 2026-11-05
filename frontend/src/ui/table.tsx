@@ -5,10 +5,18 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { ArrowDownIcon, ArrowUpIcon, ChevronLeftIcon, ChevronRightIcon } from 'lucide-react'
-import { type ReactNode, useRef } from 'react'
+import {
+  Children,
+  cloneElement,
+  isValidElement,
+  type ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
-import { Button, Empty, ErrorNotice, Skeleton } from './kit'
+import { Button, Checkbox, Empty, ErrorNotice, Skeleton } from './kit'
 
 export interface Column<T> {
   key: string
@@ -29,6 +37,7 @@ export function DataTable<T>({
   rows,
   columns,
   rowKey,
+  activeKey,
   onRowClick,
   rowClass,
   sort,
@@ -39,21 +48,25 @@ export function DataTable<T>({
   error,
   empty = 'Nothing to show.',
   maxHeight = '70vh',
-  rowHeight = 34,
+  rowHeight = 28,
   label,
+  page,
 }: {
   rows: T[]
   columns: Column<T>[]
   rowKey: (row: T) => string
-  /** The event comes too, so a table can treat a modified click as its own action. */
-  onRowClick?: (row: T, event: React.MouseEvent | React.KeyboardEvent) => void
+  /** The row open beside the table, in a sheet or a pane: marked, and kept in view as it moves. */
+  activeKey?: string | null | undefined
+  /** The event comes too, so a table can treat a modified click as its own action, and the
+   *  rows in the order shown, for stepping through them from what the click opened. */
+  onRowClick?: (row: T, event: React.MouseEvent | React.KeyboardEvent, shown: T[]) => void
   /** Extra classes for one row, so a table can mark rows that mean something. */
   rowClass?: (row: T) => string | undefined
   sort?: Sort
   onSort?: (sort: Sort) => void
-  /** With `onSelect`, adds a checkbox column. */
+  /** With `onSelect`, adds a checkbox column. Shift-click ticks or unticks a run of rows. */
   selected?: ReadonlySet<string>
-  onSelect?: (key: string, on: boolean) => void
+  onSelect?: (keys: string[], on: boolean) => void
   loading?: boolean
   /** A failed query: shown in place of the empty state, which would claim there is nothing. */
   error?: unknown
@@ -62,8 +75,19 @@ export function DataTable<T>({
   maxHeight?: string | undefined
   rowHeight?: number
   label: string
+  /** The page shown, when the rows are paged: a new page, like a new sort, starts at its top. */
+  page?: number
 }) {
   const scroller = useRef<HTMLDivElement>(null)
+  // The row last ticked, by key so a list refiltered since cannot aim a run at another row,
+  // and whether shift is held for this one, for ticking a run.
+  const lastTicked = useRef<string | null>(null)
+  const shift = useRef(false)
+  // biome-ignore lint/correctness/useExhaustiveDependencies: re-run to start each new sort or page at its top
+  useEffect(() => {
+    scroller.current?.scrollTo({ top: 0 })
+    lastTicked.current = null
+  }, [sort?.key, sort?.desc, page])
   const virtual = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scroller.current,
@@ -71,6 +95,21 @@ export function DataTable<T>({
     overscan: 12,
   })
   const selectable = selected !== undefined && onSelect !== undefined
+  const activeIndex = activeKey == null ? -1 : rows.findIndex((row) => rowKey(row) === activeKey)
+  // Stepping through rows in a sheet scrolls the table along, so closing it lands on the row.
+  useEffect(() => {
+    if (activeIndex >= 0) virtual.scrollToIndex(activeIndex, { align: 'auto' })
+  }, [activeIndex, virtual])
+  // The rows are one stop for Tab, moved between with the arrow keys: the last one focused,
+  // else the open one, else the first.
+  const [focused, setFocused] = useState<number | null>(null)
+  const stop = focused !== null && focused < rows.length ? focused : Math.max(activeIndex, 0)
+  const focusRow = (index: number) => {
+    virtual.scrollToIndex(index, { align: 'auto' })
+    requestAnimationFrame(() =>
+      scroller.current?.querySelector<HTMLElement>(`[data-row-index="${index}"]`)?.focus(),
+    )
+  }
   const template = [
     selectable ? '36px' : null,
     ...columns.map((c) => c.width ?? 'minmax(96px,1fr)'),
@@ -86,7 +125,21 @@ export function DataTable<T>({
         className="grid border-b border-hairline-strong bg-surface-1 select-none"
         style={{ gridTemplateColumns: template }}
       >
-        {selectable && <div role="columnheader" aria-label="Select" />}
+        {selectable && (
+          <div role="columnheader" className="flex items-center justify-center">
+            <Checkbox
+              label={null}
+              aria-label="Select every row shown"
+              checked={rows.length > 0 && rows.every((row) => selected.has(rowKey(row)))}
+              indeterminate={
+                rows.some((row) => selected.has(rowKey(row))) &&
+                !rows.every((row) => selected.has(rowKey(row)))
+              }
+              disabled={rows.length === 0}
+              onChange={(on) => onSelect(rows.map(rowKey), on)}
+            />
+          </div>
+        )}
         {columns.map((column) => {
           const active = sort?.key === column.key
           const Arrow = sort?.desc ? ArrowDownIcon : ArrowUpIcon
@@ -96,8 +149,14 @@ export function DataTable<T>({
             // sits *inside* the text, so it wraps with the last word instead of being a rigid
             // sibling that collides with it in a narrow column.
             <span className={cn('min-w-0 text-balance', column.align === 'right' && 'text-right')}>
-              {column.header}
-              {active && <Arrow className="ml-1 inline size-3 align-text-bottom text-primary" />}
+              {wholeWords(column.header)}
+              {active && (
+                <>
+                  {/* A word joiner keeps the arrow on the line of the last word. */}
+                  {'\u2060'}
+                  <Arrow className="ml-1 inline size-3 align-text-bottom text-primary" />
+                </>
+              )}
             </span>
           )
           return (
@@ -160,34 +219,57 @@ export function DataTable<T>({
         ) : rows.length === 0 ? (
           <Empty title={empty} />
         ) : (
-          <div role="rowgroup" className="relative" style={{ height: virtual.getTotalSize() }}>
+          <div
+            role="rowgroup"
+            // Rows from before a new sort or page still showing while it loads: dimmed, not live.
+            className={cn('relative transition-opacity', loading && 'opacity-60')}
+            aria-busy={loading || undefined}
+            style={{ height: virtual.getTotalSize() }}
+          >
             {virtual.getVirtualItems().map((item) => {
               const row = rows[item.index]
               if (row === undefined) return null
               const key = rowKey(row)
               const isSelected = selectable && selected.has(key)
+              const isActive = item.index === activeIndex
               return (
                 <div
                   key={key}
                   role="row"
                   aria-rowindex={item.index + 2}
                   aria-selected={selectable ? isSelected : undefined}
-                  tabIndex={onRowClick ? 0 : undefined}
-                  onClick={onRowClick ? (e) => onRowClick(row, e) : undefined}
+                  aria-current={isActive || undefined}
+                  data-row-index={item.index}
+                  tabIndex={onRowClick ? (item.index === stop ? 0 : -1) : undefined}
+                  onFocus={onRowClick ? () => setFocused(item.index) : undefined}
+                  onClick={onRowClick ? (e) => onRowClick(row, e, rows) : undefined}
                   onKeyDown={
                     onRowClick
                       ? (e) => {
+                          // A key meant for a button or menu inside the row is not the row's.
+                          if (e.target !== e.currentTarget) return
+                          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                            e.preventDefault()
+                            const step = e.key === 'ArrowDown' ? 1 : -1
+                            focusRow(Math.max(0, Math.min(rows.length - 1, item.index + step)))
+                            return
+                          }
                           if (e.key !== 'Enter' && e.key !== ' ') return
                           e.preventDefault()
-                          onRowClick(row, e)
+                          onRowClick(row, e, rows)
                         }
                       : undefined
                   }
                   className={cn(
                     'absolute inset-x-0 grid border-b border-hairline-subtle bg-surface-1 text-body-compact transition-colors',
+                    // A rule down the row's left edge as well as the fill, which is a faint step to
+                    // follow across a wide screen: hairline on hover, lavender on the open row.
                     onRowClick &&
-                      'cursor-pointer hover:bg-surface-2 focus-visible:bg-surface-2 focus-visible:-outline-offset-2',
+                      'cursor-pointer hover:bg-surface-2 hover:shadow-[inset_2px_0_0_0_var(--color-hairline-strong)] focus-visible:bg-surface-2 focus-visible:-outline-offset-2',
                     isSelected && 'bg-surface-2',
+                    // Held through hover, which otherwise repaints the row as if it were not open.
+                    isActive &&
+                      'bg-primary-subtle shadow-[inset_2px_0_0_0_var(--color-primary)] hover:bg-primary-subtle hover:shadow-[inset_2px_0_0_0_var(--color-primary)]',
                     rowClass?.(row),
                   )}
                   style={{
@@ -200,15 +282,30 @@ export function DataTable<T>({
                     <div
                       role="cell"
                       className="flex items-center justify-center"
+                      onClickCapture={(e) => {
+                        shift.current = e.shiftKey
+                      }}
                       onClick={(e) => e.stopPropagation()}
                       onKeyDown={(e) => e.stopPropagation()}
                     >
-                      <input
-                        type="checkbox"
+                      <Checkbox
+                        label={null}
                         aria-label="Select row"
-                        className="size-3.5"
                         checked={isSelected}
-                        onChange={(e) => onSelect(key, e.target.checked)}
+                        onChange={(on) => {
+                          const at = shift.current ? lastTicked.current : null
+                          const from = at === null ? -1 : rows.findIndex((r) => rowKey(r) === at)
+                          shift.current = false
+                          lastTicked.current = key
+                          const run =
+                            from < 0
+                              ? [row]
+                              : rows.slice(
+                                  Math.min(from, item.index),
+                                  Math.max(from, item.index) + 1,
+                                )
+                          onSelect(run.map(rowKey), on)
+                        }}
                       />
                     </div>
                   )}
@@ -286,4 +383,13 @@ export function Pager({
       </div>
     </div>
   )
+}
+
+/** A header with its hyphens made non-breaking, so ``Self-Correlation`` wraps at spaces only
+ *  and never as ``Self-`` over ``Correlation``. */
+function wholeWords(node: ReactNode): ReactNode {
+  if (typeof node === 'string') return node.replaceAll('-', '\u2011')
+  if (isValidElement<{ children?: ReactNode }>(node) && node.props.children !== undefined)
+    return cloneElement(node, undefined, Children.map(node.props.children, wholeWords))
+  return node
 }

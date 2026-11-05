@@ -20,7 +20,7 @@ import {
   Notice,
   Skeleton,
 } from '@/ui/kit'
-import { Sheet } from '@/ui/overlay'
+import { Sheet, SheetSteps } from '@/ui/overlay'
 import { AlphaActionsMenu, AstInspector, checkFigure, OpenInBrain, RecheckButton } from './shared'
 
 type Kind = 'self' | 'prod'
@@ -29,12 +29,45 @@ const KIND_LABEL: Record<Kind, string> = {
   prod: 'Production Correlation',
 }
 
-export function DetailSheet({ alphaId, onClose }: { alphaId: string | null; onClose: () => void }) {
+/** The Alphas among table rows, in order, for {@link useDetailSheet}. */
+export const alphaIds = (rows: { alphaId?: string | null | undefined }[]): string[] =>
+  rows.flatMap((r) => (r.alphaId ? [r.alphaId] : []))
+
+/** The detail sheet and how to open it: `ids` are the rows it was opened from, in the order
+ *  shown, so the sheet can step through them without being closed. */
+export function useDetailSheet() {
+  const [at, setAt] = useState<{ id: string; ids: string[] } | null>(null)
+  return {
+    openId: at?.id ?? null,
+    open: (id: string, ids: string[] = []) => setAt({ id, ids }),
+    sheet: (
+      <DetailSheet
+        alphaId={at?.id ?? null}
+        ids={at?.ids ?? []}
+        onStep={(id) => setAt((now) => now && { ...now, id })}
+        onClose={() => setAt(null)}
+      />
+    ),
+  }
+}
+
+export function DetailSheet({
+  alphaId,
+  onClose,
+  ids = [],
+  onStep,
+}: {
+  alphaId: string | null
+  onClose: () => void
+  ids?: string[]
+  onStep?: (alphaId: string) => void
+}) {
   return (
     <Sheet
       open={alphaId !== null}
       onOpenChange={(o) => !o && onClose()}
       title={<span className="num">{alphaId ?? 'Alpha'}</span>}
+      actions={onStep && <SheetSteps ids={ids} id={alphaId} onStep={onStep} noun="Alpha" />}
     >
       {alphaId && <Body key={alphaId} alphaId={alphaId} />}
     </Sheet>

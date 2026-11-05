@@ -4,7 +4,6 @@
 # References for Development
 CLAUDE.md
 /docs/
-/research-notes/
 
 .venv/
 node_modules/
@@ -16,3 +15,8 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 *.tsbuildinfo
+
+# Desktop app (Tauri): build output, generated schemas, and the uv each build bundles.
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/src-tauri/binaries/

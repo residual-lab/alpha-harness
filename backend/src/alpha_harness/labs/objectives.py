@@ -1,23 +1,10 @@
-"""What a study is trying to maximise, and what it must not violate.
+"""What a study is trying to maximise: Sharpe, fitness, train fitness, read from a finished
+alpha's statistics."""
 
-Two different things come out of a finished alpha:
-
-**Objectives** are the numbers being optimised — Sharpe, fitness, train fitness.
-They come from the in-sample statistics block.
-
-**Constraints** are the submission checks, read from the response rather than written down
-here because the limits differ by region and delay.
-
-The encoding follows Optuna's convention — at or below zero is feasible, and the magnitude
-says by how much — so a sampler that understands constraints prefers a nearly-passing alpha
-over a badly-failing one.
-"""
-
-import math
 from dataclasses import dataclass
 from typing import Any
 
-from ..brain.schemas import QUICK_MODE, Alpha, Check, CheckResult, SampleStats
+from ..brain.schemas import QUICK_MODE, Alpha, SampleStats
 from ..vault.yields import without_quota_checks
 
 #: A missing number scores this: deliberately terrible, so a broken trial is never mistaken
@@ -104,73 +91,26 @@ def train_extra(alpha: Alpha, objectives: list[Objective]) -> dict[str, float | 
     }
 
 
-# --- constraints ----------------------------------------------------------
-
-
-def constraints(alpha: Alpha) -> tuple[dict[str, float], list[dict[str, Any]]]:
-    """Violation magnitudes from the alpha's own submission checks.
-
-    Keyed by the platform's check name — ``LOW_SHARPE``, ``HIGH_TURNOVER`` — so BRAIN
-    adding a check later cannot shift the meaning of an existing position the way a bare
-    vector would. Each value is ``0.0`` when the check passed, and otherwise how far the
-    value sits the wrong side of its limit.
-    """
-    checks = alpha.in_sample.checks if alpha.in_sample else []
-    violations: dict[str, float] = {}
-    detail: list[dict[str, Any]] = []
-
-    for index, check in enumerate(checks):
-        violation = _violation(check)
-        # Duplicate names are not expected, but silently overwriting one would hide a
-        # failing check from the sampler.
-        key = check.name if check.name not in violations else f"{check.name}#{index}"
-        violations[key] = violation
-        detail.append(
-            {
-                "name": check.name,
-                "key": key,
-                "result": str(check.result) if check.result else None,
-                "value": check.value,
-                "limit": check.limit,
-                "violation": violation,
-            }
-        )
-
-    return violations, detail
-
-
-def _violation(check: Check) -> float:
-    if check.result in (CheckResult.PASS, CheckResult.WARNING, CheckResult.PENDING, None):
-        return 0.0
-    numbers = check.numbers
-    if numbers is None or not all(math.isfinite(n) for n in numbers):
-        # Failed, but gave us no usable numbers — a check whose limit is a neutralization
-        # name, or none at all. Feasibility is binary here; a NaN would be refused by Optuna
-        # and leave the trial RUNNING in the sampler for good.
-        return 1.0
-    value, limit = numbers
-    # The distance alone: the platform does not label a check as a floor or a ceiling, and a
-    # table of check names would go stale as BRAIN adds them.
-    return abs(limit - value)
-
-
-def feasible(violations: dict[str, float]) -> bool:
-    """Optuna's convention: at or below zero on every constraint."""
-    return all(v <= 0.0 for v in violations.values())
-
-
 def summarise(alpha: Alpha) -> dict[str, Any]:
     """The per-trial result row the UI shows, with nothing dropped."""
     stats = alpha.in_sample
-    violations, detail = constraints(alpha)
-    detail = without_quota_checks(detail)
+    # Shaped as the vault stores them, so a trial reads the same whichever way it was scored.
+    checks = without_quota_checks(
+        [
+            {
+                "name": c.name,
+                "result": str(c.result) if c.result else None,
+                "value": c.value,
+                "limit": c.limit,
+            }
+            for c in (stats.checks if stats else [])
+        ]
+    )
     return {
         "alphaId": alpha.id,
         "grade": alpha.grade,
         "stats": stats.model_dump(by_alias=True, exclude={"checks"}) if stats else None,
-        "checks": detail,
-        "constraint": violations,
-        "feasible": feasible(violations),
-        "failedChecks": [d["name"] for d in detail if d["violation"] > 0],
+        "checks": checks,
+        "failedChecks": [c["name"] for c in checks if c["result"] == "FAIL"],
         "quick": alpha.settings is not None and alpha.settings.simulation_mode == QUICK_MODE,
     }

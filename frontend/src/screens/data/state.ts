@@ -6,7 +6,7 @@ import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { DASH, fmt, isNum } from '@/lib/format'
 import { regionLabel } from '@/lib/scope'
-import { useDatasetPick } from '@/screens/data/dataset-pick'
+import { type PickFrom, useDatasetPick, useFieldPick } from '@/screens/data/dataset-pick'
 import { STATUS } from '@/ui/kit'
 import type { Sort } from '@/ui/table'
 
@@ -81,6 +81,45 @@ export const useFieldFilter = create<FieldFilterStore>()((set) => ({
   page: (offset) => set({ offset }),
 }))
 
+/** The reader's own filter while a lab picks under its own, given back when the pick ends. */
+let browsing: Pick<FieldFilterStore, 'filter' | 'sort' | 'chosen'> | null = null
+
+/** Opens a dataset pick for a lab, the Explorer showing the fields `filter` leaves. */
+export function startDatasetPick(
+  scope: Scope,
+  ids: string[],
+  from: PickFrom,
+  filter: FieldFilterState | null,
+) {
+  const { filter: own, sort, chosen } = useFieldFilter.getState()
+  browsing ??= { filter: own, sort, chosen }
+  // The lab's own fields come back as ticks, not as a filter that would hide the rest.
+  const { field_ids: fields = [], ...rest } = filter ?? {}
+  useFieldPick.setState({ fields: Object.fromEntries(fields.map((id) => [id, ''])) })
+  useFieldFilter.getState().replace(rest)
+  useDatasetPick.getState().start(scope, ids, from)
+}
+
+/** Done hands the lab its datasets and the filter they were chosen under; either way the
+ *  reader's own filter comes back. */
+export function endDatasetPick(done: boolean) {
+  const pick = useDatasetPick.getState()
+  const { fields } = useFieldPick.getState()
+  if (done) {
+    const ticked = Object.keys(fields)
+    useDatasetPick.setState({
+      ids: [...new Set([...pick.ids, ...Object.values(fields).filter(Boolean)])],
+    })
+    pick.finish(labFilter({ ...useFieldFilter.getState().filter, field_ids: ticked }))
+  } else pick.cancel()
+  useFieldPick.setState({ fields: {} })
+  useFieldFilter.setState({
+    ...(browsing ?? { filter: {}, sort: DEFAULT_SORT, chosen: false }),
+    offset: 0,
+  })
+  browsing = null
+}
+
 const NONE: string[] = []
 
 /**
@@ -141,6 +180,8 @@ export function describeFilter(filter: FieldFilterState, region: string): string
     filter.category_ids?.length &&
       `${fmt.int(filter.category_ids.length)} ${filter.category_ids.length === 1 ? 'Category' : 'Categories'}`,
     filter.field_types?.length && filter.field_types.join(', '),
+    filter.field_ids?.length &&
+      `${fmt.int(filter.field_ids.length)} ${filter.field_ids.length === 1 ? 'Field' : 'Fields'}`,
     range('Instrument Coverage', filter.coverage_min, filter.coverage_max, pct),
     range('Date Coverage', filter.date_coverage_min, filter.date_coverage_max, pct),
     range('Alphas', filter.alpha_count_min, filter.alpha_count_max, fmt.int),
@@ -166,6 +207,9 @@ export const multiplier = (v: number | null | undefined) =>
   isNum(v) ? `×${fmt.ratio(v, 1)}` : DASH
 
 /** Client-side sort for tables the backend returns whole. Absent values last. */
+/** Numbers inside text in their own order: TOP200 before TOP1000, model2 before model10. */
+const NATURAL = new Intl.Collator('en-US', { numeric: true })
+
 export function sortRows<T>(rows: T[], sort: Sort): T[] {
   const key = sort.key as keyof T
   return [...rows].sort((a, b) => {
@@ -173,7 +217,14 @@ export function sortRows<T>(rows: T[], sort: Sort): T[] {
     const y = b[key]
     if (x == null) return y == null ? 0 : 1
     if (y == null) return -1
-    const c = x < y ? -1 : x > y ? 1 : 0
+    const c =
+      typeof x === 'string' && typeof y === 'string'
+        ? NATURAL.compare(x, y)
+        : x < y
+          ? -1
+          : x > y
+            ? 1
+            : 0
     return sort.desc ? -c : c
   })
 }

@@ -14,13 +14,13 @@ import structlog
 
 from .altcha import Challenge
 from .errors import BrainError, BrainServiceUnavailable, BrainVerificationRequired
+from .platform import ALL_FIELDS_CEILING, ALL_FIELDS_PAGE
 from .schemas import (
     BULK_FIELDS,
     BULK_FIELDS_ENVELOPE,
     Alpha,
     AuthState,
     BulkField,
-    DataCategory,
     DataSet,
     Operator,
     RecordSet,
@@ -127,8 +127,14 @@ class BrainEndpoints:
         return AuthState.model_validate(r.body)
 
     async def logout(self) -> None:
-        await self.client.request("DELETE", "/authentication", raise_for_status=False)
-        self.client.clear_cookies()
+        """End the session on BRAIN when it can be reached, and here whether or not."""
+        try:
+            await self.client.request("DELETE", "/authentication", raise_for_status=False)
+        except BrainError as exc:
+            # Offline: BRAIN lets the session lapse on its own; signing out must not wait for it.
+            log.info("brain.logout_unsent", error=str(exc))
+        finally:
+            self.client.clear_cookies()
 
     async def get_user(self, user_id: str) -> dict[str, Any]:
         """Fetch user profile details from /users/{user_id}."""
@@ -302,12 +308,6 @@ class BrainEndpoints:
 
     # -- data catalog ----------------------------------------------------
 
-    async def list_data_categories(self) -> list[DataCategory]:
-        """``GET /data-categories``: the whole taxonomy. It takes no parameters."""
-        r = await self.client.request_retrying("GET", "/data-categories")
-        raw = r.body if isinstance(r.body, list) else (r.body or {}).get("results", [])
-        return [DataCategory.model_validate(c) for c in raw]
-
     #: A market's fields are ~40 MB, and eight scopes download at once. Measured on a first
     #: sync: every USA delay-1 scope (76,519 fields) blew the client's ordinary 30 s read and
     #: only landed on its fourth attempt — ``fetch_s=114`` for a transfer that succeeds in
@@ -338,12 +338,6 @@ class BrainEndpoints:
             return BULK_FIELDS_ENVELOPE.decode(r.body).results
         return BULK_FIELDS.decode(r.body)
 
-    #: The page size region ``ALL`` allows. Measured: 51 is refused outright.
-    PAGED_FIELDS_SIZE = 50
-    #: Rows the flat listing will hand out for region ``ALL``, of 27,882 that exist —
-    #: ``offset + limit`` past this is a 400, which is why the paging goes dataset by dataset.
-    PAGED_FIELDS_CEILING = 10_000
-
     async def list_data_fields_paged(self, dataset_id: str, **params: Any) -> list[BulkField]:
         """Every field of one dataset in one scope, fifty at a time.
 
@@ -353,7 +347,7 @@ class BrainEndpoints:
         """
         out: list[BulkField] = []
         offset = 0
-        while offset < self.PAGED_FIELDS_CEILING:
+        while offset < ALL_FIELDS_CEILING:
             r = await self.client.request_retrying(
                 "GET",
                 "/data-fields",
@@ -361,7 +355,7 @@ class BrainEndpoints:
                 params={
                     **params,
                     "dataset.id": dataset_id,
-                    "limit": self.PAGED_FIELDS_SIZE,
+                    "limit": ALL_FIELDS_PAGE,
                     "offset": offset,
                 },
                 raw=True,
@@ -370,13 +364,13 @@ class BrainEndpoints:
                 break
             page = BULK_FIELDS_ENVELOPE.decode(r.body).results
             out.extend(page)
-            if len(page) < self.PAGED_FIELDS_SIZE:
+            if len(page) < ALL_FIELDS_PAGE:
                 return out
-            offset += self.PAGED_FIELDS_SIZE
+            offset += ALL_FIELDS_PAGE
         # Still handing out full pages at the ceiling: there is more than can be read this
         # way. Said rather than swallowed — a quietly short catalog is worse than a failed sync.
         raise BrainError(
-            f"{dataset_id} has more than {self.PAGED_FIELDS_CEILING:,} fields, which is as far "
+            f"{dataset_id} has more than {ALL_FIELDS_CEILING:,} fields, which is as far "
             "as BRAIN will page this market."
         )
 

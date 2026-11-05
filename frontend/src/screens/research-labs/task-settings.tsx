@@ -1,12 +1,15 @@
 /** The Datasets and Settings panels of a lab task, and the task settings every lab asks for. */
 
 import { DatabaseIcon, FilterIcon } from 'lucide-react'
+import { useState } from 'react'
+import { SIMULATION_SLOTS } from '@/api/platform'
 import type { Scope } from '@/api/types'
 import { DASH, fmt } from '@/lib/format'
 import { useCores } from '@/lib/preferences'
 import { isRegionAgnostic, regionLabel, useScopeOptions } from '@/lib/scope'
 import { DatasetChips, useDatasetTree } from '@/screens/data/dataset-chips'
-import { describeFilter, type FieldFilterState } from '@/screens/data/state'
+import { DatasetPicker } from '@/screens/data/dataset-picker'
+import { describeFilter, type FieldFilterState, labFilter } from '@/screens/data/state'
 import { NeutralizationPicker } from '@/screens/research-labs/neutralization'
 import {
   Button,
@@ -14,6 +17,7 @@ import {
   Disclosure,
   Empty,
   ErrorNotice,
+  Field,
   Fieldset,
   Input,
   Metric,
@@ -21,12 +25,14 @@ import {
   Panel,
   Segmented,
 } from '@/ui/kit'
+import { Sheet } from '@/ui/overlay'
+import { ScopePicker } from '@/ui/scope-picker'
 import type { LabDraft } from './lab-task'
 
 const DECAYS = [0, 3, 5, 7, 10]
 
-/** Matches `labs.search.MAX_CORES`: a task may hold every slot the engine has. */
-const CORES = [1, 2, 3, 4, 5, 6, 7, 8].map((v) => ({ value: v, label: v }))
+/** A task may hold every slot BRAIN allows. */
+const CORES = Array.from({ length: SIMULATION_SLOTS }, (_, i) => ({ value: i + 1, label: i + 1 }))
 
 export function CoresSetting({
   value,
@@ -54,15 +60,20 @@ export function SimulationsSetting({
   placeholder?: string
   onChange: (simulations: number | null) => void
 }) {
+  // Said here, beside the box, so every lab's Run greys out with its reason in view.
+  const over = value !== null && value > max
   return (
-    <Fieldset legend="Simulations">
+    <Field
+      label="Simulations"
+      error={over ? `A task takes at most ${fmt.int(max)} simulations.` : undefined}
+    >
       <Input
         type="number"
         min={1}
         max={max}
         step={1}
         placeholder={placeholder}
-        aria-label="Simulations"
+        aria-invalid={over || undefined}
         className="w-32"
         value={value ?? ''}
         onChange={(e) => {
@@ -70,7 +81,7 @@ export function SimulationsSetting({
           onChange(e.target.value === '' || !Number.isFinite(n) ? null : Math.max(0, Math.floor(n)))
         }}
       />
-    </Fieldset>
+    </Field>
   )
 }
 
@@ -84,10 +95,29 @@ export interface LabPlan {
   warnings: string[]
 }
 
+/** The market a lab's task runs in. Another region or delay starts its datasets afresh. */
+export function MarketPanel({
+  scope,
+  onChange,
+}: {
+  scope: Scope
+  onChange: (change: Partial<Scope>) => void
+}) {
+  return (
+    <Panel
+      title="Market"
+      description="Where every Alpha in the task runs. Datasets are chosen within it."
+    >
+      <ScopePicker scope={scope} onChange={onChange} />
+    </Panel>
+  )
+}
+
 export function DatasetsPanel({
   ids,
   scope,
-  onChoose,
+  onApply,
+  onExplore,
   onRemove,
   filter,
   onClearFilter,
@@ -95,7 +125,10 @@ export function DatasetsPanel({
   ids: string[]
   /** The market the datasets belong to, which places each under its category. */
   scope: Scope
-  onChoose: () => void
+  /** Chosen in the sheet, without leaving the lab. */
+  onApply: (ids: string[], filter: FieldFilterState | null) => void
+  /** On to the Data Explorer with what the sheet holds, for the filters it has no room for. */
+  onExplore: (ids: string[], filter: FieldFilterState | null) => void
   onRemove: (ids: string[]) => void
   /** The Data Explorer's filter the datasets were chosen under, which narrows their fields. */
   filter: FieldFilterState | null | undefined
@@ -103,6 +136,8 @@ export function DatasetsPanel({
 }) {
   const chosen = ids.length > 0
   const { tree, nameOf, ready } = useDatasetTree(chosen ? scope : null)
+  const [picking, setPicking] = useState(false)
+  const onChoose = () => setPicking(true)
   return (
     <Panel
       title="Datasets"
@@ -115,6 +150,19 @@ export function DatasetsPanel({
         )
       }
     >
+      {picking && (
+        <DatasetsSheet
+          scope={scope}
+          ids={ids}
+          filter={filter ?? null}
+          onClose={() => setPicking(false)}
+          onApply={(next, narrowed) => {
+            setPicking(false)
+            onApply(next, narrowed)
+          }}
+          onExplore={onExplore}
+        />
+      )}
       {chosen ? (
         <div className="flex flex-col gap-3">
           <DatasetChips tree={tree} value={ids} nameOf={nameOf} onRemove={onRemove} ready={ready} />
@@ -142,6 +190,58 @@ export function DatasetsPanel({
   )
 }
 
+function DatasetsSheet({
+  scope,
+  ids,
+  filter,
+  onClose,
+  onApply,
+  onExplore,
+}: {
+  scope: Scope
+  ids: string[]
+  filter: FieldFilterState | null
+  onClose: () => void
+  onApply: (ids: string[], filter: FieldFilterState | null) => void
+  onExplore: (ids: string[], filter: FieldFilterState | null) => void
+}) {
+  const [datasetIds, setDatasetIds] = useState(ids)
+  const [narrowed, setNarrowed] = useState<FieldFilterState>(filter ?? {})
+  // `null` when nothing narrows, as the Data Explorer hands a filter back.
+  const kept = () => labFilter(narrowed)
+  return (
+    <Sheet
+      open
+      onOpenChange={(open) => !open && onClose()}
+      title="Datasets"
+      description="The lab writes its Alphas from the fields these leave."
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            disabled={datasetIds.length === 0}
+            onClick={() => onApply(datasetIds, kept())}
+          >
+            Apply
+          </Button>
+        </>
+      }
+    >
+      <DatasetPicker
+        scope={scope}
+        datasetIds={datasetIds}
+        setDatasetIds={setDatasetIds}
+        filter={narrowed}
+        setFilter={setNarrowed}
+        onMoreFilters={() => onExplore(datasetIds, kept())}
+      />
+    </Sheet>
+  )
+}
+
 export function SettingsPanel({
   draft,
   set,
@@ -149,10 +249,13 @@ export function SettingsPanel({
   chosenVector,
   decays = DECAYS,
   maxSimulations,
+  suggested,
   plan,
   error,
 }: {
   draft: LabDraft
+  /** What the task runs while the Simulations box is empty. */
+  suggested?: number | null
   set: (change: Partial<LabDraft>) => void
   vector: string[]
   chosenVector: string[]
@@ -181,6 +284,7 @@ export function SettingsPanel({
           <SimulationsSetting
             value={simulations}
             max={maxSimulations}
+            {...(suggested ? { placeholder: String(suggested) } : {})}
             onChange={(next) => set({ simulations: next })}
           />
           <Fieldset legend="Decay">
@@ -220,12 +324,6 @@ export function SettingsPanel({
             allowance. The alphas it makes can be submitted where two or more of those regions hold
             up.
           </Notice>
-        )}
-        {simulations !== null && simulations > maxSimulations && (
-          <Notice
-            tone="error"
-            title={`A task takes at most ${fmt.int(maxSimulations)} simulations.`}
-          />
         )}
         {error ? <ErrorNotice error={error} title="Could not plan the task" /> : null}
         {plan?.problems.map((m) => (

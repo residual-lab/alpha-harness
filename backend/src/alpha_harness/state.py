@@ -17,11 +17,12 @@ from . import preferences, updates
 from .account import AuthService, PlatformMetadata
 from .brain.client import BrainClient
 from .brain.endpoints import BrainEndpoints
-from .brain.errors import BrainTransportError
+from .brain.errors import BrainError, BrainTransportError
+from .brain.platform import API_BASE
 from .catalog import search
 from .catalog.queries import CatalogQueries
 from .catalog.sync import CatalogSync, serialise_run
-from .config import BRAIN_API_BASE, Settings
+from .config import Settings
 from .db.duck import Catalog
 from .db.models import SimStatus, SimulationRecord, utcnow
 from .db.sqlite import Database, snapshot
@@ -71,7 +72,7 @@ class AppState:
         self.db = Database(self.settings.sqlite_path)
         self.catalog = Catalog(self.settings.duckdb_path)
 
-        self.client = BrainClient(BRAIN_API_BASE)
+        self.client = BrainClient(API_BASE)
         self.endpoints = BrainEndpoints(self.client)
         self.metadata = PlatformMetadata(self.db, self.endpoints)
         self.auth = AuthService(self.db, self.sealer, self.endpoints, metadata=self.metadata)
@@ -119,6 +120,8 @@ class AppState:
         self._renew_lock = asyncio.Lock()
         self._last_session_check = float("-inf")
         self._last_login_attempt = float("-inf")
+        #: Set when startup could not read the saved session: BRAIN or the network was down.
+        self._restore_pending = False
 
     # -- lifecycle -------------------------------------------------------
 
@@ -148,6 +151,7 @@ class AppState:
                 self.engine.configure_from_permissions(session.permissions)
         except Exception:
             log.warning("startup.session_restore_failed", exc_info=True)
+            self._restore_pending = True
 
         # Not caught: dispatching new work on top of an unreconciled queue is how orphans
         # and double sends start, so a failure here stops startup and says why.
@@ -207,14 +211,26 @@ class AppState:
             self.tracker.alpha_landed(alpha_id)
 
     async def _watch_session(self) -> None:
-        """Renew the BRAIN session shortly before it expires, so running work keeps going."""
+        """Renew the BRAIN session shortly before it expires, so running work keeps going, and
+        read the saved one again while startup could not."""
         while True:
             await asyncio.sleep(60)
             try:
                 session = self.auth.session
                 left = session.expires_in_seconds
-                if session.authenticated and left is not None and left <= 600:
-                    await self.renew_session(expiring=True)
+                if session.authenticated:
+                    self._restore_pending = False
+                    if left is not None and left <= 600:
+                        await self.renew_session(expiring=True)
+                elif self._restore_pending and not session.inquiry:
+                    restored = await self.auth.restore()
+                    self._restore_pending = False
+                    if restored.authenticated:
+                        self.engine.configure_from_permissions(restored.permissions)
+                        await self.hub.broadcast(TOPIC_SESSION, restored.to_dict())
+            except BrainError as exc:
+                # BRAIN or the network still down: the next minute tries again.
+                log.info("session.watch_unreachable", error=str(exc))
             # One failed check must not end renewal for the rest of the process.
             except Exception:
                 log.exception("session.watch_failed")
@@ -222,9 +238,10 @@ class AppState:
     async def renew_session(self, *, expiring: bool = False) -> bool:
         """Whether BRAIN will take requests now, signing in again if it will not.
 
-        Called on every 401, so it is guarded three ways: one renewal at a time, the
-        platform asked at most once a minute, and one silent sign-in per hour — each
-        failed sign-in spends BRAIN's lockout budget.
+        Called on every 401, so it is guarded four ways: one renewal at a time, the
+        platform asked at most once a minute, one silent sign-in per hour, and none at all
+        once BRAIN refused the stored login or the person signed out — each failed sign-in
+        spends BRAIN's lockout budget.
         """
         async with self._renew_lock:
             now = time.monotonic()
@@ -245,21 +262,22 @@ class AppState:
                 # yet another, and each spends BRAIN's lockout budget: hourly, that locked an
                 # account out without anyone signing in.
                 return False
-            if await self.auth.get_credential() is None:
+            if not await self.auth.can_sign_in_silently():
                 return False
-            # Set only for a sign-in BRAIN actually answered: the hour exists to protect the
+            # Set only for a sign-in BRAIN may have answered: the hour exists to protect the
             # lockout budget, and a request that never arrived spent none of it.
             previous, self._last_login_attempt = self._last_login_attempt, now
             try:
-                info = await self.auth.login()
+                info = await self.auth.login(silent=True)
                 if info.authenticated:
                     # A sign-in that worked spent none of the lockout budget.
                     self._last_login_attempt = float("-inf")
                     self.engine.configure_from_permissions(info.permissions)
                 await self.hub.broadcast(TOPIC_SESSION, info.to_dict())
                 return info.authenticated
-            except BrainTransportError:
-                self._last_login_attempt = previous
+            except BrainTransportError as exc:
+                if not exc.maybe_delivered:
+                    self._last_login_attempt = previous
                 log.warning("session.renew_unreachable", exc_info=True)
                 return False
             except Exception:

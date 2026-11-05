@@ -19,7 +19,7 @@ from openai import DefaultAsyncHttpxClient
 
 from ..schemas import camel_dict
 from .budget import Ledger
-from .keys import BudgetExhaustedError, KeyStore, LLMError
+from .keys import BudgetExhaustedError, KeyStore, LLMError, LLMUnavailable
 from .openai_compat import OpenAICompatible, ProviderError
 from .providers import PROVIDERS
 from .text import estimate_tokens
@@ -60,6 +60,8 @@ def _status(exc: Exception) -> int | None:
 def _is_rate_limit(exc: Exception) -> tuple[bool, bool]:
     """``(rate limited, daily)``. Only the provider's details say which limit was hit."""
     text = str(exc).lower()
+    if _out_of_credit(text):
+        return False, False
     limited = _status(exc) == 429 or "resource_exhausted" in text or "quota" in text
     daily = "per day" in text or "perday" in text or "daily" in text or "requests per day" in text
     return limited, daily
@@ -79,8 +81,8 @@ def _plain_reason(exc: Exception) -> str | None:
         )
     if status == 403 or "permission_denied" in text:
         return (
-            "Google refused that key. It may not have access to this model, or the "
-            "project it belongs to may have been closed."
+            "The provider refused that key. It may not have access to this model, or the "
+            "account or project it belongs to may have been closed."
         )
     if status == 404 or ("not found" in text and "model" in text):
         return "That model is not available to this key. Pick a different one."
@@ -99,7 +101,13 @@ def _rejects_temperature(exc: Exception) -> bool:
 
 def _refused(exc: Exception) -> bool:
     """Whether the key was turned away rather than the request: another key may get in."""
-    return _status(exc) in (401, 403) or "api_key_invalid" in str(exc).lower()
+    text = str(exc).lower()
+    return _status(exc) in (401, 403) or "api_key_invalid" in text or _out_of_credit(text)
+
+
+def _out_of_credit(text: str) -> bool:
+    """An account with no credit left: a ``429`` naming a quota, but no wait ends it."""
+    return "insufficient_quota" in text
 
 
 #: How long a connection to a provider stays open between calls: a fresh one costs about
@@ -155,7 +163,27 @@ class LLMService:
             raise LLMError(f"{provider!r} is not a provider this application knows.")
         return OpenAICompatible(spec.base_url, secret, self._http)
 
-    def _model(self, ref: str | None) -> ModelInfo:
+    async def runnable(self) -> list[dict[str, Any]]:
+        """Set-up models whose provider has an enabled Key, most requests left today first.
+
+        A model set up without such a Key is listed under LLM Integration but cannot answer,
+        so nothing that sends a request offers it.
+        """
+        status = await self.keys.status(self.registry)
+        enabled = {k["provider"] for k in status["keys"] if k["enabled"]}
+        found = [
+            {
+                "id": b["model"],
+                "ref": b["ref"],
+                "provider": b["provider"],
+                "remainingToday": b["remainingToday"],
+            }
+            for b in status["budget"]
+            if b["provider"] in enabled
+        ]
+        return sorted(found, key=lambda m: -m["remainingToday"])
+
+    def model_for(self, ref: str | None) -> ModelInfo:
         """The model asked for, or with none named, the set-up one with most to spend."""
         if not ref:
             models = self.registry.all()
@@ -185,7 +213,7 @@ class LLMService:
         ``thinking`` is one of Google's thinking levels. Not a free upgrade: thinking tokens
         are billed against the same per-minute budget as the answer.
         """
-        model = self._model(model_ref)
+        model = self.model_for(model_ref)
         estimate = estimate_tokens(system) + estimate_tokens(user)
         tried: set[int] = set()
         refusal: LLMError | None = None
@@ -209,7 +237,6 @@ class LLMService:
 
             # Settled however this ends: answered and recorded, failed, or retried.
             try:
-                row = await self.keys.get(key_id)
                 secret = await self.keys.secret(key_id)
                 client = self._client(model.provider, secret)
 
@@ -227,7 +254,9 @@ class LLMService:
                     )
                 except TimeoutError as exc:
                     await self.keys.mark(key_id, error="Timed out")
-                    raise LLMError(
+                    # The provider had the request and may well bill it, so it counts.
+                    await self.ledger.record(key_id, model, estimate)
+                    raise LLMUnavailable(
                         f"{model.id} did not answer within {TIMEOUT_SECONDS:.0f} seconds. "
                         "Try a smaller question or a lighter model."
                     ) from exc
@@ -244,14 +273,12 @@ class LLMService:
                     if limited:
                         # Google is the authority: mark this pair spent and rotate rather than
                         # retrying into a limit we evidently mis-tracked.
-                        await self.ledger.penalise(
-                            key_id, model, daily=daily, cap=row.daily_limit if row else None
-                        )
+                        await self.ledger.penalise(key_id, model, daily=daily)
                         log.warning("llm.rate_limited", key_id=key_id, model=model.id, daily=daily)
                         continue
-                    error = LLMError(
-                        _plain_reason(exc) or f"{model.id} could not be reached: {exc}"
-                    )
+                    # 5xx is the provider's own trouble ("overloaded"): another model may answer.
+                    kind = LLMUnavailable if (_status(exc) or 0) >= 500 else LLMError
+                    error = kind(_plain_reason(exc) or f"{model.id} could not be reached: {exc}")
                     if _refused(exc):
                         log.warning("llm.key_refused", key_id=key_id, model=model.id)
                         refusal = error

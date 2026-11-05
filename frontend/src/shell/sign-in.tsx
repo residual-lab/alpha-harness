@@ -74,12 +74,7 @@ export function SignIn({ storedEmail }: { storedEmail: string | null }) {
     <div className="flex min-h-svh flex-col items-center justify-center p-6">
       <div className="flex w-full max-w-120 flex-col gap-8">
         <div className="flex items-center gap-3 self-center">
-          <span
-            className="flex size-9 items-center justify-center rounded-md border border-hairline-strong bg-surface-2"
-            aria-hidden
-          >
-            <span className="text-title font-bold text-primary">α</span>
-          </span>
+          <img src="/mark.svg" alt="" className="size-10" />
           <span className="text-headline font-semibold text-ink">Alpha Harness</span>
         </div>
 

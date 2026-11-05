@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field, ValidationError
 
 from ..brain.errors import BrainError
+from ..brain.platform import INSTRUMENT_TYPE
 from ..brain.schemas import region_label
 from ..brain.settings_schema import resolve_options
 from ..catalog.queries import FieldFilter
@@ -22,6 +23,7 @@ from ..schemas import Out
 from . import scheduler, search
 from .params import (
     CORRELATION_BREAKER,
+    FIELDS_SAMPLER,
     GA_SAMPLER,
     POWER_POOL_SAMPLER,
     SEARCH_SAMPLER,
@@ -53,6 +55,7 @@ _TASKS: dict[str, tuple[str, str]] = {
     POWER_POOL_SAMPLER: ("power-pool", "sharpe"),
     SETTINGS_SAMPLER: ("settings-sampler", "sharpe"),
     CORRELATION_BREAKER: ("correlation-breaker", "sharpe"),
+    FIELDS_SAMPLER: ("fields-sampler", "sharpe"),
     SUPER_LAB: ("super-alpha", "sharpe"),
 }
 
@@ -110,7 +113,7 @@ async def account_operators(state: Any, *, refresh: bool) -> list[dict[str, Any]
 
 def legal_choices(schema: dict[str, Any] | None, region: str, delay: int) -> dict[str, Any]:
     """BRAIN's legal settings for an equity market; empty until the schema is loaded."""
-    market = {"instrumentType": "EQUITY", "region": region, "delay": delay}
+    market = {"instrumentType": INSTRUMENT_TYPE, "region": region, "delay": delay}
     return resolve_options(schema, market) if schema else {}
 
 
@@ -126,7 +129,8 @@ async def neutralizations_for(
     Chosen ones are honoured as given, narrowed only by what BRAIN accepts in that market. The
     lab's own default list is four group neutralizations, and quietly intersecting a choice
     with it would drop ``STATISTICAL`` or ``CROWDING`` from a sweep that asked for them —
-    a task that never ran what it was told to.
+    a task that never ran what it was told to. For the same reason none of them accepted
+    comes back empty, for the caller to refuse, never as the default.
 
     Nothing chosen falls back to that default, which only Auto Select relies on: every lab
     refuses a task with no neutralization chosen (:data:`NO_NEUTRALIZATION`).
@@ -135,8 +139,8 @@ async def neutralizations_for(
     if not schema:
         return []
     offered = choices(legal_choices(schema, region, delay), "neutralization")
-    if chosen and (picked := [n for n in offered if n in set(chosen)]):
-        return picked
+    if chosen:
+        return [n for n in offered if n in set(chosen)]
     return [n for n in search.NEUTRALIZATIONS if n in offered] or offered[:1]
 
 
@@ -147,7 +151,9 @@ async def synced_universes(
     synced = {
         str(r["universe"])
         for r in await state.queries.synced_tuples()
-        if r["instrument_type"] == "EQUITY" and r["region"] == region and int(r["delay"]) == delay
+        if r["instrument_type"] == INSTRUMENT_TYPE
+        and r["region"] == region
+        and int(r["delay"]) == delay
     }
     universes = [u for u in choices(legal, "universe") if u in synced]
     if first in universes:
@@ -203,17 +209,15 @@ async def market_for(body: SearchRequest, state: Any, need: tuple[str, ...] = ()
     if not body.neutralizations:
         problems.append(NO_NEUTRALIZATION)
     elif schema and not neutralizations:
-        problems.append(f"BRAIN offers no neutralization for {region_label(body.region)}.")
+        problems.append(
+            f"BRAIN offers none of the chosen neutralizations in {region_label(body.region)}."
+        )
 
     lacking: set[str] = set()
     if need and universes:
-        held: dict[str, set[str]] = {}
-        for name in need:
-            held[name] = {
-                str(r["universe"])
-                for r in await state.queries.field_availability(name)
-                if r["region"] == body.region and int(r["delay"]) == body.delay
-            }
+        held: dict[str, set[str]] = {name: set() for name in need}
+        for r in await state.queries.universes_holding(body.region, body.delay, list(need)):
+            held[str(r["field_id"])].add(str(r["universe"]))
         for universe in list(universes):
             short = [name for name in need if universe not in held[name]]
             if short:

@@ -69,14 +69,14 @@ export function kvMarkdown({
   for (const section of extra) lines.push(...section, '')
 
   let count = 0
+  const ownTraits = traits.labels.filter((l) => !traits.shared.includes(l))
   const alpha = (r: CopyAlpha, level: number) => {
     count += 1
     // Headed by what sets it apart from its section; numbered when nothing does.
     const heading = inline.map((l) => `${l}: ${settings.value(r, l)}`).join(' · ')
     lines.push(`${'#'.repeat(level)} ${heading || `${unit} ${count}`}`)
     if (!oneExpression) lines.push(`- Expression: \`${(r.expression ?? '').replace(/\s+/g, ' ')}\``)
-    for (const label of traits.labels.filter((l) => !traits.shared.includes(l)))
-      lines.push(`- ${label}: ${traits.value(r, label)}`)
+    for (const label of ownTraits) lines.push(`- ${label}: ${traits.value(r, label)}`)
     for (const [label, value] of r.metrics) lines.push(`- ${label}: ${value}`)
     lines.push('')
   }
@@ -90,7 +90,9 @@ export function kvMarkdown({
     const groups = new Map<string, CopyAlpha[]>()
     for (const r of group) {
       const value = settings.value(r, branch)
-      groups.set(value, [...(groups.get(value) ?? []), r])
+      const members = groups.get(value)
+      if (members) members.push(r)
+      else groups.set(value, [r])
     }
     for (const [value, members] of groups) {
       lines.push(`${'#'.repeat(depth + 2)} ${branch}: ${value}`, '')

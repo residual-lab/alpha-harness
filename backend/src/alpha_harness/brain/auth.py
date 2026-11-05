@@ -44,19 +44,17 @@ class SessionInfo:
     full_name: str | None = None
     permissions: list[str] = field(default_factory=list)
     expires_at: float | None = None
-    restored_from_cache: bool = False
     verification_url: str | None = None
     #: The Persona inquiry of a pending verification; closed by :meth:`Authenticator.verify`.
     inquiry: str | None = None
     detail: str | None = None
+    #: BRAIN refused the login itself (wrong password, throttled, locked), so trying the same
+    #: one again can only spend the lockout budget. A rejected captcha is not a refusal.
+    refused: bool = False
 
     @property
     def can_multi_simulate(self) -> bool:
         return "MULTI_SIMULATION" in self.permissions
-
-    @property
-    def is_consultant(self) -> bool:
-        return "CONSULTANT" in self.permissions
 
     @property
     def expires_in_seconds(self) -> int | None:
@@ -65,18 +63,18 @@ class SessionInfo:
         return max(0, round(self.expires_at - time.time()))
 
     def to_dict(self) -> dict[str, Any]:
-        return camel_dict(self) | {
+        # The countdown, not the moment: the page's clock need not agree with this one.
+        return camel_dict(self, exclude=("refused", "expires_at")) | {
             "canMultiSimulate": self.can_multi_simulate,
-            "isConsultant": self.is_consultant,
             "expiresInSeconds": self.expires_in_seconds,
         }
 
     @classmethod
-    def anonymous(cls, detail: str | None = None) -> SessionInfo:
-        return cls(authenticated=False, detail=detail)
+    def anonymous(cls, detail: str | None = None, *, refused: bool = False) -> SessionInfo:
+        return cls(authenticated=False, detail=detail, refused=refused)
 
     @classmethod
-    def from_state(cls, state: AuthState, *, restored: bool = False) -> SessionInfo:
+    def from_state(cls, state: AuthState) -> SessionInfo:
         expires_at = None
         if state.token and state.token.expiry:
             expires_at = time.time() + float(state.token.expiry)
@@ -85,7 +83,6 @@ class SessionInfo:
             user_id=state.user_id,
             permissions=list(state.permissions),
             expires_at=expires_at,
-            restored_from_cache=restored,
         )
 
 
@@ -117,7 +114,7 @@ class Authenticator:
             return None
 
         log.info("brain.session.restored", user_id=state.user_id)
-        return SessionInfo.from_state(state, restored=True)
+        return SessionInfo.from_state(state)
 
     async def login(self, email: str, password: str) -> SessionInfo:
         """Full sign-in: solve the proof-of-work, then exchange Basic auth for a cookie."""
@@ -147,7 +144,7 @@ class Authenticator:
                 if not detail
                 else sign_in_message(detail if isinstance(detail, str) else None)
             )
-            return SessionInfo.anonymous(detail=message)
+            return SessionInfo.anonymous(detail=message, refused=bool(detail))
 
         if state.user_id is None:
             return SessionInfo.anonymous(detail="BRAIN accepted the request but returned no user.")
