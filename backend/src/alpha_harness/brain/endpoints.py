@@ -244,14 +244,16 @@ class BrainEndpoints:
         r = await self.client.poll(f"/alphas/{alpha_id}/correlations/{kind}")
         return r.body if isinstance(r.body, dict) else {}
 
-    async def alpha_body(self, alpha_id: str) -> dict[str, Any]:
+    async def alpha_body(self, alpha_id: str, *, patience: float | None = None) -> dict[str, Any]:
         """``GET /alphas/{id}`` exactly as sent: the page reads blocks the model leaves out
         (``is.investabilityConstrained``, ``classifications``)."""
-        r = await self.client.request("GET", f"/alphas/{alpha_id}")
+        r = await self.client.request("GET", f"/alphas/{alpha_id}", patience=patience)
         return r.body if isinstance(r.body, dict) else {}
 
-    async def recordset_body(self, alpha_id: str, name: str) -> dict[str, Any]:
-        r = await self.client.poll(f"/alphas/{alpha_id}/recordsets/{name}")
+    async def recordset_body(
+        self, alpha_id: str, name: str, *, patience: float | None = None
+    ) -> dict[str, Any]:
+        r = await self.client.poll(f"/alphas/{alpha_id}/recordsets/{name}", patience=patience)
         return r.body if isinstance(r.body, dict) else {}
 
     async def before_and_after(self, alpha_id: str) -> dict[str, Any]:

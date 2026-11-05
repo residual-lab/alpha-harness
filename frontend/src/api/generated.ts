@@ -131,7 +131,7 @@ export interface paths {
          * @description The Alpha as BRAIN's own page shows it; its series come from :func:`recordset`.
          *
          *     Read from BRAIN on every open, since its checks and properties change, falling back to
-         *     the last copy when BRAIN cannot answer.
+         *     the last copy when BRAIN cannot answer, or at once when a download holds its rate limit.
          */
         get: operations["page_api_alphas__alpha_id__page_get"];
         put?: never;

@@ -159,6 +159,11 @@ class BrainRateLimited(BrainError):
         self.retry_after = retry_after
 
 
+class BrainBusy(BrainError):
+    """Never sent: the endpoint's rate limit would have kept it queued longer than its caller
+    agreed to wait."""
+
+
 class BrainDailyLimitReached(BrainRateLimited):
     """429 with ``DAILY_SIMULATION_LIMIT_EXCEEDED``.
 

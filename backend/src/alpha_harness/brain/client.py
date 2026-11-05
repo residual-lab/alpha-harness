@@ -28,6 +28,7 @@ import structlog
 from .errors import (
     DAILY_LIMIT_DETAIL,
     BrainAuthError,
+    BrainBusy,
     BrainDailyLimitReached,
     BrainError,
     BrainForbidden,
@@ -144,6 +145,10 @@ def _parse_retry_after(headers: httpx2.Headers) -> float | None:
     return max(seconds, 0.0)
 
 
+def _busy(bucket: str) -> BrainBusy:
+    return BrainBusy(f"BRAIN was not asked: its /{bucket} rate limit is in use by a download")
+
+
 class BrainClient:
     """Cookie-authenticated async client.
 
@@ -223,8 +228,9 @@ class BrainClient:
     def _pause(self, bucket: str, seconds: float) -> None:
         self._resume_at[bucket] = max(self._resume_at.get(bucket, 0.0), time.monotonic() + seconds)
 
-    async def _reserve(self, bucket: str) -> None:
-        """Hold the caller until this endpoint's next free slot.
+    async def _reserve(self, bucket: str, wait: float | None = None) -> None:
+        """Hold the caller until this endpoint's next free slot, or raise :class:`BrainBusy`
+        when that is more than ``wait`` seconds off.
 
         Nothing about the rate is written here. The first caller to reach an unmeasured
         endpoint goes straight through and every other waits for what its headers report,
@@ -237,7 +243,11 @@ class BrainClient:
                 self._last_send[bucket] = time.monotonic()
                 return
         if not measured.is_set():
-            await measured.wait()
+            try:
+                async with asyncio.timeout(wait):
+                    await measured.wait()
+            except TimeoutError:
+                raise _busy(bucket) from None
 
         # The next send is due a gap after the last, re-read on every wake rather than booked
         # ahead: a queue booked while a window ran dry would keep its minute-wide spacing long
@@ -249,6 +259,8 @@ class BrainClient:
                 if now >= due:
                     self._last_send[bucket] = now
                     return
+            if wait is not None and due - now > wait:
+                raise _busy(bucket)
             await asyncio.sleep(min(due - now, PACE_RECHECK))
 
     def _measure(self, bucket: str, headers: httpx2.Headers) -> None:
@@ -286,12 +298,15 @@ class BrainClient:
         raise_for_status: bool = True,
         raw: bool = False,
         read_timeout: float | None = None,
+        patience: float | None = None,
     ) -> BrainResponse:
         """Issue one request and translate failures into typed exceptions.
 
         ``raw`` leaves a successful body as undecoded ``bytes``, for payloads whose caller
         has a faster decoder than the standard library's. ``read_timeout`` overrides the client's
         for one call, since a few endpoints legitimately take longer than the rest.
+        ``patience`` caps how long it queues for the rate limit before :class:`BrainBusy`,
+        for a caller with something else to show; once sent, it is never cut short.
 
         ``params`` values that are ``None`` are dropped.
         """
@@ -300,10 +315,12 @@ class BrainClient:
         bucket = self._bucket(path)
         # Re-checked after each sleep: another 429 may have pushed the pause further out.
         # Jittered so every waiter does not re-send in the same tick and draw another 429.
-        while (wait := self._resume_at.get(bucket, 0.0) - time.monotonic()) > 0:  # noqa: ASYNC110
+        while (wait := self._resume_at.get(bucket, 0.0) - time.monotonic()) > 0:
+            if patience is not None and wait > patience:
+                raise _busy(bucket)
             await asyncio.sleep(wait + random.uniform(0.05, 0.25))
 
-        await self._reserve(bucket)
+        await self._reserve(bucket, patience)
 
         try:
             response = await self._client.request(
@@ -483,18 +500,21 @@ class BrainClient:
 
     # -- the asynchronous job protocol -----------------------------------
 
-    async def poll(self, path: str) -> BrainResponse:
+    async def poll(self, path: str, *, patience: float | None = None) -> BrainResponse:
         """Drive an asynchronous ``GET`` job to completion.
 
         Re-issues the request while the response carries ``Retry-After``, waiting what the
-        server asks. Returns the first response *without* that header.
+        server asks. Returns the first response *without* that header. ``patience`` is
+        :meth:`request`'s, for the first send only: a job BRAIN has taken is seen through.
         """
         deadline = time.monotonic() + POLL_TIMEOUT
         attempt = 0
 
         while True:
             # Retrying: a 429 or 503 between polls says nothing about the job.
-            response = await self.request_retrying("GET", path)
+            response = await self.request_retrying(
+                "GET", path, patience=patience if attempt == 0 else None
+            )
             attempt += 1
 
             if not response.pending:

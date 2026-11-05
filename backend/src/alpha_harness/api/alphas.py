@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field, RootModel
 from sqlalchemy import delete
 
 from .. import preferences
-from ..brain.errors import BrainError
+from ..brain.errors import BrainBusy, BrainError
 from ..brain.platform import PLATFORM_ALPHA_URL
 from ..brain.settings_schema import chosen_labels
 from ..db.models import BrainCache, utcnow
@@ -38,6 +38,8 @@ RECORDSETS = {"pnl": "pnl", "sharpe": "sharpe", "turnover": "turnover", "yearly-
 Recordset = Literal["pnl", "sharpe", "turnover", "yearly-stats"]
 #: BRAIN adds a submitted Alpha's out-of-sample days as they pass, so its series age.
 GROWING_SERIES_AGE = timedelta(hours=12)
+#: Seconds an Alpha page with a copy to show queues for BRAIN's rate limit before showing it.
+STALE_PAGE_PATIENCE = 0.2
 #: The periods BRAIN reports figures for, each its own block of the Alpha.
 PERIODS = ("train", "test", "is", "os", "prod")
 
@@ -144,6 +146,11 @@ def _copy(row: BrainCache) -> str:
     return f"showing the copy from {row.fetched_at:%b %d, %H:%M} UTC."
 
 
+def _unanswered(exc: BrainError, row: BrainCache) -> str:
+    reason = exc.message if isinstance(exc, BrainBusy) else f"BRAIN did not answer ({exc.message})"
+    return f"{reason}; {_copy(row)}"
+
+
 async def _kept(
     state: State, key: str, fetch: Fetch, *, refresh: bool, cached_only: bool
 ) -> BrainPayload:
@@ -236,22 +243,21 @@ async def page(alpha_id: str, state: State) -> AlphaView:
     """The Alpha as BRAIN's own page shows it; its series come from :func:`recordset`.
 
     Read from BRAIN on every open, since its checks and properties change, falling back to
-    the last copy when BRAIN cannot answer.
+    the last copy when BRAIN cannot answer, or at once when a download holds its rate limit.
     """
     problems: list[str] = []
+    key = f"alpha:{alpha_id}"
+    stale = await _stored(state, key)
     try:
-        body, _ = await _cached(
-            state,
-            f"alpha:{alpha_id}",
-            lambda: state.endpoints.alpha_body(alpha_id),
-            refresh=True,
+        body = await state.endpoints.alpha_body(
+            alpha_id, patience=None if stale is None else STALE_PAGE_PATIENCE
         )
+        await _store(state, key, body)
     except BrainError as exc:
-        stale = await _stored(state, f"alpha:{alpha_id}")
         if stale is None:
             raise
         body = stale.body
-        problems.append(f"BRAIN did not answer ({exc.message}); {_copy(stale)}")
+        problems.append(_unanswered(exc, stale))
     return AlphaView(alpha=await _info(state, alpha_id, body), problems=problems)
 
 
@@ -270,13 +276,13 @@ async def recordset(alpha_id: str, name: Recordset, state: State) -> BrainPayloa
     if kept is not None and not (growing and utcnow() - kept.fetched_at > GROWING_SERIES_AGE):
         return BrainPayload(kept.body)
     try:
-        body = await state.endpoints.recordset_body(alpha_id, name)
+        body = await state.endpoints.recordset_body(
+            alpha_id, name, patience=None if kept is None else STALE_PAGE_PATIENCE
+        )
     except BrainError as exc:
         if kept is None:
             raise
-        return BrainPayload(
-            kept.body | {"problem": f"BRAIN did not answer ({exc.message}); {_copy(kept)}"}
-        )
+        return BrainPayload(kept.body | {"problem": _unanswered(exc, kept)})
     await _store(state, key, body)
     return BrainPayload(body)
 

@@ -22,6 +22,8 @@ from . import metrics
 from .yields import SUBMITTED, checks_of, children_check, limits_of, without_quota_checks
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import pyarrow as pa
 
     from ..brain.schemas import Alpha
@@ -343,15 +345,22 @@ def _page_row(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _by_alpha[T](ids: list[str], days: list[date], values: list[T]) -> dict[str, dict[date, T]]:
-    """Rows sorted by Alpha, each Alpha's days made a dict in one go rather than row by row."""
-    if not ids:
-        # An Alpha with no PnL stored yet reads no rows, and ``ends`` would still hold one.
+def _by_alpha[T](table: pa.Table, values: Callable[[slice], list[T]]) -> dict[str, dict[date, T]]:
+    """Rows sorted by Alpha as each Alpha's ``values(rows)`` by date.
+
+    Converted to Python an Alpha at a time: one call over the whole table holds the GIL, and
+    the event loop with it, for as long as it runs, even from a worker thread.
+    """
+    if not table.num_rows:
         return {}
-    starts = [i for i in range(len(ids)) if i == 0 or ids[i] != ids[i - 1]]
-    ends = [*starts[1:], len(ids)]
+    ids = table.column("alpha_id").combine_chunks().dictionary_encode()
+    names: list[str] = ids.dictionary.to_pylist()
+    codes = ids.indices.to_numpy()
+    starts = [0, *(np.flatnonzero(np.diff(codes)) + 1).tolist()]
+    ends = [*starts[1:], len(codes)]
+    days = table.column("date").to_numpy()
     return {
-        ids[s]: dict(zip(days[s:e], values[s:e], strict=True))
+        names[codes[s]]: dict(zip(days[s:e].tolist(), values(slice(s, e)), strict=True))
         for s, e in zip(starts, ends, strict=True)
     }
 
@@ -363,20 +372,15 @@ def _by_alpha[T](ids: list[str], days: list[date], values: list[T]) -> dict[str,
 def _daily(table: pa.Table) -> dict[str, dict[date, float]]:
     """``alpha_id, date, pnl`` rows, sorted by Alpha and date, as each Alpha's PnL by date."""
     # Through numpy: Arrow's own to_pylist builds dates twenty times slower.
-    return _by_alpha(
-        table.column("alpha_id").to_pylist(),
-        table.column("date").to_numpy().tolist(),
-        table.column("pnl").to_numpy().tolist(),
-    )
+    pnl = table.column("pnl").to_numpy()
+    return _by_alpha(table, lambda rows: pnl[rows].tolist())
 
 
 def _daily_traded(table: pa.Table) -> dict[str, dict[date, tuple[float, float]]]:
     """:func:`_daily` with each day's turnover beside its PnL."""
     pnl, traded = table.column("pnl").to_numpy(), table.column("turnover").to_numpy()
     return _by_alpha(
-        table.column("alpha_id").to_pylist(),
-        table.column("date").to_numpy().tolist(),
-        list(zip(pnl.tolist(), traded.tolist(), strict=True)),
+        table, lambda rows: list(zip(pnl[rows].tolist(), traded[rows].tolist(), strict=True))
     )
 
 
@@ -713,7 +717,7 @@ class AlphaVault:
                        a.operator_count, {ALPHA_METRICS["calmar"]} AS calmar,
                        a.date_created, a.date_submitted, a.long_count, a.short_count,
                        a.max_trade, a.max_position, a.classifications, a.pyramids,
-                       a.train_sharpe, a.test_sharpe, a.checks, {standing}, {order} AS sort_key
+                       a.train_sharpe, a.test_sharpe, {standing}, {order} AS sort_key
                 FROM {source} a
                 WHERE {where}
                 ORDER BY sort_key {direction} NULLS LAST, a.alpha_id
@@ -723,7 +727,23 @@ class AlphaVault:
             """,  # noqa: S608
             [*params, limit, offset],
         )
-        return {"total": int(total or 0), "results": [_page_row(r) for r in rows]}
+        # Checks are ~2 KB of JSON an Alpha: inside the sort, DuckDB decompressed every row's
+        # to keep a page's, eight times the rest of the query. Read for the page alone instead.
+        checks: dict[str, str | None] = {}
+        if rows:
+            ids = [r["alpha_id"] for r in rows]
+            listed = ", ".join("?" for _ in ids)
+            checks = {
+                r["alpha_id"]: r["checks"]
+                for r in await self.catalog.query(
+                    f"SELECT alpha_id, checks FROM alpha WHERE alpha_id IN ({listed})",  # noqa: S608
+                    ids,
+                )
+            }
+        return {
+            "total": int(total or 0),
+            "results": [_page_row(r | {"checks": checks.get(r["alpha_id"])}) for r in rows],
+        }
 
     async def pnl_series(self, alpha_id: str) -> list[dict[str, Any]]:
         """The stored daily PnL, oldest first, as ``{date, pnl}`` rows."""
