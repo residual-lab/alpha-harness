@@ -704,15 +704,32 @@ async def _plan(body: TemplateTask, state: Any) -> dict[str, Any]:
 
     # -- fixed data fields: each has to exist here, and a universe without one is left out
     held = await _held(state, set(reads), body.region, body.delay) if reads and searched else {}
+
+    def problems_of(reader: str | None) -> list[str]:
+        if reader is None:
+            return template_problems
+        return next(i for i in infos if i["name"] == reader)["problems"]
+
+    operator_names = {str(o.get("name")) for o in operators}
+    #: Operators written where a field goes, by who wrote them: ``$ts_op`` used as an input.
+    misplaced: dict[str | None, list[str]] = {}
     for name, readers in reads.items() if searched else ():
         if held.get(name):
             continue
-        message = f"{name} is not a data field in {market}."
         for reader in readers:
-            if reader is None:
-                template_problems.append(message)
+            if name in operator_names:
+                misplaced.setdefault(reader, []).append(name)
             else:
-                next(i for i in infos if i["name"] == reader)["problems"].append(message)
+                problems_of(reader).append(f"{name} is not a data field in {market}.")
+    for reader, names in misplaced.items():
+        one = len(names) == 1
+        what = f"{', '.join(names)} {'is an operator' if one else 'are operators'}"
+        it = "it" if one else "they"
+        problems_of(reader).append(
+            f"{what}: write ${reader}(…) around what {it} should wrap, e.g. ${reader}(rank(x), 20)."
+            if reader
+            else f"{what}: call {it} on what {it} should wrap, e.g. {names[0]}(rank(x), 20)."
+        )
     kept: list[str] = []
     for universe in universes:
         short = [n for n, there in held.items() if there and universe not in there]

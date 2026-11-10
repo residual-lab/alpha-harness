@@ -78,10 +78,11 @@ async def _plan(body: SearchRequest, state: Any) -> dict[str, Any]:
         "absent": pool.absent,
         "backfill": pool.backfill,
         "neutralizations": market["neutralizations"],
+        "decays": list(dict.fromkeys(body.decays)),
     }
     sample: list[SampleAlpha] = []
     if not problems:
-        run = SearchParams(region=body.region, delay=body.delay, decay=body.decay, space=space)
+        run = SearchParams(region=body.region, delay=body.delay, space=space)
         choices = search.field_choices(space)
         sample = preview_samples(
             lambda rng: search.request_for(
@@ -126,7 +127,7 @@ async def add_task(body: SearchRequest, state: State) -> AddedTask:
             space=plan["space"],
             region=body.region,
             delay=body.delay,
-            decay=body.decay,
+            decay=plan["space"]["decays"][0],
             cores=body.cores,
             dataset_ids=body.dataset_ids,
             n_startup_trials=startup_trials(len(plan["space"]["fields"]), size, per_round),

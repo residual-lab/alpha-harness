@@ -340,6 +340,14 @@ def user_prompt(
             f"MARKET\n{run.region} · Delay {run.delay} · Universes {', '.join(run.universes)}"
             + (REGION_AGNOSTIC_BRIEF if run.region == REGION_AGNOSTIC_REGION else ""),
             "OPERATORS\n" + operators_text(operators),
+            *(
+                [
+                    "OPERATORS NOT USED THIS QUARTER · use them where they fit the idea; a sound "
+                    "Alpha comes first\n" + ", ".join(run.favour_operators)
+                ]
+                if run.favour_operators
+                else []
+            ),
             f"DATASET\n{ctx.id} · {ctx.name} · {ctx.category}\n{ctx.description}",
         ]
     )
@@ -383,6 +391,8 @@ def user_prompt(
 
 
 async def refill(optimizer: Optimizer, row: Study, want: int, waiting: bool) -> int:
+    # What repeats a setting BRAIN refused in its market is failed, never sent.
+    await scheduler.close_refused(optimizer, row.id, PROPOSED)
     async with optimizer.db.session() as session:
         # Only the written Alphas still waiting to be sent, not the whole task.
         ready = list(

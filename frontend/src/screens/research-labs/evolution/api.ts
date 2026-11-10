@@ -25,6 +25,8 @@ export interface EvolutionRequest {
   /** `null`: sized from the simulations. */
   population: number | null
   mutation_rate: number
+  /** Off, a mutation may give a child a decay neither parent has. */
+  keep_decay: boolean
   /** Needed to add a task; a preview uses it to size the population. */
   simulations?: number
 }

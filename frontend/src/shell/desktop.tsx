@@ -1,13 +1,12 @@
 /**
  * Inside the desktop app only: system notifications for what happens while the window is out of
- * sight — a task ending, BRAIN's daily limit, a lost session, an update to install. Each is raised
- * when its state changes, never for what was already so when the window opened.
+ * sight — a task ending, an update to install (sending pausing is `PauseAlerts`, in either mode).
+ * Each is raised when its state changes, never for what was already so when the window opened.
  */
 
 import { useQuery } from '@tanstack/react-query'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
-import { simulations } from '@/api/core'
 import { cn } from '@/lib/cn'
 import { useRefetchOn } from '@/lib/ws'
 import { labTasks } from '@/screens/tasks/api'
@@ -133,9 +132,14 @@ export function WindowControls() {
 const ENDED: Record<string, string> = { COMPLETE: 'finished', PAUSED: 'paused', FAILED: 'failed' }
 const LIVE = new Set(['QUEUED', 'RUNNING'])
 
-async function notify(title: string, body: string) {
+export async function notify(title: string, body: string) {
   // What is on screen already says it.
   if (document.visibilityState === 'visible' && document.hasFocus()) return
+  if (!inDesktop) {
+    if ('Notification' in window && Notification.permission === 'granted')
+      new Notification(title, { body })
+    return
+  }
   // Asked once, on mount: a prompt raised from the tray is held back or unwelcome.
   const { isPermissionGranted, sendNotification } = await import('@tauri-apps/plugin-notification')
   if (!(await isPermissionGranted())) return
@@ -146,8 +150,6 @@ export function DesktopNotifications() {
   // The same queries the Tasks page and the header read, so this costs nothing extra on screen.
   const tasks = useQuery({ queryKey: ['lab-tasks'], queryFn: labTasks.list })
   useRefetchOn('studies', ['lab-tasks'], 2_000)
-  const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
-  useRefetchOn('simulations', ['simulations', 'engine'], 2_000)
   const update = useUpdateStatus()
 
   // Asked now, while the window is in front: macOS may hold back a prompt raised from the tray.
@@ -179,25 +181,6 @@ export function DesktopNotifications() {
       void notify(`${ended.length} tasks ended`, `${shown.join(', ')}${more}.`)
     }
   }, [tasks.data])
-
-  const flags = useRef<{ limit: boolean; session: boolean } | null>(null)
-  useEffect(() => {
-    if (!engine.data) return
-    const now = { limit: engine.data.dailyLimitHit, session: engine.data.sessionLost }
-    const before = flags.current
-    flags.current = now
-    if (!before) return
-    if (now.limit && !before.limit)
-      void notify(
-        "BRAIN's daily simulation limit is reached",
-        'Queued simulations wait for the reset at midnight US Eastern.',
-      )
-    if (now.session && !before.session)
-      void notify(
-        'BRAIN is not accepting your session',
-        'Sending is paused until the session is renewed or you sign in again.',
-      )
-  }, [engine.data])
 
   const offered = useRef<string | null | undefined>(undefined)
   useEffect(() => {

@@ -2,6 +2,7 @@
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { CopyIcon } from 'lucide-react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import { type AlphaCheck, type Scope, scopeLabel } from '@/api/types'
 import { cn } from '@/lib/cn'
@@ -47,9 +48,10 @@ const hiddenReasons = (data: SubmittableResponse) =>
 
 export function Submittable({ onOpen }: { onOpen: (alphaId: string) => void }) {
   const [scope, setScope] = useScope('pool-submittable')
+  const [implausible, setImplausible] = useState(false)
   const q = useQuery({
-    queryKey: ['pool', 'submittable', scope],
-    queryFn: () => pool.submittable(scope),
+    queryKey: ['pool', 'submittable', scope, implausible],
+    queryFn: () => pool.submittable(scope, 200, implausible),
     placeholderData: keepPreviousData,
   })
   useRefetchOn('simulations', ['pool', 'submittable'], 5000)
@@ -79,6 +81,16 @@ export function Submittable({ onOpen }: { onOpen: (alphaId: string) => void }) {
         </div>
       )}
       {q.isError && <ErrorNotice error={q.error} title="Could not read submittable Alphas" />}
+      {(implausible || (data?.implausibleHidden ?? 0) > 0) && (
+        <p className="flex flex-wrap items-center gap-x-2 text-body-compact text-ink-subtle">
+          {implausible
+            ? 'Including Alphas with a Sharpe beyond ±10 in some period, which are almost always straight lines rather than signals.'
+            : `${fmt.int(data?.implausibleHidden ?? 0)} left out for a Sharpe beyond ±10 in some period: almost always a straight line, not a signal.`}
+          <Button variant="ghost" size="sm" onClick={() => setImplausible((on) => !on)}>
+            {implausible ? 'Hide them' : 'Show them'}
+          </Button>
+        </p>
+      )}
 
       {q.isPending ? (
         <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">

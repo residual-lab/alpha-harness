@@ -59,6 +59,11 @@ import { type Column, DataTable } from '@/ui/table'
 /** Matches `labs.params.SETTINGS_SAMPLER`. */
 const SETTINGS_SAMPLER = 'settings-sampler'
 const PASTE_ALPHAS = 'paste-alphas'
+/** Reshape one Alpha at its own settings, so they have no search space or fields of their own. */
+const ONE_ALPHA = new Set(['correlation-breaker', 'fields-sampler'])
+/** Ask for another point whenever one is answered from an earlier Alpha, so their target counts
+ *  new simulations only. The labs that write their simulations up front count reused ones too. */
+const REPLACES_REUSED = new Set(['search', 'template', 'ga', 'power-pool'])
 
 /** What a task searches for, where that is not Sharpe, named as the task names it. */
 const objective = (task: LabTask) =>
@@ -87,6 +92,8 @@ const samplerDefaults = (task: LabTask) => [
   'neutralization',
   'investability',
   ...(task.truncationAgent ? ['truncation'] : []),
+  // A Decay sweep is read by what each Decay did to Turnover.
+  ...(task.decays?.length ? ['decay', 'turnover'] : []),
   'sharpe',
   'afterCostSharpe',
 ]
@@ -246,29 +253,47 @@ export function TasksScreen() {
       key: 'simulations',
       header: 'Simulations',
       width: 'minmax(220px,1.5fr)',
-      // Reused Alphas count towards the target as simulated ones do: without them, a task that
-      // reran settings it had run before read as finished early, e.g. "28 / 88, Complete".
-      cell: (t) => (
-        <span className="flex w-full min-w-0 items-center gap-2">
-          <Progress
-            className="flex-1"
-            value={t.target > 0 ? (t.simulated + t.cached) / t.target : 0}
-            label="Simulated"
-          />
-          <span className="num shrink-0 text-body-compact">
-            {fmt.int(t.simulated + t.cached)} / {fmt.int(t.target)}
-            {t.cached > 0 && (
-              <span
-                className="text-ink-subtle"
-                title="Simulated before, so read back from BRAIN's earlier result without spending quota or adding a new Alpha on BRAIN"
-              >
-                {' '}
-                · {fmt.int(t.cached)} reused
-              </span>
-            )}
+      // A lab that writes its simulations up front counts reused Alphas towards the target:
+      // without them, a task that reran settings it had run before read as finished early,
+      // e.g. "28 / 88, Complete". A lab that replaces each reused point counts new ones only,
+      // or it read "507 / 500"; ended short, it says so rather than look like that again.
+      cell: (t) => {
+        const replaces = REPLACES_REUSED.has(t.lab)
+        const done = replaces ? t.simulated : t.simulated + t.cached
+        const ended = t.status === 'COMPLETE' || t.status === 'FAILED'
+        const short = replaces && ended && t.simulated < t.target
+        return (
+          <span className="flex w-full min-w-0 items-center gap-2">
+            <Progress
+              className="flex-1"
+              value={t.target > 0 ? Math.min(1, done / t.target) : 0}
+              label="Simulated"
+            />
+            <span className="num shrink-0 text-body-compact">
+              {fmt.int(done)} / {fmt.int(t.target)}
+              {t.cached > 0 && (
+                <span
+                  className="text-ink-subtle"
+                  title="Simulated before, so read back from BRAIN's earlier result without spending quota or adding a new Alpha on BRAIN"
+                >
+                  {' '}
+                  · {replaces ? '+' : ''}
+                  {fmt.int(t.cached)} reused
+                </span>
+              )}
+              {short && (
+                <span
+                  className="text-ink-subtle"
+                  title={t.message || 'Stopped before reaching its target.'}
+                >
+                  {' '}
+                  · {t.stopping ? 'stopped' : 'ended early'}
+                </span>
+              )}
+            </span>
           </span>
-        </span>
-      ),
+        )
+      },
     },
     {
       key: 'best',
@@ -644,14 +669,16 @@ function TaskDetail({
   const description =
     task.lab === SETTINGS_SAMPLER
       ? // Held at the source Alpha's values for every simulation in the sweep.
-        `${fmt.int(task.markets)} Markets · Decay ${task.decay ?? DASH} · ${task.truncationAgent ? 'Truncation Agent' : `Truncation ${task.truncation ?? DASH}`} · NaN Handling ${task.nanHandling ?? DASH}`
+        `${fmt.int(task.markets)} Markets · Decay ${task.decays?.length ? task.decays.join(', ') : (task.decay ?? DASH)} · ${task.truncationAgent ? 'Truncation Agent' : `Truncation ${task.truncation ?? DASH}`} · NaN Handling ${task.nanHandling ?? DASH}${task.visualization ? ' · Visualization On' : ''}`
       : task.lab === 'super-alpha'
         ? `${task.universe ?? DASH} · SuperAlphas from your submitted Alphas`
         : task.lab === PASTE_ALPHAS
           ? `${fmt.int(task.target)} pasted Alphas · ${fmt.int(task.markets)} Markets`
-          : task.seeds > 0
-            ? `${task.universe ?? DASH} · ${fmt.int(task.seeds)} seeds · Population ${fmt.int(task.population)} · Mutation ${fmt.pct(task.mutationRate, 0)}`
-            : `Decay ${task.decay ?? DASH} · ${fmt.int(task.fields)} fields`
+          : ONE_ALPHA.has(task.lab)
+            ? `${task.alphaId || DASH} · ${task.universe ?? DASH} · Decay ${task.decay ?? DASH}`
+            : task.seeds > 0
+              ? `${task.universe ?? DASH} · ${fmt.int(task.seeds)} seeds · Population ${fmt.int(task.population)} · Mutation ${fmt.pct(task.mutationRate, 0)}`
+              : `Decay ${task.decays?.length ? task.decays.join(', ') : (task.decay ?? DASH)} · ${fmt.int(task.fields)} fields`
   const copyResults = () =>
     navigator.clipboard.writeText(resultsMarkdown(task, found)).then(
       () => toast.success(`Copied ${fmt.int(found.length)} results`),

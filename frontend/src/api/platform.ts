@@ -32,6 +32,7 @@ export const UNCOUNTED_OPERATORS = ["group_backfill", "ts_backfill"] as const
 export const POWER_POOL_MAX_OPERATORS = 8 as const
 export const POWER_POOL_MAX_FIELDS = 3 as const
 export const POWER_POOL_MIN_SHARPE = 1.0 as const
+export const IMPLAUSIBLE_SHARPE = 10.0 as const
 export const POWER_POOL_DESCRIPTION_MIN_LENGTH = 100 as const
 export const POWER_POOL_DESCRIPTION_HEADINGS = ["Idea", "Rationale for data used", "Rationale for operators used"] as const
 export const GROUPING_FIELDS = ["market", "sector", "industry", "subindustry", "country", "exchange", "currency", "split", "adjfactor"] as const

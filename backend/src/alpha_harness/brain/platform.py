@@ -98,6 +98,9 @@ UNCOUNTED_OPERATORS = frozenset({"ts_backfill", "group_backfill"})
 POWER_POOL_MAX_OPERATORS = 8
 POWER_POOL_MAX_FIELDS = 3
 POWER_POOL_MIN_SHARPE = 1.0
+#: A Sharpe beyond this either way, in any period, is a straight line or a step rather than a
+#: signal: consultants found nearly every one so.
+IMPLAUSIBLE_SHARPE = 10.0
 #: A Power Pool description's least length, and the headings BRAIN's template asks for.
 POWER_POOL_DESCRIPTION_MIN_LENGTH = 100
 POWER_POOL_DESCRIPTION_HEADINGS = (

@@ -45,7 +45,7 @@ export const testPeriodOf = (years: string, months: string) => {
 
 /**
  * Decay, Truncation, NaN Handling and Test Period — Test Period in years *and* months, as BRAIN
- * has it. Pasteurization shows only where it is passed.
+ * has it. Pasteurization and Visualization show only where they are passed.
  */
 export function SimulationSettingsFields({
   decay,
@@ -59,6 +59,8 @@ export function SimulationSettingsFields({
   setPasteurization,
   nanHandling,
   setNanHandling,
+  visualization,
+  setVisualization,
   testYears,
   setTestYears,
   testMonths,
@@ -77,17 +79,21 @@ export function SimulationSettingsFields({
   setPasteurization?: ((v: OnOff) => void) | undefined
   nanHandling: OnOff
   setNanHandling: (v: OnOff) => void
+  visualization?: OnOff | undefined
+  setVisualization?: ((v: OnOff) => void) | undefined
   testYears: string
   setTestYears: (v: string) => void
   testMonths: string
   setTestMonths: (v: string) => void
 }) {
   const badTruncation = !truncationAgent && truncationOf(truncation) === null
+  const tiles = 4 + Number(Boolean(setPasteurization)) + Number(Boolean(setVisualization))
   return (
     <div
       className={cn(
         'grid grid-cols-1 gap-4 sm:grid-cols-2',
-        pasteurization && setPasteurization ? 'xl:grid-cols-5' : 'xl:grid-cols-4',
+        // Six in one row squeezes Test Period's two boxes, so they go two rows of three.
+        tiles === 6 ? 'xl:grid-cols-3' : tiles === 5 ? 'xl:grid-cols-5' : 'xl:grid-cols-4',
       )}
     >
       <Field label="Decay" className={TILE}>
@@ -157,6 +163,24 @@ export function SimulationSettingsFields({
       <Field label="NaN Handling" className={TILE}>
         <Select label="NaN Handling" value={nanHandling} onChange={setNanHandling} items={ON_OFF} />
       </Field>
+      {visualization && setVisualization && (
+        <Field
+          label="Visualization"
+          className={TILE}
+          hint={
+            visualization === 'ON'
+              ? 'Slower, and in Full mode: Quick mode draws none. BRAIN keeps the charts a week.'
+              : undefined
+          }
+        >
+          <Select
+            label="Visualization"
+            value={visualization}
+            onChange={setVisualization}
+            items={ON_OFF}
+          />
+        </Field>
+      )}
       {/* BRAIN takes P0Y0M0D up to P6Y0M0D, and its own form splits the two. The units sit
           beside the boxes rather than above them, so this reads as one control on one line
           and its inputs share a baseline with Decay and Truncation. */}

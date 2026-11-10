@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from .brain.connection import background
 from .schemas import camel_dict
 
 if TYPE_CHECKING:
@@ -136,6 +137,8 @@ def spawn[T](coro: Awaitable[T], *, name: str) -> asyncio.Task[T | None]:
     """Run ``coro`` detached, tracked for :func:`cancel_background`."""
 
     async def run() -> T | None:
+        # Detached work runs on its own, so it stands down while BRAIN cannot be asked.
+        background()
         try:
             return await coro
         # Nobody awaits a detached job, so an uncaught error would otherwise vanish.

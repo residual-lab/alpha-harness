@@ -31,6 +31,11 @@ export interface AlphaPageRequest {
   minimum?: Partial<Record<AlphaMetricKey, number>>
   maximum?: Partial<Record<AlphaMetricKey, number>>
   search?: string | null
+  /** Alphas carrying any of these tags. */
+  tags?: string[] | null
+  /** `YYYY-MM-DD` days on BRAIN's clock, both included. */
+  created_after?: string | null
+  created_before?: string | null
   /** Only Alphas the Evolution Lab can breed from, for when this table picks seeds. */
   evolvable?: boolean
   /** 1..500 */
@@ -87,9 +92,11 @@ export const pool = {
   /** Downloads the daily PnL from BRAIN the first time, so it can take a while. */
   pnl: (alphaId: string) =>
     http.get<AlphaPnl>(`/api/vault/alphas/${encodeURIComponent(alphaId)}/pnl`),
-  submittable: (scope: Scope, limit = 200) =>
+  /** ``implausible`` also lists Alphas with a Sharpe beyond ±10 in some period, left out by
+   *  default as straight lines rather than signals. */
+  submittable: (scope: Scope, limit = 200, implausible = false) =>
     http.get<SubmittableResponse>(
-      `/api/vault/submittable${qs({ region: scope.region, delay: scope.delay, universe: scope.universe, instrument_type: scope.instrumentType, limit })}`,
+      `/api/vault/submittable${qs({ region: scope.region, delay: scope.delay, universe: scope.universe, instrument_type: scope.instrumentType, limit, implausible: implausible || undefined })}`,
     ),
   /** Every market at once: where an empty market points instead. */
   everywhere: queryOptions({

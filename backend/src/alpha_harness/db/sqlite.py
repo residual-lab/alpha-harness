@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.schema import CreateColumn
 
+from ..config import PRIVATE_DIR_MODE
 from .models import Base
 
 if TYPE_CHECKING:
@@ -54,7 +55,11 @@ class Database:
     """Owns the engine and hands out sessions."""
 
     def __init__(self, path: Path) -> None:
-        self._engine: AsyncEngine = create_async_engine(f"sqlite+aiosqlite:///{path}")
+        # A failed write's message still names the error; without this it also carried every
+        # bound value, a whole search space into the log the person sends for help.
+        self._engine: AsyncEngine = create_async_engine(
+            f"sqlite+aiosqlite:///{path}", hide_parameters=True
+        )
         event.listen(self._engine.sync_engine, "connect", _apply_pragmas)
         self._sessionmaker = async_sessionmaker(self._engine, expire_on_commit=False)
 
@@ -106,7 +111,7 @@ def snapshot(path: Path, version: str) -> Path | None:
     target = folder / f"{path.stem}-before-{re.sub(r'[^\w.+-]', '_', version)}.db"
     if target.exists():
         return None
-    folder.mkdir(mode=0o700, exist_ok=True)
+    folder.mkdir(mode=PRIVATE_DIR_MODE, exist_ok=True)
     partial = target.with_suffix(".partial")
     # VACUUM INTO refuses a file that is already there, as one a crash left half-written is.
     partial.unlink(missing_ok=True)

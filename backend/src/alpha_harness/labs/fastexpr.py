@@ -450,6 +450,20 @@ def guarded(parent: Node | None, path: Path) -> bool:
 # -- changing --------------------------------------------------------------
 
 
+def negated(tree: Node) -> Node:
+    """The Alpha with its sign flipped. Only the last statement is the Alpha, so the steps
+    before it stay as they are, and one already negated loses its minus rather than gains two.
+    """
+    if tree.kind == "seq":
+        *steps, last = tree.args
+        return replace(tree, args=(*steps, negated(last)))
+    if tree.kind == "assign":
+        raise ParseError("The expression ends in an assignment, so it has no value to flip.")
+    if tree.kind == "unary" and tree.value == "-":
+        return tree.args[0]
+    return Node("unary", "-", (tree,))
+
+
 def crossover(rng: random.Random, left: Node, right: Node) -> Node | None:
     """Graft a call from one parent in place of a call inside the other.
 
@@ -514,3 +528,39 @@ def validate(
         ):
             problems.append(f"{node.value} is not a data field here.")
     return problems
+
+
+if __name__ == "__main__":
+    import sys
+
+    def flip(text: str) -> str:
+        return render(negated(parse(text)))
+
+    def ends_in_assignment() -> bool:
+        try:
+            negated(parse("a = rank(close)"))
+        except ParseError:
+            return True
+        return False
+
+    flips = {
+        "rank(close)": "-rank(close)",
+        "close - open": "-(close - open)",
+        "x > 0 ? 1 : -1": "-(x > 0 ? 1 : -1)",
+        "a = rank(close);\nb = a * a;\nb - a": "a = rank(close); b = a * a; -(b - a)",
+        "-rank(close)": "rank(close)",
+        "a = rank(close); -a": "a = rank(close); a",
+        # The tokenizer blanks comments out, so a flipped Alpha comes back without them.
+        "rank(close) // momentum": "-rank(close)",
+        "/* note */ a = rank(close); a": "a = rank(close); -a",
+    }
+    checks = {f"flips {text!r}": flip(text) == want for text, want in flips.items()}
+    checks |= {f"round-trips {text!r}": parse(flip(text)) == negated(parse(text)) for text in flips}
+    checks |= {
+        "twice is the original": negated(negated(parse("ts_rank(close, 5)")))
+        == parse("ts_rank(close, 5)"),
+        "an assignment last has nothing to flip": ends_in_assignment(),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"fastexpr self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

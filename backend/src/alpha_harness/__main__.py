@@ -2,6 +2,7 @@
 
 import asyncio
 import errno
+import faulthandler
 import os
 import socket
 import sys
@@ -9,7 +10,7 @@ from typing import Any
 
 import uvicorn
 
-from . import updates
+from . import handover, updates
 from .window import open_window
 
 HOST = "127.0.0.1"
@@ -133,6 +134,12 @@ async def _orphaned(server: uvicorn.Server) -> None:
 
 
 def main() -> None:
+    # A native crash, an access violation inside DuckDB say, otherwise ends with no trace at
+    # all: this writes its stack to stderr, which the launcher keeps in its log.
+    faulthandler.enable()
+    if handover.started_by_old_launcher():
+        handover.run(_listen(), f"http://{HOST}:{PORT}")
+        return
     failure = asyncio.run(_serve())
     if failure is not None:
         # A message, not a code: Python writes it last in the launcher's log, which is the

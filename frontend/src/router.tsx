@@ -98,6 +98,7 @@ const settingsSampler = createRoute({
   // is shareable, unlike the multi-item picks that use a handoff store.
   validateSearch: (search: Record<string, unknown>) => ({
     alpha: typeof search['alpha'] === 'string' ? search['alpha'] : undefined,
+    ...(search['sweep'] === 'decay' ? { sweep: 'decay' as const } : {}),
   }),
   component: lazyRouteComponent(
     () => import('@/screens/tools/settings-sampler'),

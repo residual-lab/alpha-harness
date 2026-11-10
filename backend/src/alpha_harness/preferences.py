@@ -1,12 +1,13 @@
 """What the consultant chooses on the Settings screen, kept in ``harness.db``.
 
 Every choice has a default, so an install that never opens Settings runs as the app does
-out of the box.
+out of the box. The recipes a consultant writes in a lab are kept here too, one row a lab,
+so a reinstall or another browser still finds them.
 """
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from . import updates
@@ -62,6 +63,51 @@ async def save(db: Database, preferences: Preferences) -> None:
             await session.merge(Preference(key=key, value=value))
 
 
+class OwnRecipe(Out):
+    """A selection, combo or re-shape the consultant wrote, as their screen holds it."""
+
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    #: Blank while it is being typed; the lab running it refuses a blank one then.
+    name: str = Field(max_length=120)
+    code: str = Field(max_length=8000)
+
+
+class SuperLabRecipes(Out):
+    """The Super Alpha Lab's own selections and combos, and which of every one are unticked."""
+
+    selections: list[OwnRecipe] = Field(default_factory=list[OwnRecipe], max_length=50)
+    combos: list[OwnRecipe] = Field(default_factory=list[OwnRecipe], max_length=50)
+    #: ``builtin:{name}`` or ``custom:{id}``.
+    off: list[Annotated[str, Field(max_length=200)]] = Field(
+        default_factory=list[str], max_length=200
+    )
+
+
+class BreakerReshapes(Out):
+    """The Correlation Breaker's own re-shapes, offered for every Alpha."""
+
+    reshapes: list[OwnRecipe] = Field(default_factory=list[OwnRecipe], max_length=50)
+
+
+#: Their rows in ``preference``, beside the Settings screen's choices, which never read them.
+SUPER_LAB = "super_lab_recipes"
+BREAKER = "correlation_breaker_reshapes"
+
+
+async def kept[M: BaseModel](db: Database, key: str, model: type[M]) -> M | None:
+    """What a screen saved under ``key``; ``None`` until it first saves."""
+    async with db.session() as session:
+        row = await session.get(Preference, key)
+        return None if row is None else model.model_validate(row.value)
+
+
+async def keep(db: Database, key: str, value: BaseModel) -> None:
+    async with db.session() as session:
+        await session.merge(
+            Preference(key=key, value=value.model_dump(mode="json", by_alias=False))
+        )
+
+
 def apply(state: AppState, preferences: Preferences) -> None:
     """Hand every choice to the part of the app that acts on it. Takes effect at once."""
     state.engine.lend_idle_cores = preferences.lend_idle_cores
@@ -72,3 +118,59 @@ def apply(state: AppState, preferences: Preferences) -> None:
     )
     updates.check_hours = preferences.update_check_hours
     updates.auto_install = preferences.auto_update
+
+
+if __name__ == "__main__":
+    import asyncio
+    import sys
+    import tempfile
+    from pathlib import Path
+    from typing import Any
+
+    from pydantic import ValidationError
+
+    from .db.sqlite import Database
+
+    def refused(model: type[BaseModel], data: dict[str, Any]) -> bool:
+        try:
+            model.model_validate(data)
+        except ValidationError:
+            return True
+        return False
+
+    blank = {"id": "a-1", "name": "", "code": ""}
+
+    async def round_trip() -> dict[str, bool]:
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "harness.db")
+            await db.create_all()
+            before = await kept(db, BREAKER, BreakerReshapes)
+            mine = BreakerReshapes.model_validate({"reshapes": [{**blank, "code": "rank(alpha)"}]})
+            await keep(db, BREAKER, mine)
+            after = await kept(db, BREAKER, BreakerReshapes)
+            other = await kept(db, SUPER_LAB, SuperLabRecipes)
+            settings = await load(db)
+            await db.dispose()
+        return {
+            "nothing until first saved": before is None,
+            "read back as saved, a blank name included": after == mine,
+            "one lab's row is not another's": other is None,
+            "never read as a Settings choice": settings == Preferences(),
+        }
+
+    checks = {
+        **asyncio.run(round_trip()),
+        "a 51st re-shape refused": refused(
+            BreakerReshapes, {"reshapes": [{**blank, "id": str(i)} for i in range(51)]}
+        ),
+        "an id that is not a token refused": refused(OwnRecipe, {**blank, "id": "../a"}),
+        "code past 8,000 characters refused": refused(OwnRecipe, {**blank, "code": "x" * 8001}),
+        "an overlong unticked key refused": refused(SuperLabRecipes, {"off": ["x" * 201]}),
+        "a browser's copy as it stands accepted": not refused(
+            SuperLabRecipes,
+            {"selections": [blank], "combos": [], "off": ["builtin:Slow core", "custom:a-1"]},
+        ),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"preferences self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

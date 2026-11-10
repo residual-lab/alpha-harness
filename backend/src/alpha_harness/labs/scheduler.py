@@ -17,7 +17,7 @@ from ..brain.platform import MULTI_SIMULATION_SIZE
 from ..brain.schemas import SimulationRequest, SimulationSettings, SimulationType
 from ..brain.settings_schema import validate_settings
 from ..db.models import SimStatus, SimulationRecord, Study, StudyStatus, Trial, TrialState, utcnow
-from . import ga, search, template
+from . import ga, refusals, search, template
 from .objectives import StudyNotFoundError
 from .params import (
     CORRELATION_BREAKER,
@@ -277,12 +277,15 @@ def ask_points(
     seen: dict[tuple[str, str], float | bool],
     cover: list[str],
     schema: dict[str, Any] | None = None,
+    refused: set[refusals.Refusal] | None = None,
 ) -> tuple[list[tuple[Any, dict[str, Any], SimulationRequest]], str | None]:
     """Ask for ``want`` new simulations. Runs off the event loop.
 
     A point this task already scored is answered with its score, one that failed is told as
     failed, and a repeat, or a point its lab cannot write, is pruned; each time another
-    point is asked, so quota is only spent on Alphas the task has not seen.
+    point is asked, so quota is only spent on Alphas the task has not seen. So is a point
+    repeating a setting BRAIN ``refused`` in its market earlier in the task: Optuna cannot drop
+    a choice from a running study, so the refusal is honoured here instead.
 
     Also returns the first setting BRAIN refused, so a task left with nothing to ask can say
     whether BRAIN withdrew what it searches or the search ran out of new points.
@@ -314,13 +317,12 @@ def ask_points(
             withdrawn = withdrawn or problems[0]
             study.tell(trial, state=OptunaState.PRUNED)
             continue
-        key = (
-            None
-            if request is None
-            else search.identity_of(
-                request.regular, request.settings.model_dump(by_alias=True, exclude_none=True)
-            )
-        )
+        wire = None if request is None else _wire(request)
+        if wire is not None and (hit := refusals.repeated(wire, refused or set())) is not None:
+            withdrawn = withdrawn or refusals.describe(hit)
+            study.tell(trial, state=OptunaState.PRUNED)
+            continue
+        key = None if request is None or wire is None else search.identity_of(request.regular, wire)
         if request is None or key is None or key in keys or key in seen:
             known = None if key is None else seen.get(key)
             if known is False:
@@ -401,7 +403,7 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
                 return await send_parked(optimizer, row, owed)
     if stopping or committed >= row.max_trials:
         if not waiting:
-            await optimizer.set_status(study_id, StudyStatus.COMPLETE)
+            await finish(optimizer, study_id, StudyStatus.COMPLETE, None)
         return 0
     want = to_ask(room, int(in_flight or 0), row.max_trials - committed)
     if row.sampler in (GA_SAMPLER, SEARCH_SAMPLER, TEMPLATE_SAMPLER) and want > 0:
@@ -463,10 +465,11 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
                     Trial.expression,
                     raw_json(Trial.settings),
                     raw_json(Trial.values),
+                    Trial.message,
                 ).where(Trial.study_id == study_id, Trial.state != TrialState.PRUNED)
             )
         ).all()
-    tried, seen = await asyncio.to_thread(_search_memory, counted, key)
+    tried, seen, refused = await asyncio.to_thread(_search_memory, counted, key)
     limit = row.max_trials // 2
     cover: list[str] = []
     if len(tried) < limit:
@@ -476,7 +479,7 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
     study = await optimizer.optuna_study(study_id, row)
     schema = await optimizer.metadata.cached_settings_schema()
     picked, withdrawn = await asyncio.to_thread(
-        ask_points, study, lab, run, want, seen, cover, schema
+        ask_points, study, lab, run, want, seen, cover, schema, refused
     )
     if not picked:
         # Nothing new left to ask: the task is done once what is out has come back.
@@ -493,6 +496,11 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
         return 0
 
     return await _queue(optimizer, row, last_number, picked)
+
+
+def _wire(request: SimulationRequest) -> dict[str, Any]:
+    """A request's settings as BRAIN reads them, the shape trials store them in."""
+    return request.settings.model_dump(by_alias=True, exclude_none=True)
 
 
 def raw_json(column: Any) -> Any:
@@ -512,8 +520,9 @@ def full_run() -> Any:
 
 def _search_memory(
     rows: Sequence[Any], covers: str
-) -> tuple[set[Any], dict[tuple[str, str], float | bool]]:
-    """The fields tried as ``covers`` and every point already scored, from unpruned trials.
+) -> tuple[set[Any], dict[tuple[str, str], float | bool], set[refusals.Refusal]]:
+    """The fields tried as ``covers``, every point already scored, and every setting BRAIN
+    refused in a market (:mod:`.refusals`), from unpruned trials.
 
     Runs in a worker thread: identity keys validate each trial's settings, which costs
     seconds at the largest task sizes. A task reuses a few settings many times over, so each
@@ -526,7 +535,8 @@ def _search_memory(
 
     tried: set[Any] = set()
     seen: dict[tuple[str, str], float | bool] = {}
-    for state, params, expression, settings, values in rows:
+    refused: set[refusals.Refusal] = set()
+    for state, params, expression, settings, values, message in rows:
         tried.add((json.loads(params or "null") or {}).get(covers))
         key = (expression or "", settings_of(settings))
         scores = json.loads(values or "null")
@@ -534,7 +544,8 @@ def _search_memory(
             seen[key] = float(scores[0])
         elif state == TrialState.FAIL:
             seen[key] = False
-    return tried, seen
+            refused |= refusals.from_message(message, json.loads(settings or "null"))
+    return tried, seen, refused
 
 
 async def _queue(
@@ -594,7 +605,11 @@ async def _breed(
         # Only what the stall check reads: spent children's scores, in the order asked.
         spent_rows = (
             await session.execute(
-                select(Trial.state, raw_json(Trial.values))
+                select(
+                    Trial.state,
+                    raw_json(Trial.values),
+                    func.json_extract(Trial.result, "$.implausible"),
+                )
                 .where(
                     Trial.study_id == row.id,
                     Trial.generation > 0,
@@ -611,6 +626,13 @@ async def _breed(
     if want <= 0:
         return 0
     picked = await ga.breed(optimizer, row, want)
+    if picked and (known := await known_refusals(optimizer, row.id)):
+        # A child keeps its parent's settings, so it would repeat its parent's refusal.
+        picked = [
+            (params, request)
+            for params, request in picked
+            if refusals.repeated(_wire(request), known) is None
+        ]
     if not picked:
         if not waiting:
             async with optimizer.db.session() as session:
@@ -633,10 +655,13 @@ async def _breed(
 
 
 def _spent(rows: Sequence[Any]) -> list[float | None]:
+    """Each spent child's score, ``None`` for one that failed. An implausible one failed too:
+    counted as found, a straight line would keep a stalled search breeding."""
     out: list[float | None] = []
-    for state, values in rows:
+    for state, values, flagged in rows:
         scores = json.loads(values or "null")
-        out.append(float(scores[0]) if state == TrialState.COMPLETE and scores else None)
+        good = state == TrialState.COMPLETE and scores and not flagged
+        out.append(float(scores[0]) if good else None)
     return out
 
 
@@ -739,23 +764,40 @@ async def retire_block_templates(optimizer: Optimizer) -> int:
             ).all()
         )
     for study_id in old:
-        await finish(optimizer, study_id, StudyStatus.COMPLETE, BLOCK_TEMPLATE)
+        await finish(optimizer, study_id, StudyStatus.COMPLETE, BLOCK_TEMPLATE, judge=False)
     if old:
         log.info("tasks.block_templates_closed", count=len(old))
     return len(old)
 
 
-async def finish(optimizer: Optimizer, study_id: int, status: StudyStatus, message: str) -> None:
+async def finish(
+    optimizer: Optimizer,
+    study_id: int,
+    status: StudyStatus,
+    message: str | None,
+    *,
+    judge: bool = True,
+) -> None:
     """End a task, and stop it spending: its unsent simulations leave the queue.
 
     Dropping the queue matters as much as the status, or the engine goes on sending work
     nobody will score. Simulations already sent finish; running the task again scores them.
+
+    A task ending *Complete* with nothing scored and something failed ends *Failed* instead,
+    with its commonest reason: "Complete" with no Alphas is how a whole run lost to one refused
+    setting once looked. Not for a task the person stopped, nor where ``judge`` is off. A
+    ``message`` of ``None`` keeps the task's own.
     """
     async with optimizer.db.session() as session:
         stored = await session.get(Study, study_id)
         if stored is not None:
+            if status == StudyStatus.COMPLETE and judge and not task_params(stored).stopping:
+                reason = await _nothing_scored(session, study_id)
+                if reason is not None:
+                    status, message = StudyStatus.FAILED, reason
             stored.status = status
-            stored.message = message
+            if message is not None:
+                stored.message = message
             stored.finished_at = utcnow()
             task = stored.task
         else:
@@ -765,6 +807,81 @@ async def finish(optimizer: Optimizer, study_id: int, status: StudyStatus, messa
         await prune_unsent(optimizer, study_id)
         await optimizer.engine.set_quota(task, 0)
     await optimizer.notify()
+
+
+async def known_refusals(optimizer: Optimizer, study_id: int) -> set[refusals.Refusal]:
+    """The settings BRAIN refused this task, each in the market it refused it in."""
+    async with optimizer.db.session() as session:
+        rows = (
+            await session.execute(
+                select(Trial.message, Trial.settings).where(
+                    Trial.study_id == study_id,
+                    Trial.state == TrialState.FAIL,
+                    Trial.message.startswith(refusals.REFUSED),
+                )
+            )
+        ).tuples()
+        return refusals.learned(rows)
+
+
+#: How many refusals each task's parked trials were last checked against: they are read again
+#: only once the task has learned another, not on every tick.
+_checked_against: dict[int, int] = {}
+
+
+async def close_refused(optimizer: Optimizer, study_id: int, parked_as: str) -> int:
+    """Fail the trials parked as ``parked_as`` that repeat a refusal BRAIN made earlier in the
+    task, each naming it: sent, each would be refused again. Failed rather than pruned, so they
+    count among the task's failures. Returns how many."""
+    known = await known_refusals(optimizer, study_id)
+    if len(known) <= _checked_against.get(study_id, 0):
+        return 0
+    _checked_against[study_id] = len(known)
+    closed = 0
+    async with optimizer.db.session() as session:
+        parked = await session.scalars(
+            select(Trial).where(
+                Trial.study_id == study_id,
+                Trial.state == TrialState.PRUNED,
+                Trial.message == parked_as,
+            )
+        )
+        for trial in parked:
+            if (hit := refusals.repeated(trial.settings or {}, known)) is not None:
+                trial.state = TrialState.FAIL
+                trial.message = refusals.held_back(hit)
+                trial.finished_at = utcnow()
+                closed += 1
+    if closed:
+        log.warning("tasks.refusal_held_back", study_id=study_id, trials=closed)
+    return closed
+
+
+async def _nothing_scored(session: Any, study_id: int) -> str | None:
+    """Why a task that scored nothing failed, or ``None`` when it scored something or nothing
+    failed. Evolution's seeds were scored before the task began, so they do not count."""
+    scored = await session.scalar(
+        select(func.count()).where(
+            Trial.study_id == study_id,
+            Trial.state == TrialState.COMPLETE,
+            or_(Trial.generation.is_(None), Trial.generation != 0),
+        )
+    )
+    if scored:
+        return None
+    reasons = (
+        await session.execute(
+            select(Trial.message, func.count())
+            .where(Trial.study_id == study_id, Trial.state == TrialState.FAIL)
+            .group_by(Trial.message)
+        )
+    ).all()
+    if not reasons:
+        return None
+    # BRAIN's own words first: one refused batch says more than the many held back after it.
+    message, _ = max(reasons, key=lambda r: (str(r[0] or "").startswith(refusals.REFUSED), r[1]))
+    total = sum(n for _, n in reasons)
+    return f"None of its {total} simulations scored. {message or 'No reason was given.'}"
 
 
 async def prune_unsent(optimizer: Optimizer, study_id: int, *, everything: bool = False) -> int:
@@ -845,3 +962,130 @@ async def pause(optimizer: Optimizer, study_id: int) -> int | None:
         await prune_unsent(optimizer, study_id)
     await start_waiting(optimizer)
     return dropped
+
+
+if __name__ == "__main__":
+    import sys
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    import optuna as _optuna
+
+    from ..db.sqlite import Database
+    from ..engine.slots import BatchEngine
+    from .params import SETTINGS_SAMPLER
+
+    usa = {"region": "USA", "delay": 1, "universe": "TOP3000", "testPeriod": "P6Y3M0D"}
+    eur = {**usa, "region": "EUR", "universe": "TOP2500"}
+    refused_once = f"{refusals.REFUSED} — settings.testPeriod: Must be at most P6Y0M0D"
+    known = refusals.from_fields({"settings": {"testPeriod": ["too long"]}}, usa)
+
+    async def nothing(*_args: Any) -> None:
+        return None
+
+    async def refusals_end_to_end() -> dict[str, bool]:
+        found: dict[str, bool] = {}
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "harness.db")
+            try:
+                await db.create_all()
+                engine = SimpleNamespace(drop_queued=nothing, set_quota=nothing)
+                optimizer: Any = SimpleNamespace(
+                    db=db, engine=engine, notify=nothing, open_trials={}, studies={}
+                )
+
+                async def task(name: str, **params: Any) -> int:
+                    async with db.session() as session:
+                        row = Study(
+                            name=name,
+                            template_source="",
+                            sampler=SETTINGS_SAMPLER,
+                            task=name,
+                            status=StudyStatus.RUNNING,
+                            sampler_params={"region": "USA", "delay": 1, **params},
+                        )
+                        session.add(row)
+                        await session.flush()
+                        session.add(
+                            Trial(
+                                study_id=row.id,
+                                number=0,
+                                settings=usa,
+                                state=TrialState.FAIL,
+                                message=refused_once,
+                            )
+                        )
+                        return row.id
+
+                async def status(study_id: int) -> str:
+                    async with db.session() as session:
+                        row = await session.get(Study, study_id)
+                        return row.status if row else ""
+
+                refused = await task("refused")
+                await finish(optimizer, refused, StudyStatus.COMPLETE, "")
+                found["refused throughout ends Failed"] = await status(refused) == "FAILED"
+                stopped = await task("stopped", stopping=True)
+                await finish(optimizer, stopped, StudyStatus.COMPLETE, "")
+                found["a person's Stop stays Complete"] = await status(stopped) == "COMPLETE"
+
+                sweep = await task("sweep")
+                async with db.session() as session:
+                    session.add_all(
+                        Trial(
+                            study_id=sweep,
+                            number=n,
+                            settings=usa if n % 2 else eur,
+                            state=TrialState.PRUNED,
+                            message=PENDING_SEND,
+                        )
+                        for n in range(1, 11)
+                    )
+                closed = await close_refused(optimizer, sweep, PENDING_SEND)
+                found["only the refused market's parked trials close"] = closed == 5
+
+                async with db.session() as session:
+                    for n, settings in enumerate([usa, eur]):
+                        session.add(
+                            SimulationRecord(
+                                request_hash=f"h{n}",
+                                payload={"settings": settings},
+                                expression="rank(x)",
+                                sim_type="REGULAR",
+                                instrument_type="EQUITY",
+                                region=settings["region"],
+                                delay=1,
+                                language="FASTEXPR",
+                                task="queued",
+                                status=SimStatus.QUEUED,
+                            )
+                        )
+                engine_like: Any = SimpleNamespace(db=db, tracker=SimpleNamespace(notify=nothing))
+                held = await BatchEngine.hold_back(engine_like, "queued", known)
+                found["the engine holds back only the refused market"] = held == 1
+            finally:
+                await db.dispose()
+        return found
+
+    class _Lab:
+        @staticmethod
+        def field_choices(_space: Any) -> dict[str, Any]:
+            return {}
+
+        @staticmethod
+        def draw(trial: Any, _run: Any, _choices: Any) -> tuple[dict[str, Any], SimulationRequest]:
+            n = trial.suggest_int("n", 0, 1000)
+            settings = SimulationSettings.model_validate({**usa, "neutralization": "MARKET"})
+            return {"n": n}, SimulationRequest(settings=settings, regular=f"rank(x{n})")
+
+    _optuna.logging.set_verbosity(_optuna.logging.ERROR)
+    run = SearchParams(region="USA", delay=1, space={})
+    pruned, why = ask_points(_optuna.create_study(), _Lab, run, 10, {}, [], None, known)
+    asked, _ = ask_points(_optuna.create_study(), _Lab, run, 10, {}, [], None, set())
+    checks = asyncio.run(refusals_end_to_end())
+    checks["a refused market is never asked again"] = pruned == [] and why is not None
+    checks["an unrefused one is"] = len(asked) == 10
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"scheduler self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

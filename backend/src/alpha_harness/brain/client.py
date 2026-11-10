@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import httpx2
 import structlog
 
+from .connection import Connection, Link
 from .errors import (
     DAILY_LIMIT_DETAIL,
     BrainAuthError,
@@ -33,6 +34,7 @@ from .errors import (
     BrainError,
     BrainForbidden,
     BrainNotFound,
+    BrainPaused,
     BrainPollTimeout,
     BrainRateLimited,
     BrainServerError,
@@ -40,6 +42,7 @@ from .errors import (
     BrainTransportError,
     BrainValidationError,
     BrainVerificationRequired,
+    persona_url,
 )
 
 log = structlog.get_logger(__name__)
@@ -171,6 +174,8 @@ class BrainClient:
         #: its callers back off together instead of each retrying into a server that said
         #: stop. Per endpoint, so a throttled catalog crawl never holds up a simulation poll.
         self._resume_at: dict[str, float] = {}
+        #: Whether BRAIN can be asked anything now, moved by the answers below.
+        self.connection = Connection()
         self._client = httpx2.AsyncClient(
             base_url=self.base_url,
             timeout=httpx2.Timeout(TIMEOUT, connect=10.0),
@@ -311,6 +316,8 @@ class BrainClient:
         ``params`` values that are ``None`` are dropped.
         """
         clean_params = {k: v for k, v in params.items() if v is not None} if params else None
+        if self.connection.holds(path):
+            raise BrainPaused(f"{method} {path}: not sent while {self.connection.state}")
 
         bucket = self._bucket(path)
         # Re-checked after each sleep: another 429 may have pushed the pause further out.
@@ -340,6 +347,9 @@ class BrainClient:
             self._measure(bucket, response.headers)
         # Not connected, or no pooled connection free: the request never left.
         except (httpx2.ConnectError, httpx2.ConnectTimeout, httpx2.PoolTimeout) as exc:
+            if not isinstance(exc, httpx2.PoolTimeout):
+                # DNS or a refused connect: nothing will get through until the network does.
+                self.connection.move(Link.OFFLINE, f"{method} {path} could not connect: {exc}")
             raise BrainTransportError(
                 f"{method} {path} could not connect: {exc}", maybe_delivered=False
             ) from exc
@@ -368,9 +378,30 @@ class BrainClient:
             # would stop finished alphas being read.
             self._pause(bucket, min(result.retry_after, MAX_MEASURED_GAP))
 
+        self._judge(method, bucket, result)
         if raise_for_status and response.status_code >= 400:
             raise self.to_error(method, path, result)
         return result
+
+    def _judge(self, method: str, bucket: str, r: BrainResponse) -> None:
+        """Move :attr:`connection` by what this answer says about the session.
+
+        A success is proof the session works, except signing out. A 401 says it does not: an
+        identity check pending, or no session at all. Anything else says nothing about it.
+        """
+        if 200 <= r.status < 300 and not (method == "DELETE" and bucket == "authentication"):
+            self.connection.move(Link.CONNECTED)
+        elif r.status == 401:
+            inquiry, url = self._persona_challenge(r)
+            if inquiry:
+                self.connection.move(
+                    Link.VERIFYING,
+                    "BRAIN needs to verify your identity.",
+                    url=url or persona_url(self.base_url, inquiry),
+                    inquiry=inquiry,
+                )
+            else:
+                self.connection.move(Link.SIGNED_OUT, "BRAIN no longer accepts this session.")
 
     def _persona_challenge(self, r: BrainResponse) -> tuple[str | None, str | None]:
         """The Persona inquiry in a 401, and the URL to open to complete it.

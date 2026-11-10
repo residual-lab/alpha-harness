@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from ..brain.platform import (
     IGNORED_CHECKS,
+    IMPLAUSIBLE_SHARPE,
     PLATFORM_ALPHA_URL,
     POWER_POOL_CHECK,
     QUOTA_CHECKS,
@@ -155,6 +156,13 @@ def verdict(checks: list[dict[str, Any]], simulation_mode: str | None = None) ->
     return "pending"
 
 
+def implausible(*sharpes: Any) -> bool:
+    """Whether any of these Sharpe figures, missing ones skipped, is beyond
+    :data:`IMPLAUSIBLE_SHARPE` either way. Such an Alpha stays in the vault but is not offered
+    for submission, and the searches score it as a failure (labs.objectives)."""
+    return any(isinstance(s, int | float) and abs(s) > IMPLAUSIBLE_SHARPE for s in sharpes)
+
+
 #: Anything past UNSUBMITTED (ACTIVE, DECOMMISSIONED, ...) has been submitted.
 SUBMITTED = "(a.status IS NOT NULL AND a.status <> 'UNSUBMITTED')"
 
@@ -186,10 +194,14 @@ async def submittable(
     instrument_type: str | None = None,
     limit: int = 50,
     shortlist: bool = True,
+    show_implausible: bool = False,
 ) -> dict[str, Any]:
     """Every alpha that passed all of BRAIN's submission checks, best Sharpe first, and
     a shortlist of the few worth submitting. Without ``shortlist``, only the counts: no PnL is
     read for the shortlist, which across every market is most of the work.
+
+    An Alpha with an :func:`implausible` Sharpe in any period is left out and counted, unless
+    ``show_implausible``: a test-years step function would otherwise top the list.
 
     Alphas already submitted are left out, so nobody submits the same idea twice. Best
     Sharpe first is also most overfit first, so the shortlist ignores it: only Alphas
@@ -213,7 +225,6 @@ async def submittable(
     ready_ids, pending, near = await _tally(
         alphas, f"{' AND '.join(clauses)} AND a.checks IS NOT NULL", params
     )
-    total = len(ready_ids)
     placeholders = ", ".join("?" for _ in ready_ids)
     ready = (
         await alphas.catalog.query(
@@ -224,6 +235,15 @@ async def submittable(
         if ready_ids
         else []
     )
+    flagged = {
+        str(r["alpha_id"])
+        for r in ready
+        if implausible(r.get("train_sharpe"), r.get("test_sharpe"), r.get("sharpe"))
+    }
+    hidden = 0 if show_implausible else len(flagged)
+    if hidden:
+        ready = [r for r in ready if str(r["alpha_id"]) not in flagged]
+    total = len(ready)
 
     # Imported here: both modules read this one's check lists at import time.
     from ..labs.ga import independent, series_of
@@ -300,6 +320,8 @@ async def submittable(
         #: Still being judged by the platform. Shown so an empty list reads as
         #: "not yet" rather than "never".
         "pending": pending,
+        #: Submittable but left out for an implausible Sharpe, so the list says so.
+        "implausibleHidden": hidden,
         #: Failing one or two fixable checks, and nothing else.
         "nearMisses": near,
         #: Submittable, but their Sharpe collapsed in the held-out test years.

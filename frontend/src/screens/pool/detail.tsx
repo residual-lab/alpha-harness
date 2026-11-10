@@ -21,7 +21,14 @@ import {
   Skeleton,
 } from '@/ui/kit'
 import { Sheet, SheetSteps } from '@/ui/overlay'
-import { AlphaActionsMenu, AstInspector, checkFigure, OpenInBrain, RecheckButton } from './shared'
+import {
+  AlphaActionsMenu,
+  AstInspector,
+  checkFigure,
+  OpenInBrain,
+  RecheckButton,
+  useFlipSign,
+} from './shared'
 
 type Kind = 'self' | 'prod'
 const KIND_LABEL: Record<Kind, string> = {
@@ -106,6 +113,7 @@ function Body({ alphaId }: { alphaId: string }) {
     retry: false,
   })
   const [kinds, setKinds] = useState<Kind[]>([])
+  const flip = useFlipSign()
 
   if (detail.isPending) return <Skeleton className="h-60" />
   if (detail.isError) return <ErrorNotice error={detail.error} title="Could not load this Alpha" />
@@ -125,7 +133,8 @@ function Body({ alphaId }: { alphaId: string }) {
         </Button>
         <OpenInBrain url={d.brainUrl} />
         <RecheckButton alphaId={d.alphaId} />
-        <AlphaActionsMenu alphaId={d.alphaId} />
+        <AlphaActionsMenu alphaId={d.alphaId} {...flip.offer(d.alphaId, d.sharpe)} />
+        {flip.dialog}
       </div>
 
       <PnlSection alphaId={d.alphaId} />

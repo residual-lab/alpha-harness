@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, override
@@ -31,6 +32,7 @@ from .api import (
     catalog,
     chat,
     competitions,
+    diagnostics,
     ga,
     lab_tasks,
     llm,
@@ -62,6 +64,9 @@ if TYPE_CHECKING:
     from starlette.types import Scope
 
 log = structlog.get_logger(__name__)
+
+#: A request slower than this is logged by name.
+SLOW_SECONDS = 1.0
 
 DESCRIPTION = """
 Local research studio for the WorldQuant BRAIN platform.
@@ -165,7 +170,18 @@ def create_app() -> FastAPI:
         # Only the page sends this on reads too: a health check or a typed URL is not a tab.
         if request.headers.get("x-harness-client") == "1":
             page_seen.set()
-        return await call_next(request)
+        started = time.perf_counter()
+        response = await call_next(request)
+        # So the next "it's slow" report names the request that was.
+        if (took := time.perf_counter() - started) > SLOW_SECONDS:
+            log.warning(
+                "http.slow",
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+                seconds=round(took, 2),
+            )
+        return response
 
     install_exception_handlers(app)
 
@@ -189,6 +205,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(competitions.router)
     app.include_router(update.router)
+    app.include_router(diagnostics.router)
     app.include_router(preferences.router)
     app.include_router(ws.router)
 

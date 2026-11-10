@@ -3,16 +3,32 @@
  * chosen datasets or as typed values, with what it holds in this market beside it.
  */
 
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { DatabaseIcon, PencilIcon, RotateCcwIcon } from 'lucide-react'
 import { useState } from 'react'
-import type { DatasetRow } from '@/api/catalog'
+import { catalog, type DataFieldRow, type DatasetRow, type FieldFilter } from '@/api/catalog'
 import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { fmt } from '@/lib/format'
+import { useDebounced } from '@/lib/use-debounced'
 import { DatasetChips, useDatasetTree } from '@/screens/data/dataset-chips'
 import { DatasetPicker } from '@/screens/data/dataset-picker'
 import { describeFilter, type FieldFilterState } from '@/screens/data/state'
-import { Badge, Button, Chips, Empty, Field, Fieldset, Panel, Segmented, Textarea } from '@/ui/kit'
+import {
+  Badge,
+  Button,
+  Checkbox,
+  Chips,
+  Empty,
+  ErrorNotice,
+  Field,
+  Fieldset,
+  Input,
+  Panel,
+  Segmented,
+  Skeleton,
+  Textarea,
+} from '@/ui/kit'
 import { Sheet } from '@/ui/overlay'
 import type { FieldsVariable, VariableDef, VariableInfo } from './api'
 
@@ -294,16 +310,34 @@ function VariableEditor({
     initial?.kind === 'fields' ? (initial.vector_operators ?? []) : [],
   )
   const [values, setValues] = useState(initial?.kind === 'values' ? initial.values : '')
+  // The dataset of each field picked here. A variable searches only its datasets, so a picked
+  // field brings its own along, and unticking that dataset drops the field again.
+  const [homes, setHomes] = useState<Record<string, string>>({})
+  const picked = filter.field_ids ?? []
+  const brought = picked.flatMap((id) => homes[id] ?? [])
+  const datasets = [...new Set([...datasetIds, ...brought])]
+  const pickFields = (ids: string[], field?: DataFieldRow) => {
+    const home = field?.dataset_id
+    if (field && home) setHomes((h) => ({ ...h, [field.field_id]: home }))
+    setFilter(({ field_ids: _, ...f }) => (ids.length ? { ...f, field_ids: ids } : f))
+  }
+  const tickDatasets = (ids: string[]) => {
+    setDatasetIds(ids.filter((id) => datasetIds.includes(id) || !brought.includes(id)))
+    pickFields(picked.filter((id) => !homes[id] || ids.includes(homes[id])))
+  }
 
   // Types not chosen here follow where the template writes the variable, as the preview read it.
   const own = (filter.field_types ?? []).filter((t): t is FieldType =>
     TYPES.includes(t as FieldType),
   )
-  const types = own.length ? own : ((info?.fieldTypes ?? ['MATRIX']) as FieldType[])
+  // Matrix until the preview has read them: an undefined variable comes back with none.
+  const types = (
+    own.length ? own : info?.fieldTypes.length ? info.fieldTypes : ['MATRIX']
+  ) as FieldType[]
   const both = types.includes('MATRIX') && types.includes('VECTOR')
   const fields: FieldsVariable = {
     kind: 'fields',
-    dataset_ids: datasetIds,
+    dataset_ids: datasets,
     filter: Object.keys(filter).length ? filter : null,
     vector_operators: both ? wraps : [],
   }
@@ -390,8 +424,8 @@ function VariableEditor({
         ) : (
           <FieldsChoice
             scope={scope}
-            datasetIds={datasetIds}
-            setDatasetIds={setDatasetIds}
+            datasetIds={datasets}
+            setDatasetIds={tickDatasets}
             filter={filter}
             setFilter={setFilter}
             types={types}
@@ -399,6 +433,8 @@ function VariableEditor({
             vector={vector}
             wraps={wraps}
             setWraps={setWraps}
+            picked={picked}
+            onPick={pickFields}
             onMoreFilters={() => onMoreFilters(fields)}
           />
         )}
@@ -418,6 +454,8 @@ function FieldsChoice({
   vector,
   wraps,
   setWraps,
+  picked,
+  onPick,
   onMoreFilters,
 }: {
   scope: Scope
@@ -430,6 +468,8 @@ function FieldsChoice({
   vector: string[]
   wraps: string[]
   setWraps: (ops: string[]) => void
+  picked: string[]
+  onPick: (ids: string[], field?: DataFieldRow) => void
   onMoreFilters: () => void
 }) {
   return (
@@ -475,8 +515,128 @@ function FieldsChoice({
               />
             </Fieldset>
           )}
+          <FieldPicker
+            scope={scope}
+            filter={filter}
+            types={types}
+            picked={picked}
+            onChange={onPick}
+          />
         </>
       )}
     </DatasetPicker>
+  )
+}
+
+/**
+ * Exact fields, found by searching every dataset of the market. Matches are only fields the
+ * variable can take: of its types, and under its other filters.
+ */
+function FieldPicker({
+  scope,
+  filter,
+  types,
+  picked,
+  onChange,
+}: {
+  scope: Scope
+  filter: FieldFilterState
+  types: FieldType[]
+  picked: string[]
+  /** With the field just ticked, so its dataset can come along. */
+  onChange: (ids: string[], ticked?: DataFieldRow) => void
+}) {
+  const [search, setSearch] = useState('')
+  const typed = useDebounced(search.trim(), 250)
+  const body: FieldFilter = {
+    ...filter,
+    search: typed,
+    search_mode: 'smart',
+    dataset_ids: [],
+    field_ids: [],
+    field_types: types,
+    // The most used first: ranked by relevance, `close` falls behind every id that repeats it.
+    sort_by: 'alpha_count',
+    limit: 50,
+  }
+  const found = useQuery({
+    queryKey: ['catalog', 'fields', scope, body],
+    queryFn: ({ signal }) => catalog.fields(scope, body, signal),
+    enabled: typed !== '',
+    placeholderData: keepPreviousData,
+  })
+  const rows = found.data?.results ?? []
+  const total = found.data?.total ?? 0
+
+  return (
+    <Fieldset
+      legend="Exact Fields"
+      hint="Search every dataset in this market and tick fields: with any ticked, the variable takes only those."
+    >
+      {picked.length > 0 && (
+        <Chips
+          label="Exact Fields"
+          value={picked}
+          onChange={(kept) => onChange(kept)}
+          items={picked.map((id) => ({
+            value: id,
+            title: 'Remove this field',
+            label: (
+              <>
+                <span className="num">{id}</span> <span className="text-ink-subtle">×</span>
+              </>
+            ),
+          }))}
+        />
+      )}
+      <Input
+        placeholder="Search Field ID or Description"
+        aria-label="Search fields to pick"
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+      />
+      {typed !== '' &&
+        (found.isError ? (
+          <ErrorNotice error={found.error} title="Could not search the fields" />
+        ) : (
+          <div
+            role="group"
+            aria-label="Matching fields"
+            className="flex max-h-60 flex-col overflow-y-auto rounded-md border border-hairline py-1"
+          >
+            {found.isPending ? (
+              <Skeleton className="mx-3 my-2 h-12" />
+            ) : rows.length === 0 ? (
+              <p className="px-3 py-2 text-body-compact text-ink-subtle">No field matches.</p>
+            ) : (
+              rows.map((row) => (
+                <Checkbox
+                  key={row.field_id}
+                  className="flex px-3 py-1.5 hover:bg-surface-2"
+                  checked={picked.includes(row.field_id)}
+                  onChange={(on) =>
+                    on
+                      ? onChange([...picked, row.field_id], row)
+                      : onChange(picked.filter((id) => id !== row.field_id))
+                  }
+                  label={
+                    <>
+                      <span className="num truncate text-body-compact">{row.field_id}</span>
+                      <span className="truncate text-caption text-ink-subtle">
+                        {[row.dataset_id, row.description].filter(Boolean).join(' · ')}
+                      </span>
+                    </>
+                  }
+                />
+              ))
+            )}
+            {total > rows.length && (
+              <p className="px-3 py-1.5 text-caption text-ink-subtle">
+                The first {fmt.int(rows.length)} of {fmt.int(total)}: type more to narrow them.
+              </p>
+            )}
+          </div>
+        ))}
+    </Fieldset>
   )
 }

@@ -14,7 +14,7 @@
 //! an install it made carries straight over.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -54,6 +54,11 @@ const SERVED_FILE: &str = "served.json";
 const OUTGROWN_FILE: &str = "launcher-upgrade.txt";
 const ACTIVE_FILE: &str = "active-slot.txt";
 const LOCK_FILE: &str = "running.lock";
+/// This program's path, for an app the old launcher started to hand over to.
+const DESKTOP_FILE: &str = "desktop-app.txt";
+/// How long the folder's lock is waited for. An app the old launcher started opens this program
+/// and exits, and the old launcher lets go of the lock only once it sees that.
+const CLAIM_WAIT: Duration = Duration::from_secs(15);
 const LOG_FILE: &str = "launcher.log";
 /// Past this the log starts afresh beside one previous file: the app writes to it as it works.
 const LOG_LIMIT: u64 = 10 * 1024 * 1024;
@@ -64,6 +69,9 @@ const APP_PORT: u16 = 8000;
 const SLOTS: [&str; 2] = ["a", "b"];
 /// Long enough for a cold `uv` to fetch `CPython` and ~330 MB of wheels on a slow line.
 const INSTALL_TIMEOUT: Duration = Duration::from_mins(30);
+/// Tries at the whole install before giving up: a slow line drops a download now and then, and
+/// uv's cache keeps whatever already arrived.
+const INSTALL_ATTEMPTS: u32 = 3;
 /// How long the app is given to close itself before it is terminated. Worth waiting for: a
 /// clean exit unwinds uvicorn's lifespan, which releases `DuckDB`'s single-writer lock.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -476,11 +484,17 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Run `uv`, its errors into the log; give up after [`INSTALL_TIMEOUT`].
-fn run_uv(uv: &Path, arguments: &[&str]) -> Result<(), String> {
+/// Run `uv`, its progress on the start-up page and its errors into the log; give up after
+/// [`INSTALL_TIMEOUT`].
+fn run_uv(app: &AppHandle, uv: &Path, arguments: &[&str], downloads: u32) -> Result<(), String> {
     let mut command = Command::new(uv);
     command
         .args(arguments)
+        // uv's 30 s default failed first installs on slow lines; two minutes still bounds a
+        // stalled connection, and fewer downloads at once do not starve each other.
+        .env("UV_HTTP_TIMEOUT", "120")
+        .env("UV_HTTP_RETRIES", "5")
+        .env("UV_CONCURRENT_DOWNLOADS", downloads.to_string())
         // uv keeps its Python builds and cache inside the folder, so uninstalling is deleting
         // one folder and nothing is left behind in the user's profile.
         .env("UV_PYTHON_INSTALL_DIR", root().join("python"))
@@ -501,13 +515,28 @@ fn run_uv(uv: &Path, arguments: &[&str]) -> Result<(), String> {
     if !job::adopt(&child) {
         note("could not tie uv to this program's lifetime");
     }
-    let mut stderr = child.stderr.take();
+    let stderr = child.stderr.take();
+    let page = app.clone();
     let reader = thread::spawn(move || {
         let mut text = String::new();
-        if let Some(stderr) = stderr.as_mut() {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            text = String::from_utf8_lossy(&bytes).into_owned();
+        let Some(stderr) = stderr else { return text };
+        let mut stderr = BufReader::new(stderr);
+        let mut line = Vec::new();
+        while stderr
+            .read_until(b'\n', &mut line)
+            .is_ok_and(|read| read > 0)
+        {
+            let piece = String::from_utf8_lossy(&line);
+            // Shown as it arrives, so nobody closes an install that is still moving.
+            let shown = piece.trim();
+            if ["Download", "Resolved", "Prepared", "Installed"]
+                .iter()
+                .any(|step| shown.starts_with(step))
+            {
+                let _ = page.emit("startup-detail", shown);
+            }
+            text.push_str(&piece);
+            line.clear();
         }
         text
     });
@@ -556,7 +585,13 @@ fn run_uv(uv: &Path, arguments: &[&str]) -> Result<(), String> {
 ///
 /// Rebuilding rather than upgrading in place costs no download — the wheels are in uv's
 /// cache from the last install — and a slot never carries a package left by an old version.
-fn install(uv: &Path, slot: &str, version: &str, wheel: Option<String>) -> Result<(), String> {
+fn install(
+    app: &AppHandle,
+    uv: &Path,
+    slot: &str,
+    version: &str,
+    wheel: Option<String>,
+) -> Result<(), String> {
     let base = download();
     // A development build installs a wheel built from this checkout (`uv build` leaves
     // constraints.txt beside it), since no release exists for its 0.0.0.
@@ -581,23 +616,51 @@ fn install(uv: &Path, slot: &str, version: &str, wheel: Option<String>) -> Resul
     // The marker goes first: a half-built slot must never read as a working one.
     let _ = fs::remove_file(marker(slot));
     let venv = root().join(format!("venv-{slot}"));
-    let _ = fs::remove_dir_all(&venv);
-    run_uv(uv, &["venv", "--python", "3.14", &venv.to_string_lossy()])?;
-    // Constrained to the versions the release was locked against, so a dependency publishing a
-    // breaking version cannot break an install that worked yesterday.
     let python = venv_python(slot);
-    run_uv(
-        uv,
-        &[
-            "pip",
-            "install",
-            "--python",
-            &python.to_string_lossy(),
-            "-c",
-            &constraints,
-            &wheel,
-        ],
-    )?;
+    let mut attempt = 1;
+    loop {
+        let _ = fs::remove_dir_all(&venv);
+        // One download at a time once a try has failed: on a contended line, two still can.
+        let downloads = if attempt == 1 { 2 } else { 1 };
+        let tried = run_uv(
+            app,
+            uv,
+            &["venv", "--python", "3.14", &venv.to_string_lossy()],
+            downloads,
+        )
+        .and_then(|()| {
+            // Constrained to the versions the release was locked against, so a dependency
+            // publishing a breaking version cannot break an install that worked yesterday.
+            run_uv(
+                app,
+                uv,
+                &[
+                    "pip",
+                    "install",
+                    "--python",
+                    &python.to_string_lossy(),
+                    "-c",
+                    &constraints,
+                    &wheel,
+                ],
+                downloads,
+            )
+        });
+        match tried {
+            Err(error) if attempt < INSTALL_ATTEMPTS && !QUITTING.load(Ordering::SeqCst) => {
+                note(&format!("install attempt {attempt} failed: {error}"));
+                attempt += 1;
+                status(
+                    app,
+                    &format!(
+                        "The download was interrupted. Trying again ({attempt} of \
+                         {INSTALL_ATTEMPTS}), one file at a time…"
+                    ),
+                );
+            }
+            result => break result?,
+        }
+    }
     let body = json!({"version": version, "served": false});
     write_atomic(&marker(slot), body.to_string())
         .map_err(|e| format!("could not record the install: {e}"))?;
@@ -965,7 +1028,7 @@ fn supervise(app: &AppHandle, uv: &Path) -> i32 {
                     )
                 },
             );
-            match install(uv, target, &wanted, requested_wheel(&wanted)) {
+            match install(app, uv, target, &wanted, requested_wheel(&wanted)) {
                 Ok(()) => {
                     activate(target);
                     slot = target;
@@ -1057,7 +1120,16 @@ fn run(app: &AppHandle) -> i32 {
         return 1;
     }
     note(&format!("Alpha Harness {BUILD_VERSION} (desktop)"));
-    if !claim() {
+    let deadline = Instant::now() + CLAIM_WAIT;
+    let mut claimed = claim();
+    if !claimed {
+        status(app, "Waiting for the previous launcher to close…");
+    }
+    while !claimed && Instant::now() < deadline {
+        thread::sleep(POLL);
+        claimed = claim();
+    }
+    if !claimed {
         let message = if SLOTS.into_iter().any(|s| slot_version(s).is_some()) {
             "Alpha Harness is already running from its previous launcher, or an install it began is \
              still finishing. Quit it from its tray icon or the account menu, or wait a minute, \
@@ -1068,6 +1140,12 @@ fn run(app: &AppHandle) -> i32 {
         };
         fail(app, message);
         return 0;
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Err(error) =
+            write_atomic(&root().join(DESKTOP_FILE), exe.to_string_lossy().as_bytes())
+    {
+        note(&format!("could not record where this program is: {error}"));
     }
     #[cfg(target_os = "linux")]
     forget_old_launcher();

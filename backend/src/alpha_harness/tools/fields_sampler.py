@@ -564,7 +564,9 @@ async def expand(optimizer: Any, row: Any) -> int:
                             Trial.study_id == row.id, Trial.number.in_(set(full_of.values()))
                         )
                     )
-                ).tuples()
+                )
+                .tuples()
+                .all()
             )
             for parent in winners:
                 if room <= 0:
@@ -669,6 +671,67 @@ if __name__ == "__main__":
             "rank(pe) + rank(ebitda)",
         ],
     )
+
+    async def full_run_wins() -> int:
+        """``expand`` once a winner's Full re-run is back: it reads where the Quick trial sat
+        in the tree. That read once indexed a SQLAlchemy ``Result`` as a mapping."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from ..db.models import Study, StudyStatus
+        from ..db.sqlite import Database
+        from ..labs.params import FIELDS_SAMPLER
+
+        passing = {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 2}]}
+        usa = {"region": "USA", "delay": 1, "universe": "TOP3000", "instrumentType": "EQUITY"}
+        # No data field, so there is nothing to swap and the catalog is never read.
+        alpha = "rank(1)"
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "harness.db")
+            try:
+                await db.create_all()
+                async with db.session() as session:
+                    study = Study(
+                        name="fields",
+                        template_source=alpha,
+                        sampler=FIELDS_SAMPLER,
+                        sampler_params=FieldsSamplerParams(region="USA", delay=1).dump(),
+                        task="fields",
+                        status=StudyStatus.RUNNING,
+                    )
+                    session.add(study)
+                    await session.flush()
+                    session.add_all(
+                        [
+                            Trial(
+                                study_id=study.id,
+                                number=0,
+                                expression=alpha,
+                                settings=usa,
+                                generation=1,
+                                state=TrialState.COMPLETE,
+                                result={**passing, "quick": True},
+                            ),
+                            Trial(
+                                study_id=study.id,
+                                number=1,
+                                params={"fullOf": 0},
+                                expression=alpha,
+                                settings={**usa, "simulationMode": "FULL"},
+                                state=TrialState.COMPLETE,
+                                result=passing,
+                            ),
+                        ]
+                    )
+                async with db.session() as session:
+                    row = await session.get(Study, study.id)
+                optimizer = SimpleNamespace(db=db, alphas=SimpleNamespace(catalog=None))
+                return await expand(optimizer, row)
+            finally:
+                await db.dispose()
+
+    checks["a Full re-run's win expands"] = (asyncio.run(full_run_wins()), 0)
     wrong = [f"{name}: {got!r}" for name, (got, want) in checks.items() if got != want]
     if wrong:
         raise SystemExit(f"fields sampler self-check failed: {'; '.join(wrong)}")

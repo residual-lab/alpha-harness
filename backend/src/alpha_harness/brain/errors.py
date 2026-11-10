@@ -205,5 +205,12 @@ class BrainTransportError(BrainError):
         self.maybe_delivered = maybe_delivered
 
 
+class BrainPaused(BrainError):
+    """Never sent: a background request while BRAIN cannot be asked anything (offline, or the
+    session waits on the person). Retried once the connection is back (``brain.connection``)."""
+
+    retryable = True
+
+
 class BrainPollTimeout(BrainError):
     """An asynchronous job kept returning ``Retry-After`` past our ceiling."""

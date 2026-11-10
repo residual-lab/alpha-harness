@@ -11,12 +11,13 @@ if the series are kept. The stored series rebuilds the platform's own figures (s
 import asyncio
 import itertools
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import structlog
 
+from ..brain.filters import PLATFORM_TZ
 from ..db.duck import ALPHA_COLUMNS, TRAIN_COLUMNS, Catalog
 from . import metrics
 from .yields import SUBMITTED, checks_of, children_check, limits_of, without_quota_checks
@@ -342,6 +343,7 @@ def _page_row(r: dict[str, Any]) -> dict[str, Any]:
         "trainSharpe": r["train_sharpe"],
         "testSharpe": r["test_sharpe"],
         "standingRegion": r.get("standing_region"),
+        "tags": json_list(r["tags"]),
     }
 
 
@@ -408,6 +410,13 @@ def _as_date(value: Any) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
+
+
+def _day_starts(day: date) -> datetime:
+    """When ``day`` starts on BRAIN's clock, which its Date Created counts days on, in the
+    naive UTC the vault keeps times in."""
+    start = datetime(day.year, day.month, day.day, tzinfo=PLATFORM_TZ)
+    return start.astimezone(UTC).replace(tzinfo=None)
 
 
 class AlphaVault:
@@ -580,6 +589,19 @@ class AlphaVault:
         kept = json.dumps(without_quota_checks(checks))
         await self.catalog.upsert("alpha", ("alpha_id", "checks"), [(alpha_id, kept)])
 
+    async def save_tags(self, tags: dict[str, list[str]]) -> None:
+        """Replace stored Alphas' tags and touch nothing else. An update, not an upsert: an
+        Alpha not stored yet arrives whole with the next sync, not as a row of tags alone."""
+        if tags:
+            await self.catalog.execute(
+                """
+                UPDATE alpha SET tags = t.tags
+                FROM (SELECT unnest(?::VARCHAR[]) AS alpha_id, unnest(?::VARCHAR[]) AS tags) t
+                WHERE alpha.alpha_id = t.alpha_id
+                """,
+                [list(tags), [json.dumps(kept) for kept in tags.values()]],
+            )
+
     # -- reading ---------------------------------------------------------
 
     async def counts(self) -> dict[str, Any]:
@@ -615,6 +637,17 @@ class AlphaVault:
             ORDER BY alphas DESC
             """
         )
+
+    async def tags(self) -> list[str]:
+        """Every tag the Alphas the Simulations table lists carry, for its tag filter."""
+        rows = await self.catalog.query(
+            """
+            SELECT DISTINCT unnest(from_json(tags, '["VARCHAR"]')) AS tag FROM alpha
+            WHERE date_created IS NOT NULL
+            ORDER BY tag
+            """
+        )
+        return [str(r["tag"]) for r in rows]
 
     async def evolvable_markets(self) -> list[dict[str, Any]]:
         """Equity scopes holding unsubmitted alphas the Evolution Lab would take as seeds.
@@ -656,11 +689,17 @@ class AlphaVault:
         minimum: dict[str, float] | None = None,
         maximum: dict[str, float] | None = None,
         search: str | None = None,
+        tags: list[str] | None = None,
+        created_after: date | None = None,
+        created_before: date | None = None,
         evolvable: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
         """One page of the Simulations table: sorted, filtered, with the total.
+
+        ``tags`` keeps Alphas carrying any of them. ``created_after`` and ``created_before``
+        are days on BRAIN's clock, both included, as its own date filter reads them.
 
         ``evolvable`` keeps only what the Evolution Lab can breed from. The same predicate
         the lab itself enforces, so the table offering an Alpha and the lab accepting it can
@@ -687,9 +726,20 @@ class AlphaVault:
                 params.extend(values)
         for bounds, op in ((minimum, ">="), (maximum, "<=")):
             for key, value in (bounds or {}).items():
+                # Bounds are numbers, and DuckDB refuses to compare a timestamp with one,
+                # failing the whole page: dates have bounds of their own, below.
                 if key in ALPHA_METRICS and not key.startswith("date_"):
                     clauses.append(f"({ALPHA_METRICS[key]}) {op} ?")
                     params.append(value)
+        if created_after:
+            clauses.append("a.date_created >= ?")
+            params.append(_day_starts(created_after))
+        if created_before:
+            clauses.append("a.date_created < ?")
+            params.append(_day_starts(created_before + timedelta(days=1)))
+        if tags:
+            clauses.append("""list_has_any(from_json(a.tags, '["VARCHAR"]'), ?::VARCHAR[])""")
+            params.append(tags)
         if search:
             needle = f"%{search.lower()}%"
             clauses.append(
@@ -716,7 +766,7 @@ class AlphaVault:
                        a.fitness, a.turnover, a.returns, a.drawdown, a.margin,
                        a.operator_count, {ALPHA_METRICS["calmar"]} AS calmar,
                        a.date_created, a.date_submitted, a.long_count, a.short_count,
-                       a.max_trade, a.max_position, a.classifications, a.pyramids,
+                       a.max_trade, a.max_position, a.classifications, a.pyramids, a.tags,
                        a.train_sharpe, a.test_sharpe, {standing}, {order} AS sort_key
                 FROM {source} a
                 WHERE {where}
@@ -984,3 +1034,66 @@ class AlphaVault:
             list(alpha_ids),
         )
         return {str(r["alpha_id"]): r for r in rows}
+
+
+if __name__ == "__main__":
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    async def filtered() -> dict[str, bool]:
+        with tempfile.TemporaryDirectory() as folder:
+            catalog = Catalog(Path(folder) / "catalog.duckdb")
+            await catalog.open()
+            try:
+                vault = AlphaVault(catalog)
+                # 03:30 UTC on Oct 8 is still Oct 7 on BRAIN's New York clock.
+                created = {
+                    "late": (datetime(2026, 10, 8, 3, 30, tzinfo=UTC), ["momentum", "café"]),
+                    "next": (datetime(2026, 10, 8, 4, 30, tzinfo=UTC), ["value"]),
+                    "bare": (datetime(2026, 10, 9, 12, tzinfo=UTC), None),
+                }
+                await catalog.upsert(
+                    "alpha",
+                    ("alpha_id", "date_created", "tags", "status"),
+                    [
+                        (a, at, None if tags is None else json.dumps(tags), "UNSUBMITTED")
+                        for a, (at, tags) in created.items()
+                    ],
+                )
+
+                async def ids(**filters: Any) -> list[str]:
+                    page = await vault.page(sort_by="date_created", sort_desc=False, **filters)
+                    return [r["alphaId"] for r in page["results"]]
+
+                oct7, oct8 = date(2026, 10, 7), date(2026, 10, 8)
+                found = {
+                    "after a day, by BRAIN's clock": await ids(created_after=oct8)
+                    == ["next", "bare"],
+                    "before a day, that day included": await ids(created_before=oct7) == ["late"],
+                    "one day": await ids(created_after=oct8, created_before=oct8) == ["next"],
+                    "a date bound among the numbers is ignored": len(
+                        await ids(minimum={"date_created": 1.0})
+                    )
+                    == 3,
+                    "a tag": await ids(tags=["momentum"]) == ["late"],
+                    "any of several tags": await ids(tags=["café", "value"]) == ["late", "next"],
+                    "rows carry their tags": (await vault.page(tags=["momentum"]))["results"][0][
+                        "tags"
+                    ]
+                    == ["momentum", "café"],
+                    "every tag, once": await vault.tags() == ["café", "momentum", "value"],
+                }
+                await vault.save_tags({"bare": ["value"], "unstored": ["value"]})
+                found |= {
+                    "saved tags filter at once": await ids(tags=["value"]) == ["next", "bare"],
+                    "an Alpha not stored is not written": await vault.by_ids(["unstored"]) == {},
+                }
+                return found
+            finally:
+                await catalog.close()
+
+    checks = asyncio.run(filtered())
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"vault store self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

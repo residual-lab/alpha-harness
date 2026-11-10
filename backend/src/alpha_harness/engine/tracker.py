@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from sqlalchemy import func, select, update
 
+from ..brain.connection import background
 from ..brain.errors import (
     BrainAuthError,
     BrainDailyLimitReached,
@@ -28,6 +29,7 @@ from ..brain.errors import (
 from ..brain.filters import platform_midnight
 from ..brain.schemas import SimulationStatus
 from ..db.models import ACTIVE, QuotaSnapshot, SimStatus, SimulationRecord, utcnow
+from ..labs.refusals import REFUSED
 from ..tasks import spawn
 from . import reconcile
 from .lifecycle import (
@@ -61,6 +63,9 @@ DEFAULT_POLL_SECONDS = 3.0
 PENDING_GRACE_SECONDS = 120.0
 #: How often stale sends are looked for after startup.
 SWEEP_SECONDS = 60.0
+#: A simulation answering a server error is read again after this, doubling while it keeps
+#: failing: a lost one was read ~120 times at a flat 15 s before it was given up on.
+ERROR_RETRY_SECONDS, ERROR_RETRY_MAX = 15.0, 240.0
 #: How long one simulation may answer every read with a server error, while BRAIN answers
 #: everything else, before it is given up on. BRAIN occasionally loses one: it then can
 #: neither report on it nor cancel it, and waiting on it holds a core for good.
@@ -99,6 +104,8 @@ class SimulationTracker:
         self._next_poll: dict[str, float] = {}
         #: Platform id -> monotonic time its reads started failing with a server error.
         self._failing_since: dict[str, float] = {}
+        #: Server errors in a row per simulation, which space its next read out.
+        self._errors: dict[str, int] = {}
         #: Adopted rows this process is sending right now. Their ``created_at`` is when
         #: they were queued, so without this the stale-send check could orphan one
         #: mid-request.
@@ -167,11 +174,12 @@ class SimulationTracker:
         except BrainValidationError as exc:
             # Pass the platform's own wording through untouched — "TOP9000 is not a
             # valid choice" tells the researcher what to fix; "rejected" does not.
-            reason = describe_fields(exc.fields, exc.message)
+            # Worded as a refused batch is, so the task learns the refusal either way.
+            reason = f"{REFUSED} — {describe_fields(exc.fields, exc.message)}"
             await self._mark(
                 record_id, SimStatus.REJECTED, message=reason, from_=[SimStatus.PENDING]
             )
-            raise SubmissionFailed(f"BRAIN rejected these settings — {reason}", cause=exc) from exc
+            raise SubmissionFailed(reason, cause=exc) from exc
         except BrainError as exc:
             if exc.maybe_delivered:
                 # The POST may be running on BRAIN with its id lost in transit. Resending
@@ -436,6 +444,7 @@ class SimulationTracker:
 
     async def _run(self) -> None:
         """Poll every active simulation, honouring each one's Retry-After."""
+        background()
         while True:
             try:
                 await self._tick()
@@ -507,6 +516,9 @@ class SimulationTracker:
         """
         if time.monotonic() < self._next_poll.get(platform_id, 0.0):
             return None
+        if self.endpoints.client.connection.holds("/simulations"):
+            # Offline or signed out: not due until the connection is back, and nothing logged.
+            return None
         try:
             response = await self.endpoints.read_simulation(platform_id)
         except BrainError as exc:
@@ -521,6 +533,7 @@ class SimulationTracker:
         outcome = read_outcome(response.status, response.body, response.retry_after)
         if outcome.kind != "retry" or response.status < 500:
             self._failing_since.pop(platform_id, None)
+            self._errors.pop(platform_id, None)
         elif await self._lost(platform_id):
             log.warning("sim.lost", platform_id=platform_id)
             outcome, body = Outcome("gone", SimStatus.ERROR, message=LOST), {}
@@ -533,12 +546,17 @@ class SimulationTracker:
                 # A 403, 429 or 5xx is not a result: treating it as one would close a
                 # running simulation with no alpha and stop polling it.
                 log.warning("sim.poll_error", platform_id=platform_id, status=response.status)
-                self._next_poll[platform_id] = now + (outcome.delay or 15.0)
+                wait = ERROR_RETRY_SECONDS
+                if response.status >= 500:
+                    errors = self._errors[platform_id] = self._errors.get(platform_id, 0) + 1
+                    wait = min(ERROR_RETRY_SECONDS * 2 ** (errors - 1), ERROR_RETRY_MAX)
+                self._next_poll[platform_id] = now + (outcome.delay or wait)
             case "unauthorized":
                 self._next_poll[platform_id] = now + 10.0
             case "fanout" | "gone" | "finished":
                 self._next_poll.pop(platform_id, None)
                 self._failing_since.pop(platform_id, None)
+                self._errors.pop(platform_id, None)
         return outcome, body
 
     async def _lost(self, platform_id: str) -> bool:

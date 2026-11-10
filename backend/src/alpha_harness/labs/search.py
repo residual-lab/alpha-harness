@@ -250,6 +250,11 @@ def suggest(
         if len(neutralizations) == 1
         else trial.suggest_categorical("neutralization", neutralizations)
     )
+    # A task added before decays were searched has none here and holds its one ``decay``.
+    if decays := list(space.get("decays") or ()):
+        params["decay"] = (
+            decays[0] if len(decays) == 1 else trial.suggest_categorical("decay", decays)
+        )
     return params
 
 
@@ -270,7 +275,7 @@ def request_for(params: dict[str, Any], run: SearchParams) -> SimulationRequest:
             delay=run.delay,
             universe=params["universe"],
             neutralization=params["neutralization"],
-            decay=run.decay,
+            decay=params.get("decay", run.decay),
             truncation=TRUNCATION,
         ),
         # A task added before backfills followed the category carries every field 21 days.
@@ -395,3 +400,34 @@ def draw(
     """One point of the search and the simulation it becomes (see ``labs.scheduler``)."""
     params = suggest(trial, run.space, choices)
     return params, request_for(params, run)
+
+
+if __name__ == "__main__":
+    import random
+    import sys
+
+    from .params import SearchParams
+
+    space: dict[str, Any] = {
+        "fields": {"close": "MATRIX"},
+        "families": ["cs"],
+        "cs": ["rank"],
+        "universes": ["TOP3000"],
+        "neutralizations": ["MARKET"],
+        "decays": [4, 12, 20],
+    }
+
+    def decays_sent(space: dict[str, Any], held: int = 0) -> set[int]:
+        run = SearchParams(region="USA", delay=1, decay=held, space=space)
+        drawn = [draw(RandomTrial(random.Random(n)), run, field_choices(space)) for n in range(40)]
+        return {request.settings.decay for _, request in drawn if request is not None}
+
+    before = {k: v for k, v in space.items() if k != "decays"}
+    checks = {
+        "several decays are searched": decays_sent(space) == {4, 12, 20},
+        "one decay is held": decays_sent({**space, "decays": [300]}) == {300},
+        "a task added before decays were searched holds its own": decays_sent(before, 5) == {5},
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"search self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

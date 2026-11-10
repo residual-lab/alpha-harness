@@ -41,7 +41,7 @@ from ..brain.schemas import SimulationRequest, SimulationSettings
 from ..db.models import Study, Trial, TrialState
 from ..vault.metrics import MIN_OVERLAP
 from ..vault.store import EVOLVABLE_TYPES, SEEDABLE
-from ..vault.yields import SUBMITTED, checks_of, is_submitted, limits_of
+from ..vault.yields import SUBMITTED, checks_of, implausible, is_submitted, limits_of
 from . import search
 from .fastexpr import (
     Node,
@@ -420,14 +420,17 @@ def mutate(
     rate: float,
     *,
     force: bool = False,
+    keep_decay: bool = False,
 ) -> tuple[Node, dict[str, Any]]:
-    """Change each gene with probability ``rate``; with ``force``, at least one."""
+    """Change each gene with probability ``rate``; with ``force``, at least one where any can
+    change. ``keep_decay`` leaves the decay as it was inherited."""
     moves: list[tuple[Path, str]] = market.genes(tree)
     if any(n != settings["neutralization"] for n in market.neutralizations):
         moves.append(((), "neutralization"))
-    moves.append(((), "decay"))
+    if not keep_decay:
+        moves.append(((), "decay"))
     chosen = [move for move in moves if rng.random() < rate]
-    if force and not chosen:
+    if force and not chosen and moves:
         chosen = [rng.choice(moves)]
     settings = dict(settings)
     # Every new value is drawn in the order chosen, then written in one pass: a value depends
@@ -477,9 +480,11 @@ def child(
     market: Market,
     rate: float,
     shapes: dict[Node, Shape],
+    *,
+    keep_decay: bool = False,
 ) -> tuple[Node, dict[str, Any]] | None:
     """A valid child of ``a`` and ``b`` that is neither of them, or ``None`` after ten tries.
-    ``shapes`` holds each parent tree's :class:`Shape`."""
+    ``shapes`` holds each parent tree's :class:`Shape`; ``keep_decay`` is :func:`mutate`'s."""
     shape_a, shape_b = shapes[a.tree], shapes[b.tree]
     genes = shape_a.genes
     same = shape_a.skeleton == shape_b.skeleton
@@ -506,9 +511,11 @@ def child(
             "decay": rng.choice((a.decay, b.decay)),
             "truncation": left.truncation,
         }
-        tree, settings = mutate(rng, tree, settings, market, rate)
+        tree, settings = mutate(rng, tree, settings, market, rate, keep_decay=keep_decay)
         if clone(tree, settings):
-            tree, settings = mutate(rng, tree, settings, market, 0.0, force=True)
+            tree, settings = mutate(
+                rng, tree, settings, market, 0.0, force=True, keep_decay=keep_decay
+            )
         if clone(tree, settings) or validate(tree, market.table, market.names):
             continue
         return tree, settings
@@ -747,6 +754,8 @@ async def breed(
                         Trial.study_id == row.id,
                         Trial.state == TrialState.COMPLETE,
                         score > FAILURE,
+                        # Bred from, a straight line fills the population with its children.
+                        func.coalesce(func.json_extract(Trial.result, "$.implausible"), 0) == 0,
                         Trial.number.not_in(superseded),
                     )
                     .order_by(searched.desc(), Trial.number)
@@ -782,7 +791,7 @@ async def breed(
         if len(out) >= want:
             break
         a, b = rng.choice(parents), rng.choice(parents)
-        made = child(rng, a, b, market, rate, shapes)
+        made = child(rng, a, b, market, rate, shapes, keep_decay=run.keep_decay)
         if made is None:
             continue
         request = request_for(*made, run)
@@ -836,6 +845,9 @@ def seed_row(row: dict[str, Any]) -> dict[str, Any]:
             k: row.get(k)
             for k in ("sharpe", "fitness", "turnover", "returns", "drawdown", "margin")
         },
+        # Shown, never bred on: the held-out years stay out of sample.
+        "testSharpe": row.get("test_sharpe"),
+        "testFitness": row.get("test_fitness"),
         "score": round(score, 4) if math.isfinite(score) else None,
         "limits": limits_of(checks_of(row.get("checks"))),
     }
@@ -874,12 +886,16 @@ async def auto_seeds(
     rows = [
         r
         for r in stood.values()
-        if (train_figure(r, "sharpe") or 0) > 0 and train_figure(r, "fitness") is not None
+        if (train_figure(r, "sharpe") or 0) > 0
+        and train_figure(r, "fitness") is not None
+        and not implausible(train_figure(r, "sharpe"))
     ]
     kept: list[dict[str, Any]] = []
     kept_series: dict[str, Profile] = {}
     reasons: list[dict[str, str]] = []
     examined = 0
+    first_error: Exception | None = None
+    errors = 0
     # Off the event loop: a market holds tens of thousands, and each score parses its checks.
     ranked = await asyncio.to_thread(lambda: sorted(rows, key=seed_score, reverse=True))
     for row in ranked:
@@ -887,26 +903,81 @@ async def auto_seeds(
             break
         examined += 1
         alpha_id = str(row["alpha_id"])
-        problem = unreadable(row["expression"], market)
         own: Profile | None = None
-        if problem is None:
-            regions: dict[str, str] = row.get("region_series") or {str(row["region"]): alpha_id}
-            days = await state.alphas.train_pnl(list(regions.values()))
-            missing = [s for s in regions.values() if s not in days]
-            # A family's regions together: four at most, the width every BRAIN read here uses.
-            await asyncio.gather(*(_download(state, s) for s in missing))
-            if missing:
-                days = await state.alphas.train_pnl(list(regions.values()))
-            own = profile_of(regions, days)
-            hit = await asyncio.to_thread(collision, own, kept_series) if own else None
-            if own is None:
-                problem = "No usable daily PnL."
-            elif hit:
-                problem = f"Moves with {hit[0]}: correlation {hit[1]:.2f}."
+        try:
+            problem, own = await _seed_profile(state, market, row, kept_series)
+        except Exception as exc:
+            # One unreadable Alpha costs one seed, not the whole selection.
+            log.warning("evolution.auto_seed_failed", alpha_id=alpha_id, exc_info=True)
+            first_error = first_error or exc
+            errors += 1
+            problem = f"Could not be read: {exc}"
         if problem or own is None:
             reasons.append({"alphaId": alpha_id, "reason": problem or "No usable daily PnL."})
         else:
             kept.append(row)
             kept_series[alpha_id] = own
         await report(len(kept), examined)
+    if first_error is not None and errors == examined:
+        # Not "0 seeds", as though none passed the filters.
+        raise first_error
     return {"rows": kept, "reasons": reasons, "pool": len(rows), "examined": examined}
+
+
+async def _seed_profile(
+    state: Any, market: Market, row: dict[str, Any], kept_series: dict[str, Profile]
+) -> tuple[str | None, Profile | None]:
+    """Why ``row`` cannot be a seed, if it cannot, and its daily PnL profile."""
+    alpha_id = str(row["alpha_id"])
+    if problem := unreadable(row["expression"], market):
+        return problem, None
+    regions: dict[str, str] = row.get("region_series") or {str(row["region"]): alpha_id}
+    days = await state.alphas.train_pnl(list(regions.values()))
+    missing = [s for s in regions.values() if s not in days]
+    # A family's regions together: four at most, the width every BRAIN read here uses.
+    await asyncio.gather(*(_download(state, s) for s in missing))
+    if missing:
+        days = await state.alphas.train_pnl(list(regions.values()))
+    own = profile_of(regions, days)
+    if own is None:
+        return "No usable daily PnL.", None
+    if hit := await asyncio.to_thread(collision, own, kept_series):
+        return f"Moves with {hit[0]}: correlation {hit[1]:.2f}.", own
+    return None, own
+
+
+if __name__ == "__main__":
+    import sys
+
+    def parent(alpha_id: str, expression: str, decay: int) -> Parent:
+        found = Parent.of(alpha_id, expression, {"neutralization": "MARKET", "decay": decay})
+        if found is None:
+            raise SystemExit(f"ga self-check could not read {expression!r}")
+        return found
+
+    def bred(market: Market, a: Parent, b: Parent, *, keep_decay: bool) -> set[int]:
+        rng, shapes = random.Random(7), {p.tree: Shape.of(p.tree, market) for p in (a, b)}
+        made = [child(rng, a, b, market, 1.0, shapes, keep_decay=keep_decay) for _ in range(50)]
+        return {int(settings["decay"]) for _, settings in filter(None, made)}
+
+    def market_of(datasets: tuple[str, str]) -> Market:
+        fields = [
+            {"field_id": f, "dataset_id": d, "field_type": "MATRIX"}
+            for f, d in zip(("close", "open"), datasets, strict=True)
+        ]
+        return build_market([], fields, ["MARKET"])
+
+    # One dataset lets a field swap for the other; two leave the decay the only gene.
+    swaps, fixed = market_of(("pv1", "pv1")), market_of(("pv1", "pv2"))
+    a, b = parent("a", "close", 3), parent("b", "open", 10)
+    twins = parent("c", "close", 3), parent("d", "close", 10)
+    checks = {
+        "a child keeps one of its parents' decays": bred(swaps, a, b, keep_decay=True) == {3, 10},
+        "otherwise a mutation may give it another": not bred(swaps, a, b, keep_decay=False)
+        <= {3, 10},
+        "nothing left to change is no child, not an error": bred(fixed, *twins, keep_decay=True)
+        == set(),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"ga self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

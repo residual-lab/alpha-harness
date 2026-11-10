@@ -17,7 +17,7 @@ import { persist } from 'zustand/middleware'
 import { PROD_CORRELATION_CEILING } from '@/api/platform'
 import { cn } from '@/lib/cn'
 import { fmt } from '@/lib/format'
-import { useCores } from '@/lib/preferences'
+import { keepInHarness, useCores } from '@/lib/preferences'
 import { followOtherTabs } from '@/lib/tabs'
 import { useDebounced } from '@/lib/use-debounced'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
@@ -27,6 +27,7 @@ import {
   Button,
   Checkbox,
   Empty,
+  ErrorNotice,
   Input,
   LINK,
   Notice,
@@ -46,8 +47,15 @@ const useReshapes = create<{ reshapes: Reshape[] }>()(
   }),
 )
 followOtherTabs(useReshapes)
+const useKeptReshapes = keepInHarness(
+  useReshapes,
+  '/api/preferences/correlation-breaker',
+  're-shapes',
+)
 
 const CUSTOM = 'custom:'
+/** The heavy-tailed remap people ask for by name, offered as a re-shape of their own. */
+const QUANTILE = 'quantile(alpha, driver = "cauchy", sigma = 1.0)'
 
 function updateReshape(id: string, change: Partial<Reshape>) {
   useReshapes.setState((s) => ({
@@ -79,6 +87,7 @@ export function CorrelationBreakerScreen() {
   useEffect(() => setDraft(search.alpha ?? ''), [search.alpha])
 
   const reshapes = useReshapes((s) => s.reshapes)
+  const kept = useKeptReshapes()
   // Checked as typed, but not on every keystroke.
   const custom = useDebounced(reshapes, 400)
   const query = useQuery({
@@ -171,7 +180,7 @@ export function CorrelationBreakerScreen() {
         >
           <Panel
             title="Held Fixed"
-            description="Every re-shape runs at the Alpha's own settings. Nothing here changes."
+            description="Every re-shape runs at the Alpha's own settings, Decay included. Nothing here changes; if a result's Turnover rises, Sweep Decay in its menu in Tasks tries higher Decays."
           >
             <div className="flex flex-col gap-4">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
@@ -231,10 +240,28 @@ export function CorrelationBreakerScreen() {
                 Single Data Set Alpha. Grouping fields like sector and industry do not count.
               </Notice>
             )}
+            {kept.isError && (
+              <ErrorNotice
+                className="mb-4"
+                error={kept.error}
+                title="Could not load your own re-shapes"
+              />
+            )}
             {/* Said once, so a dozen cards do not repeat the same two hundred characters. */}
             <pre className="num mb-4 overflow-x-auto rounded-sm border border-hairline bg-canvas p-3 text-body-compact whitespace-pre text-ink-muted">
               {plan.bound}
             </pre>
+            <div className="mb-3">
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  addReshape(`My Re-shape ${reshapes.length + 1}`, 'ts_av_diff(alpha, 60)')
+                }
+              >
+                <PlusIcon />
+                Add Re-shape
+              </Button>
+            </div>
             {plan.recipes.length === 0 ? (
               <Empty title="Nothing to re-shape" />
             ) : (
@@ -385,19 +412,34 @@ export function CorrelationBreakerScreen() {
                       <p className="mt-1 text-body-compact text-ink-subtle">Checking…</p>
                     </li>
                   ))}
+                {/* Asked for by name, so where it went is said where it would have been. */}
+                {!reshapes.some((r) => r.code === QUANTILE) && (
+                  <li className="rounded-md border border-hairline bg-surface-1 p-3">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex min-w-0 flex-1 flex-col gap-1">
+                        <span className="font-medium text-ink">Quantile</span>
+                        <p className="max-w-3xl text-body-compact text-pretty text-ink-subtle">
+                          Not built in: it moves the weights, not the directional bets a PnL
+                          correlation is made of, so on its own it seldom passes Production
+                          Correlation. Add it as your own to try it anyway.
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => addReshape('Quantile', QUANTILE)}
+                      >
+                        <PlusIcon />
+                        Add as Your Own
+                      </Button>
+                    </div>
+                    <pre className="num mt-2 overflow-x-auto rounded-sm border border-hairline bg-canvas p-3 text-body-compact whitespace-pre text-ink-muted">
+                      {QUANTILE}
+                    </pre>
+                  </li>
+                )}
               </ul>
             )}
-            <div className="mt-3">
-              <Button
-                variant="secondary"
-                onClick={() =>
-                  addReshape(`My Re-shape ${reshapes.length + 1}`, 'ts_av_diff(alpha, 60)')
-                }
-              >
-                <PlusIcon />
-                Add Re-shape
-              </Button>
-            </div>
           </Panel>
         </div>
       )}

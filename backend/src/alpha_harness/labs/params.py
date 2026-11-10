@@ -74,6 +74,7 @@ class TaskParams(Out):
 
 class SearchParams(TaskParams):
     space: dict[str, Any]
+    #: Held for every simulation, unless the space searches its own ``decays``.
     decay: int = 0
     dataset_ids: list[str] = Field(default_factory=list)
     n_startup_trials: int = 20
@@ -95,6 +96,8 @@ class EvolutionParams(TaskParams):
     mutation_rate: float | None = None
     test_period: str | None = None
     neutralizations: list[str] = Field(default_factory=list)
+    #: On, a child always has one of its parents' decays: mutation never changes it.
+    keep_decay: bool = False
 
 
 class PowerPoolParams(TaskParams):
@@ -110,6 +113,9 @@ class PowerPoolParams(TaskParams):
     only_model: bool = False
     #: The consultant's own idea, which every call writes its Alphas to test; empty explores.
     hypothesis: str = ""
+    #: Operators no Alpha submitted this quarter used, as the task was added; every call asks
+    #: the LLM to use them where they fit. Empty leaves the choice to it.
+    favour_operators: list[str] = Field(default_factory=list[str])
     #: Running LLM tallies: ``calls``, ``empty``, ``failed``, ``byDataset`` and ``byModel``.
     llm: dict[str, Any] = Field(default_factory=dict)
     #: The last hundred LLM calls, for the task's detail view.
@@ -128,12 +134,15 @@ class SettingsParams(TaskParams):
     markets: int = 0
     #: Held at the source Alpha's values for every simulation in the sweep.
     decay: int = 0
+    #: Swept in place of ``decay`` when given, every simulation run at each.
+    decays: list[int] = Field(default_factory=list[int])
     truncation: float = DEFAULT_TRUNCATION
     #: Truncation set per market by the Truncation Agent instead of held at ``truncation``.
     truncation_agent: bool = False
     nan_handling: str = DEFAULT_NAN_HANDLING
     #: ``P{years}Y{months}M0D``. Empty on a task added before it was recorded.
     test_period: str = ""
+    visualization: bool = False
 
 
 class BreakerParams(TaskParams):

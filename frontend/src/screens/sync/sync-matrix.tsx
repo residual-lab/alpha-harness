@@ -166,9 +166,13 @@ export function SyncHero({
     return map
   }, [scopes.data, full, running])
 
-  // The all-regions market is counted in its own panel, never here, or the totals read as
-  // more markets synced than this grid draws.
-  const held = (scopes.data ?? []).filter((r) => r.region !== REGION_AGNOSTIC_REGION)
+  // Only the markets this grid draws: the all-regions one is counted in its own panel, and one
+  // BRAIN has retired stays in the catalog until a full sync prunes it ("52 of 47 synced").
+  const held = (scopes.data ?? []).filter(
+    (r) =>
+      r.region !== REGION_AGNOSTIC_REGION &&
+      layout.exists.has(keyOf(r.region, r.delay, r.universe)),
+  )
   const syncedMarkets = held.length
   const syncedFields = held.reduce((sum, r) => sum + r.fields, 0)
   const finished = seconds(full?.startedAt, full?.finishedAt)

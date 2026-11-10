@@ -1,8 +1,8 @@
 /** The Datasets and Settings panels of a lab task, and the task settings every lab asks for. */
 
 import { DatabaseIcon, FilterIcon } from 'lucide-react'
-import { useState } from 'react'
-import { SIMULATION_SLOTS } from '@/api/platform'
+import { type ReactNode, useState } from 'react'
+import { MAX_DECAY, SIMULATION_SLOTS } from '@/api/platform'
 import type { Scope } from '@/api/types'
 import { DASH, fmt } from '@/lib/format'
 import { useCores } from '@/lib/preferences'
@@ -27,7 +27,7 @@ import {
 } from '@/ui/kit'
 import { Sheet } from '@/ui/overlay'
 import { ScopePicker } from '@/ui/scope-picker'
-import type { LabDraft } from './lab-task'
+import { decaysOf, type LabDraft } from './lab-task'
 
 const DECAYS = [0, 3, 5, 7, 10]
 
@@ -99,16 +99,22 @@ export interface LabPlan {
 export function MarketPanel({
   scope,
   onChange,
+  children,
 }: {
   scope: Scope
   onChange: (change: Partial<Scope>) => void
+  /** Beside the picker, e.g. a lab's own say over which universes it searches. */
+  children?: ReactNode
 }) {
   return (
     <Panel
       title="Market"
       description="Where every Alpha in the task runs. Datasets are chosen within it."
     >
-      <ScopePicker scope={scope} onChange={onChange} />
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+        <ScopePicker scope={scope} onChange={onChange} />
+        {children}
+      </div>
     </Panel>
   )
 }
@@ -116,6 +122,7 @@ export function MarketPanel({
 export function DatasetsPanel({
   ids,
   scope,
+  description,
   onApply,
   onExplore,
   onRemove,
@@ -125,6 +132,7 @@ export function DatasetsPanel({
   ids: string[]
   /** The market the datasets belong to, which places each under its category. */
   scope: Scope
+  description?: ReactNode
   /** Chosen in the sheet, without leaving the lab. */
   onApply: (ids: string[], filter: FieldFilterState | null) => void
   /** On to the Data Explorer with what the sheet holds, for the filters it has no room for. */
@@ -141,6 +149,7 @@ export function DatasetsPanel({
   return (
     <Panel
       title="Datasets"
+      description={description}
       actions={
         chosen && (
           <Button size="sm" onClick={onChoose}>
@@ -266,6 +275,10 @@ export function SettingsPanel({
 }) {
   const simulations = draft.simulations
   const cores = useCores(draft.cores)
+  const typed = decaysOf(draft.decays)
+  const held = typed?.length === 1 ? typed[0] : undefined
+  // Open on arrival when Advanced holds what the presets can't show.
+  const [advanced] = useState(() => held === undefined || !decays.includes(held))
   const showVector = (plan?.fields.vector ?? 0) > 0 || (plan?.leftOut.vector ?? 0) > 0
   // BRAIN's own legal list for this market, which is wider than the four a lab searches by
   // default — picking any of them is what tells the lab to search those instead.
@@ -291,8 +304,9 @@ export function SettingsPanel({
             <Segmented
               label="Decay"
               items={decays.map((v) => ({ value: v, label: v }))}
-              value={draft.decay}
-              onChange={(decay) => set({ decay })}
+              // None lit while Advanced holds several, or one that isn't a preset.
+              value={held ?? -1}
+              onChange={(decay) => set({ decays: String(decay) })}
             />
           </Fieldset>
           {showVector && (
@@ -313,6 +327,22 @@ export function SettingsPanel({
             onChange={(next) => set({ neutralizations: next })}
           />
         )}
+        <Disclosure summary="Advanced" defaultOpen={advanced}>
+          <Field
+            label="Decays"
+            className="max-w-xl"
+            hint={`Any whole numbers from 0 to ${MAX_DECAY}, separated by commas. With several, each Alpha gets one and the search steers towards the best.`}
+            error={typed ? undefined : `Each Decay is a whole number from 0 to ${MAX_DECAY}.`}
+          >
+            <Input
+              placeholder="4, 12, 20"
+              aria-invalid={typed ? undefined : true}
+              className="w-56"
+              value={draft.decays}
+              onChange={(e) => set({ decays: e.target.value })}
+            />
+          </Field>
+        </Disclosure>
         <div className="grid gap-3 sm:grid-cols-3">
           <Metric boxed label="Market" value={`${regionLabel(draft.region)} · D${draft.delay}`} />
           <Metric boxed label="Fields" value={fmt.int(plan?.fields.total)} />
@@ -343,7 +373,8 @@ export function SettingsPanel({
                   <code className="num text-body-compact break-all text-ink">{s.expression}</code>
                   <span className="text-body-compact text-ink-subtle">
                     {String(s.settings['universe'] ?? DASH)} ·{' '}
-                    {String(s.settings['neutralization'] ?? DASH)}
+                    {String(s.settings['neutralization'] ?? DASH)} · Decay{' '}
+                    <span className="num">{String(s.settings['decay'] ?? DASH)}</span>
                   </span>
                 </li>
               ))}

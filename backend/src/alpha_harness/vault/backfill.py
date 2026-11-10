@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ..brain.connection import background
 from ..brain.filters import AlphaQuery, Filter
 from ..brain.platform import ALPHA_LIST_MAX_OFFSET, ALPHA_LIST_PAGE
 from ..brain.schemas import QUICK_MODE, Alpha, RecordSet, SimulationType
@@ -424,6 +425,7 @@ class Backfill:
         task.add_done_callback(self._background.discard)
 
     async def _fetch_each(self, alpha_ids: list[str]) -> None:
+        background()
         for alpha_id in alpha_ids:
             try:
                 await self.fetch_returns(alpha_id)
@@ -447,6 +449,7 @@ class Backfill:
         await asyncio.shield(future)
 
     async def _drain_landed(self) -> None:
+        background()
         try:
             while self._landed:
                 await asyncio.sleep(CAPTURE_DEBOUNCE_SECONDS)

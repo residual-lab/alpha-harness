@@ -30,7 +30,7 @@ const MODES: { value: SamplerMode; label: string }[] = [
 
 const ABOUT: Record<SamplerMode, string> = {
   sweep:
-    'Every other field of the same dataset, best covered first. Keeps a single dataset Alpha single dataset.',
+    'Every other field of the same dataset, best covered first, so a single-dataset Alpha stays single-dataset.',
   similar:
     'The fields whose descriptions read closest to it: the closest few from its own dataset, then its subcategory, its category, and the whole market.',
   buckets:

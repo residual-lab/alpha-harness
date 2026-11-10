@@ -7,7 +7,7 @@ simulates on its own: previews only read, and queueing hands work to the schedul
 lab.
 """
 
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field, model_validator
@@ -183,6 +183,13 @@ class SampleRequest(PreviewRequest):
     market_neutral_only: bool = Field(default=True, alias="marketNeutralOnly")
     #: Truncation set per market by the Truncation Agent rather than held at one value.
     truncation_agent: bool = Field(default=False, alias="truncationAgent")
+    #: Every simulation run once at each of these instead of at ``decay`` alone.
+    decays: list[Annotated[int, Field(ge=0, le=MAX_DECAY)]] = Field(
+        default_factory=list[int], max_length=10
+    )
+    #: Off unless asked for, whatever the source Alpha ran with: it slows every simulation, and
+    #: BRAIN keeps its charts for a week.
+    visualization: bool = False
 
 
 @router.post("/settings-sampler/preview")
@@ -213,7 +220,11 @@ async def add_task(body: SampleRequest, state: State) -> AddedTask:
         if r["region"] != REGION_AGNOSTIC_REGION
         for m in r["markets"]
     }
-    source: dict[str, Any] = {**found["settings"], "expression": found["expression"]}
+    source: dict[str, Any] = {
+        **found["settings"],
+        "expression": found["expression"],
+        "visualization": body.visualization,
+    }
     requests = settings_sampler.expand(
         found["regions"],
         chosen,
@@ -222,6 +233,7 @@ async def add_task(body: SampleRequest, state: State) -> AddedTask:
         source,
         market_neutral_only=body.market_neutral_only,
         truncation_agent=body.truncation_agent,
+        decays=body.decays,
     )
     if not requests:
         raise refuse(
@@ -242,6 +254,7 @@ async def add_task(body: SampleRequest, state: State) -> AddedTask:
             alpha_id=body.alpha_id,
             markets=markets,
             decay=int(found["settings"]["decay"] or 0),
+            decays=sorted(set(body.decays)),
             truncation=(
                 DEFAULT_TRUNCATION
                 if found["settings"]["truncation"] is None
@@ -250,6 +263,7 @@ async def add_task(body: SampleRequest, state: State) -> AddedTask:
             truncation_agent=body.truncation_agent,
             nan_handling=str(found["settings"]["nanHandling"] or "ON"),
             test_period=str(found["settings"]["testPeriod"] or ""),
+            visualization=body.visualization,
             cores=body.cores,
         ),
         simulations=len(requests),

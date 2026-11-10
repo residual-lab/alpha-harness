@@ -54,6 +54,7 @@ const OFFER = [
   'dateCreated',
   'dateSubmitted',
   'classifications',
+  'tags',
   'pyramids',
   'operatorCount',
   'hasPnl',
@@ -109,6 +110,9 @@ export function Stored({
   const [regions, setRegions] = useState<string[]>([])
   const [delays, setDelays] = useState<string[]>([])
   const [universes, setUniverses] = useState<string[]>([])
+  const [tags, setTags] = useState<string[]>([])
+  const [createdAfter, setCreatedAfter] = useState('')
+  const [createdBefore, setCreatedBefore] = useState('')
   const [bounds, setBounds] = useState<Record<string, { min: string; max: string }>>({})
   const [sort, setSort] = useState<Sort>({ key: 'sharpe', desc: true })
   const [limit, setLimit] = useState(100)
@@ -141,6 +145,9 @@ export function Stored({
     delays: market ? [market.delay] : delays.length ? delays.map(Number) : null,
     universes: market ? [market.universe] : universes.length ? universes : null,
     search: quietSearch.trim() || null,
+    tags: tags.length ? tags : null,
+    created_after: createdAfter || null,
+    created_before: createdBefore || null,
     minimum: Object.fromEntries(
       BOUNDS.flatMap((b) => {
         const v = parseNum(quietBounds[b.key]?.min ?? '')
@@ -179,14 +186,18 @@ export function Stored({
     value: v,
     label: v,
   }))
+  const tagItems = (overview.data?.tags ?? []).map((v) => ({ value: v, label: v }))
 
-  // Rows are ticked only to pick seeds; anywhere else a tick would lead nowhere.
+  // Picking seeds, a tick picks a seed; otherwise the table's own ticks tag Alphas.
   const toggle = (ids: string[], on: boolean) =>
     useSeedPick.setState((s) => ({
       ids: on ? [...new Set([...s.ids, ...ids])] : s.ids.filter((id) => !ids.includes(id)),
     }))
   const activeBounds =
     BOUNDS.filter((b) => bounds[b.key]?.min || bounds[b.key]?.max).length +
+    tags.length +
+    (createdAfter ? 1 : 0) +
+    (createdBefore ? 1 : 0) +
     (market ? 0 : regions.length + delays.length + universes.length)
 
   return (
@@ -275,6 +286,40 @@ export function Stored({
                 </Fieldset>
               </div>
             )}
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+              <Fieldset
+                legend="Tags"
+                className="lg:col-span-2"
+                hint={
+                  overview.data && !tagItems.length
+                    ? 'No tags yet. Tick Alphas in the table to tag them.'
+                    : undefined
+                }
+              >
+                {tagItems.length > 0 && (
+                  <Chips label="Tags" items={tagItems} value={tags} onChange={reset(setTags)} />
+                )}
+              </Fieldset>
+              <Fieldset legend="Date Created">
+                <div className="flex items-center gap-1.5">
+                  <Input
+                    type="date"
+                    aria-label="Created on or after"
+                    value={createdAfter}
+                    max={createdBefore || undefined}
+                    onChange={(e) => reset(setCreatedAfter)(e.target.value)}
+                  />
+                  <span className="text-ink-subtle">–</span>
+                  <Input
+                    type="date"
+                    aria-label="Created on or before"
+                    value={createdBefore}
+                    min={createdAfter || undefined}
+                    onChange={(e) => reset(setCreatedBefore)(e.target.value)}
+                  />
+                </div>
+              </Fieldset>
+            </div>
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-4">
               {BOUNDS.map((b) => (
                 <Fieldset key={b.key} legend={b.label}>

@@ -17,6 +17,8 @@ export interface EvolutionDraft {
   /** `null`: sized from the simulations. */
   population: number | null
   mutationRate: number
+  /** Children only ever take a parent's decay. */
+  keepDecay: boolean
   /** Empty leaves the lab on its own four group neutralizations. */
   neutralizations: string[]
   /** The Auto Select job whose result is shown, and the one whose seeds were already taken. */
@@ -36,6 +38,7 @@ export const useEvolutionLab = create<EvolutionDraft>()(
       population: null,
       neutralizations: [],
       mutationRate: 0.05,
+      keepDecay: false,
       autoJobId: null,
       appliedJobId: null,
     }),

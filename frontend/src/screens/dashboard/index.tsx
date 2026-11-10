@@ -4,23 +4,27 @@
  */
 
 import { useQuery } from '@tanstack/react-query'
-import { AwardIcon, CpuIcon, LayersIcon, SendIcon } from 'lucide-react'
-import type { ReactNode } from 'react'
+import { Link } from '@tanstack/react-router'
+import { AwardIcon, CpuIcon, LayersIcon, SendIcon, SquareFunctionIcon } from 'lucide-react'
+import { type ReactNode, useState } from 'react'
 import { today } from '@/api/core'
 import type { components } from '@/api/generated'
-import { http } from '@/api/http'
+import { errorMessage, http } from '@/api/http'
 import { cn } from '@/lib/cn'
-import { fmt } from '@/lib/format'
+import { DASH, fmt } from '@/lib/format'
 
 type QuarterStanding = components['schemas']['QuarterStanding']
 
 import { useNow } from '@/lib/now'
 import { useRefetchOn } from '@/lib/ws'
-import { ErrorNotice, Page, Panel, Progress, Skeleton, TEXT_TONE, type Tone } from '@/ui/kit'
+import { ErrorNotice, LINK, Page, Panel, Progress, Skeleton, TEXT_TONE, type Tone } from '@/ui/kit'
 import { GettingStarted } from './getting-started'
+import { OperatorUsageDialog, operatorUsage } from './operators'
 import { WorkInFlight } from './work'
 
 const DAY_SECONDS = 24 * 60 * 60
+/** A hint that wraps moves its link down whole rather than splitting its name. */
+const TILE_LINK = cn(LINK, 'whitespace-nowrap')
 
 export function DashboardScreen() {
   const day = useQuery({ queryKey: ['today'], queryFn: () => today.get() })
@@ -34,6 +38,9 @@ export function DashboardScreen() {
     queryFn: () => http.get<QuarterStanding>('/api/quarter'),
     staleTime: 10 * 60 * 1000,
   })
+  const operators = useQuery(operatorUsage)
+  const [showOperators, setShowOperators] = useState(false)
+  const used = operators.data?.operators.filter((o) => o.alphas > 0).length ?? 0
 
   return (
     <Page>
@@ -47,7 +54,8 @@ export function DashboardScreen() {
       <GettingStarted today={day.data} />
       {day.isError && <ErrorNotice error={day.error} title="Today's figures could not load" />}
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      {/* Five across only where every label still fits on one line. */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
         <StatTile
           icon={<AwardIcon />}
           label="Submitted Alphas"
@@ -55,9 +63,20 @@ export function DashboardScreen() {
           value={quarter.isError ? '—' : fmt.int(quarter.data?.submitted)}
           tone={quarter.data?.submitted ? 'profit' : 'neutral'}
           hint={
-            quarter.isError
-              ? 'The count could not load.'
-              : `Submitted in ${quarter.data?.label ?? 'this quarter'}`
+            <>
+              {quarter.isError
+                ? 'The count could not load.'
+                : `Submitted in ${quarter.data?.label ?? 'this quarter'}`}
+              {' · '}
+              <Link
+                to="/tasks"
+                search={{ view: 'submittable' }}
+                hash="submission-order"
+                className={TILE_LINK}
+              >
+                Submission Order
+              </Link>
+            </>
           }
         />
         <StatTile
@@ -118,23 +137,79 @@ export function DashboardScreen() {
           loading={quarter.isPending}
           value={quarter.isError ? '—' : fmt.int(quarter.data?.pyramidsFormulated)}
           hint={
-            quarter.isError ? (
-              'The count could not load.'
-            ) : (
+            <>
+              {quarter.isError ? (
+                'The count could not load.'
+              ) : (
+                <>
+                  <span className="num">{fmt.int(quarter.data?.alphasPerPyramid)}</span> submitted
+                  Alphas complete one
+                  {quarter.data?.pyramidsStarted ? (
+                    <>
+                      {' · '}
+                      <span className="num">{fmt.int(quarter.data.pyramidsStarted)}</span> started
+                    </>
+                  ) : null}
+                </>
+              )}
+              {' · '}
+              <Link to="/pyramids" className={TILE_LINK}>
+                Pyramids
+              </Link>
+            </>
+          }
+        />
+        <StatTile
+          className="sm:col-span-2 2xl:col-span-1"
+          icon={<SquareFunctionIcon />}
+          label="Operators Used"
+          loading={operators.isPending}
+          value={
+            operators.data ? (
               <>
-                <span className="num">{fmt.int(quarter.data?.alphasPerPyramid)}</span> submitted
-                Alphas complete one
-                {quarter.data?.pyramidsStarted ? (
-                  <>
-                    {' · '}
-                    <span className="num">{fmt.int(quarter.data.pyramidsStarted)}</span> started
-                  </>
-                ) : null}
+                {fmt.int(used)}
+                <span className="text-body text-ink-subtle">
+                  {' '}
+                  / {fmt.int(operators.data.operators.length)}
+                </span>
               </>
+            ) : (
+              DASH
+            )
+          }
+          hint={
+            operators.data ? (
+              <>
+                <span className="num">{fmt.int(operators.data.operators.length - used)}</span> not
+                used yet in {operators.data.label}
+                {' · '}
+                <button type="button" className={TILE_LINK} onClick={() => setShowOperators(true)}>
+                  All Operators
+                </button>
+              </>
+            ) : (
+              errorMessage(operators.error)
             )
           }
         />
       </div>
+      {operators.data && (
+        <OperatorUsageDialog
+          usage={operators.data}
+          open={showOperators}
+          onOpenChange={setShowOperators}
+          footer={
+            <p className="mt-3 text-body-compact text-ink-subtle">
+              To have the LLM reach for the unused ones, tick{' '}
+              <span className="text-ink">Favour operators unused this quarter</span> in the{' '}
+              <Link to="/labs/power-pool" className={LINK}>
+                LLM Power Pool Lab
+              </Link>
+              .
+            </p>
+          }
+        />
+      )}
 
       <WorkInFlight />
     </Page>
@@ -175,6 +250,7 @@ function StatTile({
   tone = 'neutral',
   loading,
   extra,
+  className = '',
 }: {
   icon?: ReactNode
   label: string
@@ -183,9 +259,10 @@ function StatTile({
   tone?: Tone
   loading: boolean
   extra?: ReactNode
+  className?: string
 }) {
   return (
-    <Panel bodyClassName="flex h-full flex-col justify-between gap-3">
+    <Panel className={className} bodyClassName="flex h-full flex-col justify-between gap-3">
       <div className="flex min-h-5 items-center gap-2">
         {icon && <span className="text-ink-subtle [&_svg]:size-3.5">{icon}</span>}
         <span className="text-caption font-medium uppercase tracking-wide text-ink-subtle">

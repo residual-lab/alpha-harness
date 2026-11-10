@@ -77,6 +77,11 @@ export const alpha = {
     http.get<Recordset>(`/api/alphas/${id(alphaId)}/recordsets/${name}`),
   save: (alphaId: string, body: AlphaProperties) =>
     http.patch<AlphaInfo>(`/api/alphas/${id(alphaId)}`, body),
+  /** Adds the tags beside each Alpha's own on BRAIN; every other property stays as it is. */
+  tag: (alphaIds: string[], tags: string[]) =>
+    http.post<Schemas['TagResult']>('/api/alphas/tags', { alpha_ids: alphaIds, tags }),
+  /** A task, not started, simulating the expression negated at the same settings: one simulation. */
+  flip: (alphaId: string) => http.post<Schemas['AddedTask']>(`/api/alphas/${id(alphaId)}/flip`),
   /** A Power Pool description in BRAIN's template, by the model chosen in Settings. Not saved. */
   describe: (alphaId: string) =>
     http.post<AlphaDescription>(`/api/alphas/${id(alphaId)}/description`),

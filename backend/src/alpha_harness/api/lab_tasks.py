@@ -128,6 +128,11 @@ class LabTask(Out):
     mutation_rate: float | None
     #: Search Lab and Template Lab only.
     decay: int | None
+    #: Settings Sampler: every simulation draws BRAIN's visualizations.
+    visualization: bool = False
+    #: The Decays a Settings Sampler sweeps or a Search Lab task searches, in place of
+    #: ``decay``; empty when it holds one.
+    decays: list[int] = Field(default_factory=list[int])
     cores: int
     dataset_ids: list[str]
     fields: int
@@ -190,6 +195,9 @@ class RankedAlpha(Out):
     #: shows it. Shown, never searched on, so they stay out of sample. Null without a test period.
     test_sharpe: float | None = None
     test_fitness: float | None = None
+    #: The train years', from the vault: with ``sharpe`` and ``test_sharpe``, what tells a
+    #: straight line (an implausible Sharpe in any period) from a signal.
+    train_sharpe: float | None = None
     #: The highest correlation with any consultant Alpha in production, which BRAIN wants
     #: below 0.7. Null until BRAIN has been asked: it limits these checks per hour.
     prod_correlation: float | None = None
@@ -388,6 +396,10 @@ def _task(row: Study, progress: dict[str, Any]) -> LabTask:
     # Read raw on purpose: this only displays, and one malformed old row must not take the
     # whole Tasks list down with a validation error.
     params = row.sampler_params or {}
+    space = params.get("space")
+    searched = space.get("decays") if isinstance(space, dict) else None
+    # Several decays, swept (Settings Sampler) or searched (Search Lab), stand in for one.
+    decays = params.get("decays") or (searched if searched and len(searched) > 1 else [])
     states = progress["states"]
     told = states.get(TrialState.COMPLETE, 0) + states.get(TrialState.FAIL, 0)
     template = row.sampler == TEMPLATE_SAMPLER
@@ -409,7 +421,9 @@ def _task(row: Study, progress: dict[str, Any]) -> LabTask:
             "seeds": len(params.get("seeds") or []),
             "population": params.get("population"),
             "mutationRate": params.get("mutationRate"),
-            "decay": params.get("decay"),
+            "decay": None if decays else params.get("decay"),
+            "decays": decays,
+            "visualization": bool(params.get("visualization")),
             "alphaId": params.get("alphaId"),
             "markets": params.get("markets"),
             "truncation": params.get("truncation"),
@@ -544,6 +558,8 @@ async def power_pool_workflow(body: AlphaIds, state: State) -> WorkflowStarted:
 #: The least to wait once BRAIN still refuses a correlation check after the client's own
 #: retries: its limit is per hour, so asking again a minute later only spends another refusal.
 PROD_WAIT = 300.0
+#: How often a check waiting on a closed connection looks again.
+PAUSED_WAIT = 10.0
 
 
 def _prod_key(alpha_id: str) -> str:
@@ -594,6 +610,13 @@ async def check_prod_correlation(body: AlphaIds, state: State) -> WorkflowStarte
             progress = f"{done} of {len(wanted)}"
             await state.tasks.update(task, progress=done / len(wanted), detail=progress)
             while True:
+                link = state.client.connection
+                if not link.open:
+                    # Offline or signed out: wait for the connection rather than fail every Alpha
+                    # left, as 303 did in one consultant's log.
+                    await state.tasks.update(task, detail=f"{progress} · waiting for BRAIN")
+                    await asyncio.sleep(PAUSED_WAIT)
+                    continue
                 try:
                     answer = await state.endpoints.correlations(alpha_id, "prod")
                 except BrainRateLimited as exc:
@@ -608,6 +631,8 @@ async def check_prod_correlation(body: AlphaIds, state: State) -> WorkflowStarte
                     continue
                 # One Alpha BRAIN cannot check must not abandon the rest.
                 except BrainError as exc:
+                    if not state.client.connection.open:
+                        continue  # The connection closed under it: this Alpha is asked again.
                     log.warning("prod_correlation.failed", alpha_id=alpha_id, error=exc.message)
                     failed += 1
                     break
@@ -860,6 +885,7 @@ def _from_vault(
         "afterCostSharpe": vault.get("after_cost_5bps"),
         "testSharpe": vault.get("test_sharpe"),
         "testFitness": vault.get("test_fitness"),
+        "trainSharpe": vault.get("train_sharpe"),
         "prodCorrelation": prod.get(alpha_id),
         "submitted": is_submitted(vault),
     }

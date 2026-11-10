@@ -20,12 +20,15 @@ separately, so trials stay joinable to the simulations that produced them.
 
 import asyncio
 import contextlib
+import warnings
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import func, select, update
 
+from ..brain.connection import background
+from ..brain.errors import BrainAuthError, BrainError
 from ..brain.platform import IGNORED_CHECKS, QUOTA_CHECKS
 from ..brain.schemas import FULL_MODE, QUICK_MODE
 from ..db.models import (
@@ -37,7 +40,7 @@ from ..db.models import (
     TrialState,
     utcnow,
 )
-from ..vault.yields import checks_of, clean, gating_results, limits_of, verdict
+from ..vault.yields import checks_of, clean, gating_results, implausible, limits_of, verdict
 from . import objectives as obj
 from . import scheduler
 from .objectives import StudyNotFoundError
@@ -75,6 +78,9 @@ VAULT_STATS = frozenset(
 )
 #: How long a finished Alpha may take to reach the local store before BRAIN is asked.
 VAULT_WAIT = timedelta(minutes=5)
+#: How long after its simulation finished a trial keeps waiting for BRAIN to hand its Alpha
+#: back through an outage or a closed session, before it fails for good.
+READ_BACK_PATIENCE = timedelta(hours=1)
 
 
 class Optimizer:
@@ -129,6 +135,7 @@ class Optimizer:
         log.info("optimize.stopped")
 
     async def _run(self) -> None:
+        background()
         while True:
             try:
                 await self.tick()
@@ -335,8 +342,16 @@ class Optimizer:
 
             try:
                 alpha = await self.endpoints.get_alpha(alpha_id)
-            # A lookup that fails for any reason fails that trial, not the whole study.
+            # A lookup that fails for any reason fails that trial, not the whole study. Unless
+            # it failed only because BRAIN could not be asked: the Alpha is still there, and
+            # failing it for good lost every result that finished during an outage.
             except Exception as exc:  # noqa: BLE001
+                passing = isinstance(exc, BrainAuthError) or (
+                    isinstance(exc, BrainError) and exc.retryable
+                )
+                finished_at = record.finished_at or utcnow()
+                if passing and utcnow() - finished_at < READ_BACK_PATIENCE:
+                    continue
                 finished.append(
                     (
                         live.get(trial.number),
@@ -480,15 +495,17 @@ class Optimizer:
                     "distributions": distributions or {},
                     "values": values,
                     "penalty": penalty,
+                    "implausible": flagged,
                     "state": state,
                 }
-                for params, distributions, values, penalty, state in (
+                for params, distributions, values, penalty, flagged, state in (
                     await session.execute(
                         select(
                             Trial.params,
                             Trial.distributions,
                             Trial.values,
                             func.json_extract(Trial.result, "$.penalty"),
+                            func.json_extract(Trial.result, "$.implausible"),
                             Trial.state,
                         )
                         .where(Trial.study_id == study_id)
@@ -497,14 +514,19 @@ class Optimizer:
                 ).tuples()
             ]
 
+        from optuna.exceptions import ExperimentalWarning
         from optuna.samplers import TPESampler
 
-        sampler = TPESampler(
-            n_startup_trials=params_of(row, SearchParams).n_startup_trials,
-            multivariate=True,
-            group=True,
-            constant_liar=row.batch_size > 1,
-        )
+        # Optuna still labels these arguments experimental and says so on every task start,
+        # which only buried real warnings in the log.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            sampler = TPESampler(
+                n_startup_trials=params_of(row, SearchParams).n_startup_trials,
+                multivariate=True,
+                group=True,
+                constant_liar=row.batch_size > 1,
+            )
         loader = _Distributions(scheduler.field_slots(row))
         study = await asyncio.to_thread(_rebuild, sampler, history, loader)
         self.studies[study_id] = study
@@ -568,7 +590,7 @@ def _tell_many(
                 if values is None:
                     study.tell(optuna_trial, state=OptunaState.FAIL, skip_if_finished=True)
                 else:
-                    told = obj.searched(values, summary.get("penalty"))
+                    told = obj.searched(values, summary.get("penalty"), summary.get("implausible"))
                     study.tell(optuna_trial, told, skip_if_finished=True)
                 continue
 
@@ -584,7 +606,7 @@ def _tell_many(
                 create_trial(
                     params=_optuna_params(stored.params or {}, distributions),
                     distributions=distributions,
-                    values=obj.searched(values, summary.get("penalty")),
+                    values=obj.searched(values, summary.get("penalty"), summary.get("implausible")),
                     state=OptunaState.COMPLETE,
                 )
             )
@@ -654,7 +676,9 @@ def _rebuild(sampler: Any, history: list[dict[str, Any]], loader: _Distributions
             continue
         params = _optuna_params(entry["params"] or {}, distributions)
         values = (
-            obj.searched([float(v) for v in (entry["values"] or [])], entry["penalty"])
+            obj.searched(
+                [float(v) for v in (entry["values"] or [])], entry["penalty"], entry["implausible"]
+            )
             if state is OptunaState.COMPLETE
             else None
         )
@@ -794,4 +818,7 @@ def vault_summary(saved: dict[str, Any]) -> dict[str, Any]:
         "failedChecks": failed,
         "penalty": obj.STRUCTURAL_PENALTY * len(obj.STRUCTURAL_CHECKS.intersection(failed)),
         "quick": saved.get("simulation_mode") == QUICK_MODE,
+        "implausible": implausible(
+            obj.search_sharpe(saved.get("train_sharpe"), saved.get("sharpe"))
+        ),
     }

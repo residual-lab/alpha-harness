@@ -7,10 +7,9 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
 
 from ..brain.platform import INSTRUMENT_TYPE, REGION_AGNOSTIC_REGION
-from ..brain.settings_schema import valid_values
 from ..catalog.pyramids import UnknownPeriodError, pyramid_grid
 from ..catalog.queries import FieldFilter, Tuple4
-from ..catalog.sync import SyncTarget
+from ..catalog.sync import SyncTarget, offered_markets
 from ..schemas import Out, SyncAllRun
 from .deps import State, refuse
 
@@ -251,16 +250,7 @@ async def _markets(state: State) -> list[SyncTarget]:
     schema = (
         await state.metadata.cached_settings_schema() or await state.metadata.refresh_metadata()
     )
-    # EQUITY only, the one instrument type the Data Explorer offers.
-    base: dict[str, Any] = {"instrumentType": INSTRUMENT_TYPE}
-    return [
-        SyncTarget(
-            instrument_type=INSTRUMENT_TYPE, region=region, delay=int(delay), universe=universe
-        )
-        for region in valid_values(schema, "region", base)
-        for delay in valid_values(schema, "delay", {**base, "region": region})
-        for universe in valid_values(schema, "universe", {**base, "region": region, "delay": delay})
-    ]
+    return offered_markets(schema)
 
 
 @router.get("/markets")

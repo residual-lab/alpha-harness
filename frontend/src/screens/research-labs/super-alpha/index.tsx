@@ -15,6 +15,7 @@ import {
 } from '@/api/platform'
 import { cn } from '@/lib/cn'
 import { fmt } from '@/lib/format'
+import { keepInHarness } from '@/lib/preferences'
 import { useScope, useScopeOptions } from '@/lib/scope'
 import { followOtherTabs } from '@/lib/tabs'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
@@ -71,6 +72,11 @@ const useRecipes = create<Recipes>()(
   }),
 )
 followOtherTabs(useRecipes)
+const useKeptRecipes = keepInHarness(
+  useRecipes,
+  '/api/preferences/super-lab',
+  'selections and combos',
+)
 
 const STARTER: Record<Kind, string> = {
   selections: '(operator_count <= 100) * (1 - prod_correlation)',
@@ -79,7 +85,9 @@ const STARTER: Record<Kind, string> = {
 const SINGULAR: Record<Kind, string> = { selections: 'Selection', combos: 'Combo' }
 
 function addOwn(kind: Kind, name: string, code: string) {
-  useRecipes.setState((s) => ({ [kind]: [...s[kind], { id: crypto.randomUUID(), name, code }] }))
+  const id = crypto.randomUUID()
+  useRecipes.setState((s) => ({ [kind]: [...s[kind], { id, name, code }] }))
+  return id
 }
 
 function updateOwn(kind: Kind, id: string, change: Partial<Own>) {
@@ -89,7 +97,10 @@ function updateOwn(kind: Kind, id: string, change: Partial<Own>) {
 }
 
 function removeOwn(kind: Kind, id: string) {
-  useRecipes.setState((s) => ({ [kind]: s[kind].filter((r) => r.id !== id) }))
+  useRecipes.setState((s) => ({
+    [kind]: s[kind].filter((r) => r.id !== id),
+    off: s.off.filter((k) => k !== `custom:${id}`),
+  }))
 }
 
 function toggle(key: string) {
@@ -127,6 +138,9 @@ export function SuperAlphaLabScreen() {
   const [activation, setActivation] = useState<NonNullable<Activation>>('BOTH')
   const [cores, setCores] = useState(3)
   const recipes = useRecipes()
+  const kept = useKeptRecipes()
+  /** The selection just written from the panel's lead, focused so it is seen below the rest. */
+  const [fresh, setFresh] = useState<string | null>(null)
 
   // BRAIN's own list for the market; Subindustry first where it has one, as most Alphas use it.
   const neutralization = options.neutralizations.some((n) => n.value === picked)
@@ -250,7 +264,31 @@ export function SuperAlphaLabScreen() {
       <Panel
         title="What Runs"
         description="Every ticked selection with every ticked combo, at two Decays to land Turnover between 2% and 40%. Each runs in Full mode, so BRAIN's own checks say which are submittable: those show green in Tasks. Add your own, or copy a built-in one to edit; yours are kept on this computer."
+        actions={
+          <Button
+            title="A selection scores each of your own submitted Alphas, and each SuperAlpha keeps the top ones up to the Selection Limit."
+            onClick={() =>
+              setFresh(
+                addOwn(
+                  'selections',
+                  `My Selection ${recipes.selections.length + 1}`,
+                  STARTER.selections,
+                ),
+              )
+            }
+          >
+            <PencilIcon />
+            Write Your Own Selection
+          </Button>
+        }
       >
+        {kept.isError && (
+          <ErrorNotice
+            className="mb-4"
+            error={kept.error}
+            title="Could not load your own selections and combos"
+          />
+        )}
         {plan.isError && <ErrorNotice error={plan.error} title="Could not plan the task" />}
         {plan.data && (
           <div className="flex flex-col gap-4">
@@ -264,7 +302,12 @@ export function SuperAlphaLabScreen() {
               <Metric boxed label="Truncation" value={String(plan.data.truncation)} />
             </div>
             {problem && <Notice tone="warn" title={problem} />}
-            <RecipeList kind="selections" builtins={plan.data.selections} recipes={recipes} />
+            <RecipeList
+              kind="selections"
+              builtins={plan.data.selections}
+              recipes={recipes}
+              fresh={fresh}
+            />
             <RecipeList kind="combos" builtins={plan.data.combos} recipes={recipes} />
             <Notice
               tone="info"
@@ -281,10 +324,13 @@ function RecipeList({
   kind,
   builtins,
   recipes,
+  fresh,
 }: {
   kind: Kind
   builtins: Schemas['Recipe'][]
   recipes: Recipes
+  /** An own one just added from elsewhere on the screen, to focus. */
+  fresh?: string | null
 }) {
   const own = recipes[kind]
   const ticked =
@@ -359,6 +405,7 @@ function RecipeList({
               </div>
               <Textarea
                 aria-label={`${r.name} code`}
+                autoFocus={r.id === fresh}
                 className="font-mono"
                 rows={Math.min(8, Math.max(2, r.code.split('\n').length + 1))}
                 spellCheck={false}
