@@ -564,7 +564,7 @@ async def expand(optimizer: Any, row: Any) -> int:
                             Trial.study_id == row.id, Trial.number.in_(set(full_of.values()))
                         )
                     )
-                ).tuples()
+                ).tuples().all()
             )
             for parent in winners:
                 if room <= 0:
