@@ -242,6 +242,8 @@ export function PortfolioScreen() {
     queryFn: () => portfolio.compute(ids, cost),
     enabled: ids.length > 0,
     placeholderData: keepPreviousData,
+    // Each selection is its own answer, a correlation grid and years of PnL: old ones go sooner.
+    gcTime: 30_000,
   })
   // A disabled query keeps its last answer, which would outlive deselecting every Alpha.
   const result = ids.length ? computed.data : undefined

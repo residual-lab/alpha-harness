@@ -24,7 +24,7 @@ from ..brain.errors import BrainError
 from ..brain.platform import INSTRUMENT_TYPE, REGION_AGNOSTIC_REGION
 from ..brain.schemas import BulkField, FieldRef
 from ..brain.settings_schema import valid_values
-from ..db.duck import DATASET_COLUMNS, CatalogUnusableError
+from ..db.duck import DATASET_COLUMNS, FIELD_COLUMNS, CatalogUnusableError
 from ..db.models import SyncRun, SyncStatus, utcnow
 from . import search
 from .queries import scope_label
@@ -424,9 +424,15 @@ class CatalogSync:
                     now = utcnow()
                     rows = await asyncio.to_thread(_field_rows, raw, target, now)
                     datasets = await asyncio.to_thread(_dataset_rows, raw, target, now)
+                    table = await asyncio.to_thread(
+                        self.catalog.to_arrow, "data_field", FIELD_COLUMNS, rows
+                    )
+                    # Only the Arrow table waits for the writer: the structs and tuples it came
+                    # from are over four times its size, and eight markets can be waiting.
+                    del raw, rows
                     prepared = time.perf_counter()
                     scope = [target.instrument_type, target.region, target.delay, target.universe]
-                    await self.catalog.replace_fields(scope, rows)
+                    await self.catalog.replace_fields(scope, table)
                     # Placeholders only fill gaps: a re-sync must not blank the Value Score,
                     # Coverage and counts that an earlier details step stored.
                     await self.catalog.upsert(
@@ -437,12 +443,12 @@ class CatalogSync:
                     log.info(
                         "sync_all.scope_timing",
                         target=target.label,
-                        fields=len(rows),
+                        fields=len(table),
                         fetch_s=round(fetched - started, 2),
                         prepare_s=round(prepared - fetched, 2),
                         write_s=round(time.perf_counter() - prepared, 2),
                     )
-                    return len(rows), len(datasets)
+                    return len(table), len(datasets)
 
                 try:
                     fields, datasets = await _retry(store, cancel, target.label)

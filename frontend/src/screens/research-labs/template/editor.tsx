@@ -198,6 +198,10 @@ function nameColours() {
     class {
       decorations: DecorationSet
       gone = false
+      /** Names in the text with no type asked yet: looked up once typing pauses, so the
+       *  `c`, `cl`, `clo` on the way to `close` are never asked. */
+      unknown = new Set<string>()
+      pause: ReturnType<typeof setTimeout> | undefined
       readonly view: EditorView
       constructor(view: EditorView) {
         this.view = view
@@ -212,11 +216,13 @@ function nameColours() {
       }
       destroy() {
         this.gone = true
+        clearTimeout(this.pause)
       }
       marked(): DecorationSet {
         const blank = code(this.view.state.doc.toString())
         const names = locals(blank)
         const builder = new RangeSetBuilder<Decoration>()
+        this.unknown.clear()
         for (const m of blank.matchAll(NAMES)) {
           const name = m[0]
           let mark: Decoration | undefined
@@ -225,18 +231,23 @@ function nameColours() {
             mark = this.fieldMark(name)
           if (mark) builder.add(m.index, m.index + name.length, mark)
         }
+        clearTimeout(this.pause)
+        if (this.unknown.size) this.pause = setTimeout(() => this.lookUpUnknown(), 400)
         return builder.finish()
       }
       fieldMark(name: string): Decoration | undefined {
-        if (!typed.has(name)) {
+        const type = typed.get(name)
+        if (type === undefined) this.unknown.add(name)
+        return type === 'VECTOR' ? MARK.vector : type === 'GROUP' ? MARK.group : undefined
+      }
+      lookUpUnknown() {
+        for (const name of this.unknown) {
           typed.set(name, null)
           void lookUp(name).then((field) => {
             typed.set(name, field?.field_type ?? null)
             if (field && !this.gone) this.view.dispatch({ effects: recolour.of(null) })
           })
         }
-        const type = typed.get(name)
-        return type === 'VECTOR' ? MARK.vector : type === 'GROUP' ? MARK.group : undefined
       }
     },
     { decorations: (plugin) => plugin.decorations },

@@ -51,6 +51,8 @@ export function usePowerPool(alphaIds: string[]): PowerPool {
     enabled: alphaIds.length > 0,
     retry: false,
     staleTime: 60_000,
+    // A running task re-keys this with every clean Alpha; superseded answers go sooner.
+    gcTime: 30_000,
   })
   const by = useMemo(
     () => new Map((query.data?.rows ?? []).map((r) => [r.alphaId, r])),

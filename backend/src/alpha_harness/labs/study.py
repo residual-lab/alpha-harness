@@ -21,7 +21,7 @@ separately, so trials stay joinable to the simulations that produced them.
 import asyncio
 import contextlib
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -54,7 +54,7 @@ from .params import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     import optuna
 
@@ -201,6 +201,8 @@ class Optimizer:
     async def advance(self, study_id: int) -> dict[str, int]:
         """Harvest what finished, then ask for the next round if there is room."""
         async with self.lock(study_id):
+            # Read once for the whole tick, a Search Lab space being megabytes: the lock holds off
+            # every change to the row that harvesting and asking read.
             row = await self.get(study_id)
             if row is None:
                 return {"told": 0, "asked": 0}
@@ -208,25 +210,21 @@ class Optimizer:
                 raise ValueError(f"No lab runs studies with the {row.sampler!r} sampler.")
 
             # Evolution Lab breeds its own children: there is no sampler to tell.
-            told = await self._harvest(
-                study_id, tell=row.sampler in (SEARCH_SAMPLER, TEMPLATE_SAMPLER)
-            )
-            asked = await scheduler.advance(self, study_id)
+            told = await self._harvest(row, tell=row.sampler in (SEARCH_SAMPLER, TEMPLATE_SAMPLER))
+            asked = await scheduler.advance(self, row)
         if told or asked:
             await self.notify()
         return {"told": told, "asked": asked}
 
-    async def _harvest(self, study_id: int, *, tell: bool) -> int:
+    async def _harvest(self, row: Study, *, tell: bool) -> int:
         """Score every trial whose simulation reached a terminal state.
 
         ``tell=False`` stores the scores without reporting them to Optuna, for GA studies.
         The Alpha the tracker already stored locally is read first instead of asking BRAIN
         for it again, which saves one request per simulation.
         """
+        study_id = row.id
         async with self.db.session() as session:
-            row = await session.get(Study, study_id)
-            if row is None:
-                return 0
             open_trials = list(
                 (
                     await session.scalars(
@@ -482,11 +480,40 @@ class Optimizer:
 
     # -- optuna ----------------------------------------------------------
 
-    async def optuna_study(self, study_id: int, row: Study) -> optuna.Study:
-        """The Optuna study, rebuilt from the trial rows on first use."""
+    async def optuna_study(self, study_id: int, row: Study, *, trim: bool = False) -> optuna.Study:
+        """The Optuna study, rebuilt from the trial rows on first use.
+
+        With ``trim``, one grown past :data:`TRIM_AT` is cut to what :func:`kept` keeps. Its live
+        trials are forgotten and replayed once they finish, so only a caller holding none of
+        them may ask: the scheduler, before it asks for a round.
+        """
         cached = self.studies.get(study_id)
-        if cached is not None:
+        if cached is not None and not (trim and _outgrown(cached)):
             return cached
+
+        from optuna.exceptions import ExperimentalWarning
+        from optuna.samplers import TPESampler
+
+        startup = params_of(row, SearchParams).n_startup_trials
+
+        def sampler(dropped: int) -> Any:
+            # Optuna still labels these arguments experimental and says so on every task start,
+            # which only buried real warnings in the log.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ExperimentalWarning)
+                return TPESampler(
+                    # What a trim dropped still counts toward the random start.
+                    n_startup_trials=max(0, startup - dropped),
+                    multivariate=True,
+                    group=True,
+                    constant_liar=row.batch_size > 1,
+                )
+
+        if cached is not None:
+            study = await asyncio.to_thread(_trimmed, cached, sampler)
+            self.studies[study_id] = study
+            self.open_trials.pop(study_id, None)
+            return study
 
         async with self.db.session() as session:
             history = [
@@ -514,19 +541,6 @@ class Optimizer:
                 ).tuples()
             ]
 
-        from optuna.exceptions import ExperimentalWarning
-        from optuna.samplers import TPESampler
-
-        # Optuna still labels these arguments experimental and says so on every task start,
-        # which only buried real warnings in the log.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ExperimentalWarning)
-            sampler = TPESampler(
-                n_startup_trials=params_of(row, SearchParams).n_startup_trials,
-                multivariate=True,
-                group=True,
-                constant_liar=row.batch_size > 1,
-            )
         loader = _Distributions(scheduler.field_slots(row))
         study = await asyncio.to_thread(_rebuild, sampler, history, loader)
         self.studies[study_id] = study
@@ -582,7 +596,6 @@ def _tell_many(
     information reaches the sampler without relying on Optuna's numbering matching ours.
     """
     from optuna.trial import TrialState as OptunaState
-    from optuna.trial import create_trial
 
     for optuna_trial, stored, values, summary in finished:
         try:
@@ -603,15 +616,48 @@ def _tell_many(
             if distributions is None:
                 continue
             study.add_trial(
-                create_trial(
-                    params=_optuna_params(stored.params or {}, distributions),
-                    distributions=distributions,
-                    values=obj.searched(values, summary.get("penalty"), summary.get("implausible")),
-                    state=OptunaState.COMPLETE,
+                _finished(
+                    OptunaState.COMPLETE,
+                    _optuna_params(stored.params or {}, distributions),
+                    distributions,
+                    obj.searched(values, summary.get("penalty"), summary.get("implausible")),
                 )
             )
         except Exception:
             log.warning("optimize.tell_failed", number=stored.number, exc_info=True)
+
+
+class _Shared(dict[str, Any]):
+    """A replayed trial's distributions. Optuna deep-copies every trial added to a study, and a
+    field slot's distribution holds thousands of choices: they never change, so the copy shares
+    them."""
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> dict[str, Any]:
+        return dict(self)
+
+
+def _finished(
+    state: Any, params: dict[str, Any], distributions: dict[str, Any], values: list[float] | None
+) -> optuna.trial.FrozenTrial:
+    """A trial already told, to add to a study. ``create_trial`` makes the same one, but first
+    compares each distribution with itself choice by choice: 9 ms a trial for a field slot."""
+    from optuna.trial import FrozenTrial
+
+    now = datetime.now()  # noqa: DTZ005 - naive, as Optuna dates its own trials
+    return FrozenTrial(
+        number=-1,
+        state=state,
+        value=None,
+        values=values,
+        datetime_start=now,
+        datetime_complete=now,
+        params=params,
+        distributions=_Shared(distributions),
+        user_attrs={},
+        system_attrs={},
+        intermediate_values={},
+        trial_id=-1,
+    )
 
 
 class _Distributions:
@@ -646,18 +692,69 @@ class _Distributions:
         return out
 
 
-def _rebuild(sampler: Any, history: list[dict[str, Any]], loader: _Distributions) -> optuna.Study:
-    """Recreate a study from its finished trials.
+#: Past ``TRIM_AT`` trials a search keeps ``KEEP_BEST`` best, all of TPE's good group (Optuna's
+#: default gamma stops at 25), and the ``KEEP_LATEST`` latest. Each trial more costs every
+#: suggestion time, and memory per choice of every field slot; TPE weighs older ones down anyway.
+KEEP_BEST = 25
+KEEP_LATEST = 5_000
+TRIM_AT = 6_000
+#: The states TPE learns from, and counts toward its random start.
+LEARNED = frozenset({"COMPLETE", "PRUNED"})
+#: The study attribute counting the learned trials trims have dropped.
+DROPPED = "dropped"
+
+
+def kept(trials: Sequence[tuple[str, float | None]]) -> list[int]:
+    """Which of a study's trials, given as (state, value told) in order, a trim keeps.
+
+    The :data:`KEEP_LATEST` latest TPE learns from, and the :data:`KEEP_BEST` best Complete
+    ranked as TPE ranks them: highest first, the earlier on a tie. A FAILURE is never a best,
+    and a Failed trial teaches TPE nothing.
+    """
+    learned = [i for i, (state, _) in enumerate(trials) if state in LEARNED]
+    scored = [
+        (value, i)
+        for i, (state, value) in enumerate(trials)
+        if state == "COMPLETE" and value is not None and value > obj.FAILURE
+    ]
+    best = [i for _, i in sorted(scored, key=lambda pair: -pair[0])[:KEEP_BEST]]
+    return sorted({*learned[-KEEP_LATEST:], *best})
+
+
+def _outgrown(study: optuna.Study) -> bool:
+    return len(study.get_trials(deepcopy=False)) > TRIM_AT
+
+
+def _trimmed(study: optuna.Study, sampler: Callable[[int], Any]) -> optuna.Study:
+    """``study`` cut to what :func:`kept` keeps. ``sampler(dropped)`` makes its sampler, given
+    how many learned trials every trim so far has dropped."""
+    import optuna
+
+    trials = study.get_trials(deepcopy=False)
+    keep = kept([(t.state.name, t.value) for t in trials])
+    learned = sum(t.state.name in LEARNED for t in trials)
+    dropped = int(study.user_attrs.get(DROPPED, 0)) + learned - len(keep)
+    trimmed = optuna.create_study(direction="maximize", sampler=sampler(dropped))
+    trimmed.set_user_attr(DROPPED, dropped)
+    for i in keep:
+        trial = trials[i]
+        trimmed.add_trial(_finished(trial.state, trial.params, trial.distributions, trial.values))
+    return trimmed
+
+
+def _rebuild(
+    sampler: Callable[[int], Any], history: list[dict[str, Any]], loader: _Distributions
+) -> optuna.Study:
+    """Recreate a study from its finished trials, trimmed as :func:`_trimmed` trims.
 
     Only terminal trials are replayed. Open ones are told later as replayed trials, so
     recreating them here would only reserve numbers the application does not use.
     """
     import optuna
     from optuna.trial import TrialState as OptunaState
-    from optuna.trial import create_trial
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    study = optuna.create_study(direction="maximize", sampler=sampler)
+    study = optuna.create_study(direction="maximize", sampler=sampler(0))
 
     state_map = {
         "COMPLETE": OptunaState.COMPLETE,
@@ -685,14 +782,12 @@ def _rebuild(sampler: Any, history: list[dict[str, Any]], loader: _Distributions
         if state is OptunaState.COMPLETE and not values:
             continue
         try:
-            study.add_trial(
-                create_trial(params=params, distributions=distributions, values=values, state=state)
-            )
+            study.add_trial(_finished(state, params, distributions, values))
         except ValueError:
             # One unreadable row costs the sampler a point of history; raising would fail
             # the whole task and leave its sent simulations unscored.
             log.warning("optimize.replay_skipped", params=sorted(params), exc_info=True)
-    return study
+    return _trimmed(study, sampler) if _outgrown(study) else study
 
 
 def _optuna_params(params: dict[str, Any], distributions: dict[str, Any]) -> dict[str, Any]:
@@ -700,7 +795,7 @@ def _optuna_params(params: dict[str, Any], distributions: dict[str, Any]) -> dic
 
     The labs store what a point *means* (``field``), while Optuna names the slot it was
     drawn from (``field@TOP3000``: fields are scoped by universe). Replaying by the stored
-    names drops every scoped value, and ``create_trial`` then refuses the row as
+    names drops every scoped value, and ``add_trial`` then refuses the row as
     inconsistent.
     """
     found: dict[str, Any] = {}
@@ -822,3 +917,115 @@ def vault_summary(saved: dict[str, Any]) -> dict[str, Any]:
             obj.search_sharpe(saved.get("train_sharpe"), saved.get("sharpe"))
         ),
     }
+
+
+if __name__ == "__main__":
+    import random
+    import sys
+
+    import optuna as _optuna
+    from optuna.distributions import CategoricalDistribution, distribution_to_json
+    from optuna.exceptions import ExperimentalWarning
+    from optuna.samplers import TPESampler
+    from optuna.trial import TrialState as OptunaState
+    from optuna.trial import create_trial
+
+    fields, shapes = tuple(f"f{n}" for n in range(300)), ("cs", "ts", "group")
+    rng = random.Random(5)
+
+    def history_of(n: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "params": {"field": rng.choice(fields), "family": rng.choice(shapes)},
+                "distributions": {
+                    "field@TOP3000": scheduler.FROM_SPACE,
+                    "family": distribution_to_json(CategoricalDistribution(shapes)),
+                },
+                "values": [rng.gauss(0, 1)],
+                "penalty": None,
+                "implausible": None,
+                "state": rng.choice(["COMPLETE", "COMPLETE", "COMPLETE", "FAIL", "PRUNED"]),
+            }
+            for _ in range(n)
+        ]
+
+    def seeded(dropped: int = 0) -> Any:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            return TPESampler(
+                n_startup_trials=max(0, 10 - dropped),
+                multivariate=True,
+                group=True,
+                constant_liar=True,
+                seed=3,
+            )
+
+    history = history_of(80)
+    loader = _Distributions({"field@TOP3000": fields})
+    ours = _rebuild(seeded, history, loader)
+    # The same history through Optuna's own create_trial, as it was replayed before.
+    theirs = _optuna.create_study(direction="maximize", sampler=seeded())
+    for entry in history:
+        made = loader.load(entry["distributions"]) or {}
+        done = entry["state"] == "COMPLETE"
+        theirs.add_trial(
+            create_trial(
+                params=_optuna_params(entry["params"], made),
+                distributions=made,
+                values=obj.searched(entry["values"], None) if done else None,
+                state=OptunaState[entry["state"]],
+            )
+        )
+
+    def held(study: optuna.Study) -> list[tuple[Any, ...]]:
+        return [
+            (t.number, t.state, t.values, t.params, t.distributions)
+            for t in study.get_trials(deepcopy=False)
+        ]
+
+    def asked(study: optuna.Study) -> list[dict[str, Any]]:
+        points: list[dict[str, Any]] = []
+        for n in range(8):
+            trial = study.ask()
+            trial.suggest_categorical("field@TOP3000", fields)
+            trial.suggest_categorical("family", shapes)
+            points.append(trial.params)
+            study.tell(trial, n / 10)
+        return points
+
+    # 25 old bests, the last tied by a later trial, then a FAILURE and a thousand worse; the
+    # latest learned trials come last, with Failed ones between them that never count.
+    told: list[tuple[str, float | None]] = [("COMPLETE", 50.0 - n) for n in range(KEEP_BEST)]
+    told += [("COMPLETE", 50.0 - KEEP_BEST + 1), ("COMPLETE", obj.FAILURE), ("FAIL", None)]
+    told += [("COMPLETE", -5.0)] * 1_000
+    told += [("PRUNED", None), ("COMPLETE", 0.0), ("FAIL", None)] * (KEEP_LATEST // 2 + 1)
+    latest = [i for i, (state, _) in enumerate(told) if state != "FAIL"][-KEEP_LATEST:]
+    scarce = [("COMPLETE", obj.FAILURE), *[("PRUNED", None)] * KEEP_LATEST]
+
+    big = history_of(TRIM_AT + 1)
+    trimmed = _rebuild(seeded, big, loader)
+    scores = [(e["state"], e["values"][0] if e["state"] == "COMPLETE" else None) for e in big]
+    learned = sum(state in LEARNED for state, _ in scores)
+    slot = {id(t.distributions["field@TOP3000"]) for t in ours.get_trials(deepcopy=False)}
+    checks = {
+        "replayed as Optuna's own create_trial replays": held(ours) == held(theirs),
+        "the same points are asked next": asked(ours) == asked(theirs),
+        "replayed trials share their field slot's distribution": len(slot) == 1,
+        "a trim keeps the 25 best and the latest learned": kept(told)
+        == sorted({*range(KEEP_BEST), *latest}),
+        "a FAILURE is never a best": kept(scarce) == list(range(1, KEEP_LATEST + 1)),
+        "a study of TRIM_AT trials is not trimmed": len(
+            _rebuild(seeded, big[:TRIM_AT], loader).get_trials(deepcopy=False)
+        )
+        == TRIM_AT,
+        "past it, the trials kept, in order": [
+            (t.state.name, t.value, t.params["field@TOP3000"])
+            for t in trimmed.get_trials(deepcopy=False)
+        ]
+        == [(*scores[i], big[i]["params"]["field"]) for i in kept(scores)],
+        "what it dropped still counts toward the random start": trimmed.user_attrs[DROPPED]
+        == learned - len(kept(scores)),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"study self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

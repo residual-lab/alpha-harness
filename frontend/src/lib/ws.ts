@@ -113,16 +113,22 @@ document.addEventListener('visibilitychange', () => {
 /**
  * Refetch queries under `queryKey` whenever `topic` reports a change. The socket is a signal,
  * not state, so a drifting payload shape can never desync the UI; bursts collapse to one
- * refetch per `minGapMs`, with a trailing call so the final state still lands.
+ * refetch per `minGapMs`, with a trailing call so the final state still lands. `exact` refetches
+ * that one query and nothing nested under it.
  */
-export function useRefetchOn(topic: Topic, queryKey: readonly unknown[], minGapMs = 1000): void {
+export function useRefetchOn(
+  topic: Topic,
+  queryKey: readonly unknown[],
+  minGapMs = 1000,
+  { exact = false }: { exact?: boolean } = {},
+): void {
   const queryClient = useQueryClient()
   const last = useRef(0)
   const pending = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Read when a message lands, so one subscription serves every render.
-  const latest = useRef({ queryKey, minGapMs })
+  const latest = useRef({ queryKey, minGapMs, exact })
   useEffect(() => {
-    latest.current = { queryKey, minGapMs }
+    latest.current = { queryKey, minGapMs, exact }
   })
 
   useEffect(() => {
@@ -130,7 +136,8 @@ export function useRefetchOn(topic: Topic, queryKey: readonly unknown[], minGapM
       const fire = () => {
         last.current = Date.now()
         pending.current = null
-        void queryClient.invalidateQueries({ queryKey: latest.current.queryKey })
+        const { queryKey: key, exact: only } = latest.current
+        void queryClient.invalidateQueries({ queryKey: key, exact: only })
       }
       const gap = latest.current.minGapMs
       const since = Date.now() - last.current

@@ -149,7 +149,8 @@ export async function notify(title: string, body: string) {
 export function DesktopNotifications() {
   // The same queries the Tasks page and the header read, so this costs nothing extra on screen.
   const tasks = useQuery({ queryKey: ['lab-tasks'], queryFn: labTasks.list })
-  useRefetchOn('studies', ['lab-tasks'], 2_000)
+  // The list alone: a task's results nest under the same key and keep their own pace.
+  useRefetchOn('studies', ['lab-tasks'], 2_000, { exact: true })
   const update = useUpdateStatus()
 
   // Asked now, while the window is in front: macOS may hold back a prompt raised from the tray.

@@ -23,7 +23,7 @@ import json
 import math
 import random
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -316,7 +316,9 @@ async def market_for(
     neutralizations: list[str],
 ) -> Market | None:
     """The market's fields with the account's operators, or ``None`` when either is missing."""
-    key = (region, delay, universe, tuple(neutralizations), len(operators))
+    # Kept without the neutralizations: each one ticked in a preview kept another copy of every
+    # field of the market, 15 MB for USA TOP3000.
+    key = (region, delay, universe, len(operators))
     if key not in _markets:
         fields = await catalog.query(
             "SELECT field_id, dataset_id, field_type FROM data_field "
@@ -326,7 +328,7 @@ async def market_for(
         if not fields or not operators:
             return None
         _markets[key] = build_market(operators, fields, neutralizations)
-    return _markets[key]
+    return replace(_markets[key], neutralizations=tuple(neutralizations))
 
 
 def unreadable(expression: str | None, market: Market) -> str | None:

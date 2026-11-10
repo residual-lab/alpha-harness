@@ -133,6 +133,8 @@ function useLocalNet(view: string, rows: AlphaTableRow[], on: boolean) {
       }),
     enabled: charged !== undefined && ids.length > 0,
     placeholderData: keepPreviousData,
+    // Every Alpha a running task adds is a new key, and an old one is seldom asked again.
+    gcTime: 30_000,
   })
   const merged = useMemo(() => {
     if (charged === undefined) return rows

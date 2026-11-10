@@ -22,6 +22,7 @@ candidate is correlated against TOP500 and TOP2000 members alike, and a USA **D0
 against the USA D1 pool. Delay and universe are not part of the bucket.
 """
 
+import math
 from bisect import bisect_left
 from typing import TYPE_CHECKING, Any
 
@@ -103,7 +104,8 @@ def _ends(
 ) -> list[date]:
     """The last day BRAIN counts for each Alpha: its stored series' last, plus closing days."""
     _, dates, pnl = grid
-    traded = ~np.isnan(pnl[:, [at[a] for a in alpha_ids]])
+    # Tested on the grid, then picked: picking first copied every column's floats.
+    traded = ~np.isnan(pnl)[:, [at[a] for a in alpha_ids]]
     stored_last = [dates[i] for i in len(dates) - 1 - traded[::-1].argmax(axis=0)]
     # Closing days move where BRAIN's window ends, as ``portfolio.frame`` counts them, but are
     # never correlated: that is what makes these match BRAIN's own figures.
@@ -150,7 +152,7 @@ def _judge(
     """The verdict from the pairs measured, ``values`` by pool member. Only pairs both sides of
     which have a stored series can be measured; the rest still count in ``against``, so the row
     says what it was judged against."""
-    usable = [(p, v) for p in against if (v := values.get(p)) is not None and not np.isnan(v)]
+    usable = [(p, v) for p in against if (v := values.get(p)) is not None and not math.isnan(v)]
     found = _verdict(alpha_id, meta, usable, len(against), ceiling)
     if found["verdict"] != "blocked" and any(p not in stored for p in against):
         found["verdict"] = "unmeasured"

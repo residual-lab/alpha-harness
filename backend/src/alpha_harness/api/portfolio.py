@@ -22,6 +22,7 @@ from ..brain.settings_schema import chosen_labels
 from ..labs.fastexpr import ParseError, data_fields, parse
 from ..schemas import Out
 from ..tools import portfolio, power_pool
+from ..vault import metrics
 from ..vault.store import SERIES_VERSION, json_list
 from ..vault.yields import (
     REFUSING,
@@ -375,32 +376,27 @@ def _pnl_version(row: dict[str, Any]) -> Any:
 
 type Framing = tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[str], portfolio.Framed]
 
-#: The last :func:`_framed_submitted` at each cost, with the catalog revision it was read at.
-#: Two at most: the Portfolio at no cost and at the cost being looked at.
-_FRAMED: dict[float, tuple[int, Framing]] = {}
+#: The last :func:`_framed_submitted`, by the catalog revision it was read at.
+_FRAMED: dict[int, Framing] = {}
 
 
-async def _framed_submitted(state: AppState, cost_bps: float | None) -> Framing:
+async def _framed_submitted(state: AppState) -> Framing:
     """Every submitted Alpha stored, its row, and the :func:`portfolio.frame` of those with a
-    series. Laid out once for every figure worked out from it, it was each one's slowest step,
-    and kept until the catalog is next written to: the Portfolio, its copy and a cost change
-    read the same Alphas."""
-    cost = cost_bps or 0.0
+    series, before cost. Laid out once for every figure worked out from it, it was each one's
+    slowest step, and kept until the catalog is next written to: the Portfolio, its copy and a
+    cost change read the same Alphas."""
     revision = state.catalog.revision
-    kept = _FRAMED.get(cost)
-    if kept is not None and kept[0] == revision:
-        return kept[1]
+    if (kept := _FRAMED.get(revision)) is not None:
+        return kept
     rows = await state.alphas.submitted_members()
     ids = [str(r["alpha_id"]) for r in rows]
     series = await state.alphas.series(ids)
     meta = await state.alphas.by_ids(ids)
     with_series = [a for a in dict.fromkeys(ids) if series.get(a)]
-    framed = await asyncio.to_thread(portfolio.frame, series, meta, with_series, cost)
-    found: Framing = (rows, meta, with_series, framed)
-    for stale in [c for c, (r, _) in _FRAMED.items() if r != revision or c not in (0.0, cost)]:
-        del _FRAMED[stale]
-    _FRAMED[cost] = (revision, found)
-    return found
+    framed = await asyncio.to_thread(portfolio.frame, series, meta, with_series)
+    _FRAMED.clear()
+    _FRAMED[revision] = (rows, meta, with_series, framed)
+    return _FRAMED[revision]
 
 
 @router.get("/members")
@@ -410,7 +406,11 @@ async def members(
 ) -> PortfolioMembers:
     """Every submitted Alpha stored locally. With ``costBps``, its figures and correlations are
     worked out on its daily PnL net of that cost instead of read from BRAIN."""
-    rows, meta, with_series, framed = await _framed_submitted(state, cost_bps)
+    rows, meta, with_series, framed = await _framed_submitted(state)
+    if cost_bps is not None:
+        # As :func:`portfolio.frame` charges it, on the frame before cost.
+        dates, gross, turnover, closing = framed
+        framed = (dates, metrics.after_cost(gross, turnover, cost_bps), turnover, closing)
     # Worked out even at no cost: some figures, like the K-ratio, BRAIN does not report.
     net = await asyncio.to_thread(portfolio.framed_figures, with_series, framed, meta)
     if cost_bps is None:
@@ -499,7 +499,7 @@ async def _local_figures(state: AppState, alpha_ids: list[str]) -> dict[str, dic
     """K-Ratio, Max Pairwise Correlation and Portfolio Correlation for these Alphas, before
     cost. A submitted Alpha is measured against every other one, as the Portfolio table
     measures it; any other Alpha against every submitted one."""
-    _, _, members, framed = await _framed_submitted(state, None)
+    _, _, members, framed = await _framed_submitted(state)
     wanted = list(dict.fromkeys(alpha_ids))
     found: dict[str, dict[str, Any]] = {}
     inside = set(wanted) & set(members)
@@ -661,10 +661,10 @@ async def copied_alphas(
     ``error``, listed after the Alphas so a reader learns from those too.
     """
     ids = list(dict.fromkeys(alpha_ids))
-    rows = await state.alphas.by_ids(ids)
+    rows = await state.alphas.by_ids(ids, brain=True)
     if missing := [a for a, row in rows.items() if not row.get("brain")]:
         await _read_bodies(state, missing)
-        rows |= await state.alphas.by_ids(missing)
+        rows |= await state.alphas.by_ids(missing, brain=True)
     schema = await state.metadata.cached_settings_schema()
     local = await _local_figures(state, [a for a in ids if a in rows])
     blocks: list[str] = []

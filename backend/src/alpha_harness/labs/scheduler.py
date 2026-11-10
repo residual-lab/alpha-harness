@@ -158,9 +158,11 @@ def to_ask(batch_size: int, in_flight: int, left: int) -> int:
     return max(0, min(room - room % 10, left))
 
 
-async def _still_sending(optimizer: Optimizer, rows: list[Study]) -> set[int]:
+async def _still_sending(optimizer: Optimizer, rows: Sequence[Any]) -> set[int]:
     """The running tasks with simulations left to send: short of their target, holding parked
-    work, or with work queued in the engine. The rest only wait on what is out."""
+    work, or with work queued in the engine. The rest only wait on what is out.
+
+    ``rows`` are :func:`start_waiting`'s."""
     ids = [r.id for r in rows]
     tasks = [r.task for r in rows]
     async with optimizer.db.session() as session:
@@ -203,25 +205,38 @@ async def _still_sending(optimizer: Optimizer, rows: list[Study]) -> set[int]:
     return {
         r.id
         for r in rows
-        if not task_params(r).stopping
+        if not r.stopping
         and (spent.get(r.id, 0) < r.max_trials or r.id in parked or r.task in queued)
     }
+
+
+def _param(key: str) -> Any:
+    """SQL for one of a task's stored parameters."""
+    return func.json_extract(Study.sampler_params, f"$.{key}")
 
 
 async def start_waiting(optimizer: Optimizer) -> int:
     """Start queued tasks while their cores fit in the engine's slots. Returns how many."""
     async with scheduling:
         async with optimizer.db.session() as session:
-            rows = list(
-                (
-                    await session.scalars(
-                        select(Study).where(
-                            Study.sampler.in_(TASK_SAMPLERS),
-                            Study.status.in_([StudyStatus.RUNNING, StudyStatus.QUEUED]),
-                        )
+            # Only what scheduling reads: whole, a Search Lab task's parameters are megabytes,
+            # decoded every few seconds.
+            rows = (
+                await session.execute(
+                    select(
+                        Study.id,
+                        Study.task,
+                        Study.status,
+                        Study.max_trials,
+                        func.coalesce(_param("cores"), 1).label("cores"),
+                        _param("queuedAt").label("queued_at"),
+                        _param("stopping").label("stopping"),
+                    ).where(
+                        Study.sampler.in_(TASK_SAMPLERS),
+                        Study.status.in_([StudyStatus.RUNNING, StudyStatus.QUEUED]),
                     )
-                ).all()
-            )
+                )
+            ).all()
         running = [r for r in rows if r.status == StudyStatus.RUNNING]
         if optimizer.engine.lend_idle_cores and running:
             # Lending: a task that has sent everything holds no cores, only the batches still
@@ -229,13 +244,13 @@ async def start_waiting(optimizer: Optimizer) -> int:
             # stands idle beside them until the last of those batches returns.
             sending = await _still_sending(optimizer, running)
             running = [r for r in running if r.id in sending]
-        used = sum(cores_of(r) for r in running)
+        used = sum(r.cores for r in running)
         waiting = sorted(
             (r for r in rows if r.status == StudyStatus.QUEUED),
-            key=lambda r: (task_params(r).queued_at or "", r.id),
+            key=lambda r: (r.queued_at or "", r.id),
         )
         by_id = {r.id: r for r in waiting}
-        started = to_start([(r.id, cores_of(r)) for r in waiting], used, optimizer.engine.slots)
+        started = to_start([(r.id, r.cores) for r in waiting], used, optimizer.engine.slots)
         for task_id in list(started):
             # Compare-and-set from QUEUED, so a pause or stop since the read above wins. That
             # press holds the task's lock, which cannot be taken here: `resize_task` takes it
@@ -257,8 +272,8 @@ async def start_waiting(optimizer: Optimizer) -> int:
             if moved is None:
                 started.remove(task_id)
                 continue
-            await optimizer.engine.set_quota(by_id[task_id].task, cores_of(by_id[task_id]))
-            used += cores_of(by_id[task_id])
+            await optimizer.engine.set_quota(by_id[task_id].task, by_id[task_id].cores)
+            used += by_id[task_id].cores
         if started:
             await optimizer.notify()
         optimizer.lendable_cores = (
@@ -337,17 +352,17 @@ def ask_points(
     return picked, withdrawn
 
 
-async def advance(optimizer: Optimizer, study_id: int) -> int:
+async def advance(optimizer: Optimizer, row: Study) -> int:
     """Refill the task's cores as its batches come back. Returns how many were queued.
 
     A task keeps ten simulations in flight per core. Room freed by a returning batch is
     filled at once, in tens so every batch stays full, rather than once the slowest batch
-    of a round is back.
+    of a round is back. ``row`` is the task as this tick read it.
     """
+    if row.status != StudyStatus.RUNNING:
+        return 0
+    study_id = row.id
     async with optimizer.db.session() as session:
-        row = await session.get(Study, study_id)
-        if row is None or row.status != StudyStatus.RUNNING:
-            return 0
         # Counted in SQL, never by loading the trials: a task may run to 100,000 of them, and
         # building every row each tick held the event loop for seconds.
         open_count, committed, last = (
@@ -476,7 +491,7 @@ async def advance(optimizer: Optimizer, study_id: int) -> int:
         untried = [f for f in coverable if f not in tried]
         cover = untried[: min(want, limit - len(tried))]
 
-    study = await optimizer.optuna_study(study_id, row)
+    study = await optimizer.optuna_study(study_id, row, trim=True)
     schema = await optimizer.metadata.cached_settings_schema()
     picked, withdrawn = await asyncio.to_thread(
         ask_points, study, lab, run, want, seen, cover, schema, refused
@@ -995,14 +1010,14 @@ if __name__ == "__main__":
                     db=db, engine=engine, notify=nothing, open_trials={}, studies={}
                 )
 
-                async def task(name: str, **params: Any) -> int:
+                async def task(name: str, status: str = StudyStatus.RUNNING, **params: Any) -> int:
                     async with db.session() as session:
                         row = Study(
                             name=name,
                             template_source="",
                             sampler=SETTINGS_SAMPLER,
                             task=name,
-                            status=StudyStatus.RUNNING,
+                            status=status,
                             sampler_params={"region": "USA", "delay": 1, **params},
                         )
                         session.add(row)
@@ -1044,6 +1059,22 @@ if __name__ == "__main__":
                     )
                 closed = await close_refused(optimizer, sweep, PENDING_SEND)
                 found["only the refused market's parked trials close"] = closed == 5
+
+                quotas: list[tuple[str, int]] = []
+
+                async def quota(task: str, cores: int) -> None:
+                    quotas.append((task, cores))
+
+                # "sweep" runs on the one core a task without ``cores`` holds; three are free.
+                engine.slots, engine.lend_idle_cores, engine.set_quota = 4, False, quota
+                await task("late", StudyStatus.QUEUED, cores=2, queuedAt="2026-01-02")
+                await task("early", StudyStatus.QUEUED, cores=2, queuedAt="2026-01-01")
+                await task("small", StudyStatus.QUEUED, queuedAt="2026-01-03")
+                await start_waiting(optimizer)
+                found["queued tasks start oldest first while their cores fit"] = quotas == [
+                    ("early", 2),
+                    ("small", 1),
+                ]
 
                 async with db.session() as session:
                     for n, settings in enumerate([usa, eur]):

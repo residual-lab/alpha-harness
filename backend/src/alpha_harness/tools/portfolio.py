@@ -21,13 +21,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from ..vault import metrics
+from ..vault.store import days_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
     from datetime import date
 
     from ..vault.metrics import Bools, Floats, Stats
-    from ..vault.store import AlphaVault, PnlGrid
+    from ..vault.store import AlphaVault, PnlGrid, Series
 
     type Framed = tuple[list[date], Floats, Floats, Bools]
 
@@ -44,7 +45,7 @@ def _split(meta: dict[str, dict[str, Any]], alpha_ids: list[str]) -> date | None
 
 
 def compute(
-    series: dict[str, dict[date, tuple[float, float]]],
+    series: Series,
     meta: dict[str, dict[str, Any]],
     alpha_ids: list[str],
     cost_bps: float,
@@ -199,23 +200,13 @@ async def net_figures_of(
 
 
 def net_figures(
-    series: dict[str, dict[date, tuple[float, float]]],
-    meta: dict[str, dict[str, Any]],
-    bps: float,
+    series: Series, meta: dict[str, dict[str, Any]], bps: float
 ) -> dict[str, dict[str, float | None]]:
     """Each Alpha's figures recomputed on its PnL net of ``bps``, with the formulas that give
     BRAIN's own gross figures: in sample, and Sharpe in its train and test years. At zero bps,
     the gross figures BRAIN does not report, such as the K-ratio."""
-    found: dict[str, dict[str, float | None]] = {}
-    for alpha_id, days in series.items():
-        info = meta.get(alpha_id, {})
-        rows = metrics.with_closing([(d, p, t) for d, (p, t) in sorted(days.items())], info)
-        if not rows:
-            continue
-        turnover = np.array([t for _, _, t in rows])
-        pnl = metrics.after_cost(np.array([p for _, p, _ in rows]), turnover, bps)
-        found[alpha_id] = _figures([d for d, _, _ in rows], pnl, turnover, info)
-    return found
+    ids = list(series)
+    return framed_figures(ids, frame(series, meta, ids, bps), meta)
 
 
 def framed_grid(ids: list[str], framed: Framed, current: set[str], extra: PnlGrid) -> PnlGrid:
@@ -383,10 +374,7 @@ def exported(
 
 
 def frame(
-    series: dict[str, dict[date, tuple[float, float]]],
-    meta: dict[str, dict[str, Any]],
-    ids: list[str],
-    bps: float = 0.0,
+    series: Series, meta: dict[str, dict[str, Any]], ids: list[str], bps: float = 0.0
 ) -> tuple[list[date], Floats, Floats, Bools]:
     """These Alphas laid out day by day: the calendar, PnL, turnover, and which cells are
     closing days. With ``bps``, PnL is net of that cost on each day's turnover.
@@ -399,24 +387,26 @@ def frame(
     rebuilt from the Alpha's own figures rather than exported by BRAIN; correlations leave
     them out, which is what makes them match BRAIN's to four decimals.
     """
-    # Each Alpha's stored days, oldest first, plus the final days BRAIN counts in its IS and
-    # test figures but exports in no recordset (see :func:`metrics.closing_days`).
-    days = {
-        a: metrics.with_closing(
-            [(d, p, t) for d, (p, t) in sorted(series[a].items())], meta.get(a, {})
-        )
-        for a in ids
-    }
-    dates = sorted({d for a in ids for d, _, _ in days[a]})
-    at = {d: i for i, d in enumerate(dates)}
+    stored = [series[a] for a in ids]
+    # The final days BRAIN counts in each Alpha's IS and test figures but exports in no
+    # recordset (see :func:`metrics.closing_days`), all after its stored days. Python, an Alpha
+    # at a time: every Alpha's days at once as Python objects took 1.5 GB for 2,000 of them.
+    tails = [
+        metrics.with_closing(rows, meta.get(a, {}))[len(rows) :]
+        for a, rows in zip(ids, map(days_of, stored), strict=True)
+    ]
+    tail_days = np.array([d for tail in tails for d, _, _ in tail], dtype="datetime64[D]")
+    calendar = np.unique(np.concatenate([*(days for days, _, _ in stored), tail_days]))
+    dates: list[date] = calendar.tolist()
     pnl = np.full((len(dates), len(ids)), np.nan)
     turnover = np.zeros((len(dates), len(ids)))
     closing = np.zeros((len(dates), len(ids)), dtype=bool)
-    for col, alpha_id in enumerate(ids):
-        for day, value, traded in days[alpha_id]:
-            pnl[at[day], col] = value
-            turnover[at[day], col] = traded
-            closing[at[day], col] = day not in series[alpha_id]
+    for col, ((days, day_pnl, day_turnover), tail) in enumerate(zip(stored, tails, strict=True)):
+        rows = np.searchsorted(calendar, days)
+        pnl[rows, col], turnover[rows, col] = day_pnl, day_turnover
+        for day, value, traded in tail:
+            row = bisect_left(dates, day)
+            pnl[row, col], turnover[row, col], closing[row, col] = value, traded, True
     if bps:
         pnl = metrics.after_cost(pnl, turnover, bps)
     return dates, pnl, turnover, closing
@@ -491,3 +481,88 @@ def _correlation(ids: list[str], dates: list[date], pnl: Floats, since: date) ->
         "highest": highest,
         "lowest": lowest,
     }
+
+
+if __name__ == "__main__":
+    import sys
+    from datetime import date, timedelta
+
+    def stored(first: date, count: int, seed: int) -> tuple[metrics.Days, Floats, Floats]:
+        """``count`` weekdays from ``first``, as :meth:`AlphaVault.series` holds them."""
+        days = [d for d in (first + timedelta(days=k) for k in range(count * 2)) if d.weekday() < 5]
+        rng = np.random.default_rng(seed)
+        return (
+            np.array(days[:count], dtype="datetime64[D]"),
+            rng.normal(0.0, 1e4, count),
+            rng.uniform(0.0, 0.3, count),
+        )
+
+    def plain_frame(
+        series: Series, meta: dict[str, dict[str, Any]], ids: list[str], bps: float
+    ) -> Framed:
+        """:func:`frame` cell by cell, from each Alpha's rows."""
+        days = {a: metrics.with_closing(days_of(series[a]), meta.get(a, {})) for a in ids}
+        dates = sorted({d for a in ids for d, _, _ in days[a]})
+        at = {d: i for i, d in enumerate(dates)}
+        pnl = np.full((len(dates), len(ids)), np.nan)
+        turnover = np.zeros((len(dates), len(ids)))
+        closing = np.zeros((len(dates), len(ids)), dtype=bool)
+        for col, a in enumerate(ids):
+            kept = set(series[a][0].tolist())
+            for day, value, traded in days[a]:
+                pnl[at[day], col], turnover[at[day], col] = value, traded
+                closing[at[day], col] = day not in kept
+        return dates, metrics.after_cost(pnl, turnover, bps) if bps else pnl, turnover, closing
+
+    def plain_net(
+        series: Series, meta: dict[str, dict[str, Any]], bps: float
+    ) -> dict[str, dict[str, float | None]]:
+        """:func:`net_figures` an Alpha at a time, from its rows."""
+        found: dict[str, dict[str, float | None]] = {}
+        for a, kept in series.items():
+            rows = metrics.with_closing(days_of(kept), meta.get(a, {}))
+            turnover = np.array([t for _, _, t in rows])
+            pnl = metrics.after_cost(np.array([p for _, p, _ in rows]), turnover, bps)
+            found[a] = _figures([d for d, _, _ in rows], pnl, turnover, meta.get(a, {}))
+        return found
+
+    series: Series = {
+        "closing": stored(date(2021, 1, 4), 700, 1),
+        "later": stored(date(2021, 6, 1), 520, 2),
+        "short": stored(date(2022, 3, 7), 300, 3),
+    }
+    last = series["closing"][0][-1].item()
+    meta: dict[str, dict[str, Any]] = {
+        # Ends past its last exported day, so BRAIN counts closing days for it.
+        "closing": {
+            "end_date": last + timedelta(days=6),
+            "is_pnl": 2.5e5,
+            "test_start": date(2023, 1, 2),
+            "test_turnover": 0.12,
+        },
+        "short": {"end_date": date(2021, 1, 1), "is_pnl": 1.0},
+    }
+    ids = ["later", "closing", "short"]
+
+    def same(a: Framed, b: Framed) -> bool:
+        return a[0] == b[0] and all(
+            np.array_equal(x, y, equal_nan=True) for x, y in zip(a[1:], b[1:], strict=True)
+        )
+
+    framed = frame(series, meta, ids)
+    checks = {
+        "laid out as cell by cell": same(framed, plain_frame(series, meta, ids, 0.0)),
+        "net of cost as cell by cell": same(
+            frame(series, meta, ids, 5.0), plain_frame(series, meta, ids, 5.0)
+        ),
+        "closing days only after the last exported one": bool(
+            framed[3][:, 1].sum() > 0 and not framed[3][:, [0, 2]].any()
+        )
+        and min(d for d, c in zip(framed[0], framed[3][:, 1], strict=True) if c) > last,
+        "net figures as Alpha by Alpha": net_figures(series, meta, 5.0)
+        == plain_net(series, meta, 5.0),
+        "nothing to lay out": net_figures({}, {}, 5.0) == {},
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"portfolio self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

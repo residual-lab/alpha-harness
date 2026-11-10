@@ -660,8 +660,8 @@ class Catalog:
         """
         if not rows:
             return 0
-        # Built before the lock, as replace_fields does: no writer waits on the conversion.
-        batch = await asyncio.to_thread(self._to_arrow, table, columns, rows)
+        # Built before the lock: no writer waits on the conversion.
+        batch = await asyncio.to_thread(self.to_arrow, table, columns, rows)
         statement = (_upsert_sql(table, columns, overwrite=overwrite, keep=keep), [])
         try:
             await self._locked(self._load, batch, statement)
@@ -676,7 +676,7 @@ class Catalog:
             await self._locked(self._load, batch, statement)
         return len(rows)
 
-    def _to_arrow(
+    def to_arrow(
         self, table: str, columns: tuple[str, ...], rows: list[tuple[Any, ...]]
     ) -> pa.Table:
         """Transpose row tuples into a typed Arrow table."""
@@ -770,17 +770,16 @@ class Catalog:
                     removed = int(found[0]) if found else 0
         return removed
 
-    async def replace_fields(self, scope: list[Any], rows: list[tuple[Any, ...]]) -> int:
-        """Make one scope's fields exactly ``rows``, in one transaction.
+    async def replace_fields(self, scope: list[Any], table: pa.Table) -> int:
+        """Make one scope's fields exactly ``table``'s rows, in one transaction.
 
         Delete then insert: a field BRAIN has removed would otherwise stay selectable and
-        spend a simulation on an error.
+        spend a simulation on an error. ``table`` comes from :meth:`to_arrow` before the call:
+        pivoting 85k rows into columns is pure CPU, and doing it while holding the single
+        writer stalls every other market's write behind it.
         """
-        if not rows:
+        if not len(table):
             return 0
-        # Built before the lock: pivoting 85k rows into columns is pure CPU, and doing it
-        # while holding the single writer stalls every other market's write behind it.
-        table = await asyncio.to_thread(self._to_arrow, "data_field", FIELD_COLUMNS, rows)
         columns = ", ".join(FIELD_COLUMNS)
         await self._locked(
             self._load,
@@ -792,7 +791,7 @@ class Catalog:
             ),
             (f"INSERT INTO data_field ({columns}) SELECT {columns} FROM {_INCOMING}", []),  # noqa: S608
         )
-        return len(rows)
+        return len(table)
 
     async def replace_pnl(self, alpha_id: str, rows: list[tuple[Any, ...]]) -> int:
         """Make one alpha's daily series exactly ``rows``, in one transaction.
@@ -801,7 +800,7 @@ class Catalog:
         """
         if not rows:
             return 0
-        table = await asyncio.to_thread(self._to_arrow, "alpha_pnl", PNL_COLUMNS, rows)
+        table = await asyncio.to_thread(self.to_arrow, "alpha_pnl", PNL_COLUMNS, rows)
         columns = ", ".join(PNL_COLUMNS)
         await self._locked(
             self._load,

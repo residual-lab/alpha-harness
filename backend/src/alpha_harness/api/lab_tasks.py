@@ -17,6 +17,7 @@ import structlog
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.orm import defer
 
 from ..brain.errors import BrainError, BrainRateLimited
 from ..brain.platform import (
@@ -289,11 +290,16 @@ class PowerPoolCorrelation(Out):
 
 
 async def _rows(state: Any) -> list[Study]:
+    """Every task, without its parameters and source: megabytes for a Search Lab space or a
+    long paste, and the list is read every few seconds. :func:`_setups` reads what it shows."""
     async with state.db.session() as session:
         return list(
             (
                 await session.scalars(
-                    select(Study).where(Study.sampler.in_(TASK_SAMPLERS)).order_by(Study.id.desc())
+                    select(Study)
+                    .options(defer(Study.sampler_params), defer(Study.template_source))
+                    .where(Study.sampler.in_(TASK_SAMPLERS))
+                    .order_by(Study.id.desc())
                 )
             ).all()
         )
@@ -392,7 +398,8 @@ def _fields(space: Any) -> int:
     return sum(len(v.get("fields") or {}) for v in variables if isinstance(v, dict))
 
 
-def _task(row: Study, progress: dict[str, Any]) -> LabTask:
+def _setup(row: Study) -> dict[str, Any]:
+    """What a task's entry reads from its parameters and source."""
     # Read raw on purpose: this only displays, and one malformed old row must not take the
     # whole Tasks list down with a validation error.
     params = row.sampler_params or {}
@@ -400,42 +407,65 @@ def _task(row: Study, progress: dict[str, Any]) -> LabTask:
     searched = space.get("decays") if isinstance(space, dict) else None
     # Several decays, swept (Settings Sampler) or searched (Search Lab), stand in for one.
     decays = params.get("decays") or (searched if searched and len(searched) > 1 else [])
+    return {
+        "template": row.template_source if row.sampler == TEMPLATE_SAMPLER else None,
+        "stopping": bool(params.get("stopping")),
+        "region": params.get("region"),
+        "delay": params.get("delay"),
+        "universe": params.get("universe"),
+        "seeds": len(params.get("seeds") or []),
+        "population": params.get("population"),
+        "mutationRate": params.get("mutationRate"),
+        "decay": None if decays else params.get("decay"),
+        "decays": decays,
+        "visualization": bool(params.get("visualization")),
+        "alphaId": params.get("alphaId"),
+        "markets": params.get("markets"),
+        "truncation": params.get("truncation"),
+        "truncationAgent": bool(params.get("truncationAgent")),
+        "nanHandling": params.get("nanHandling"),
+        "testPeriod": params.get("testPeriod"),
+        "expression": row.template_source if row.sampler in ONE_EXPRESSION else None,
+        "cores": scheduler.cores_of(row),
+        "datasetIds": params.get("datasetIds") or [],
+        "fields": _fields(params.get("space")),
+        "llmModels": (params.get("llm") or {}).get("byModel") or {},
+        "queuedAt": params.get("queuedAt"),
+    }
+
+
+#: Each task's :func:`_setup`, with the update time it was read at: a task is read whole again
+#: only once its row has changed.
+_SETUPS: dict[int, tuple[Any, dict[str, Any]]] = {}
+
+
+async def _setups(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
+    """Each of ``rows``' :func:`_setup`. A task deleted since they were read may be missing."""
+    changed = [r.id for r in rows if r.id not in _SETUPS or _SETUPS[r.id][0] != r.updated_at]
+    async with state.db.session() as session:
+        for chunk in itertools.batched(changed, TRIAL_CHUNK, strict=False):
+            for row in await session.scalars(select(Study).where(Study.id.in_(chunk))):
+                _SETUPS[row.id] = (row.updated_at, _setup(row))
+    return {r.id: _SETUPS[r.id][1] for r in rows if r.id in _SETUPS}
+
+
+def _task(row: Study, progress: dict[str, Any], setup: dict[str, Any] | None = None) -> LabTask:
+    """A task's entry; ``setup`` is its :func:`_setup`, read from ``row`` when not given."""
     states = progress["states"]
     told = states.get(TrialState.COMPLETE, 0) + states.get(TrialState.FAIL, 0)
     template = row.sampler == TEMPLATE_SAMPLER
     objective = OBJECTIVES.get((row.objectives or ["sharpe"])[0], OBJECTIVES["sharpe"])
     return LabTask.model_validate(
-        {
+        (_setup(row) if setup is None else setup)
+        | {
             "id": row.id,
             "name": row.label,
             "lab": row.sampler,
             "labName": TASK_SAMPLERS.get(row.sampler, row.sampler),
             "templateName": row.template_name if template else None,
-            "template": row.template_source if template else None,
             "status": row.status,
-            "stopping": bool(params.get("stopping")),
             "message": row.message,
-            "region": params.get("region"),
-            "delay": params.get("delay"),
-            "universe": params.get("universe"),
-            "seeds": len(params.get("seeds") or []),
-            "population": params.get("population"),
-            "mutationRate": params.get("mutationRate"),
-            "decay": None if decays else params.get("decay"),
-            "decays": decays,
-            "visualization": bool(params.get("visualization")),
-            "alphaId": params.get("alphaId"),
-            "markets": params.get("markets"),
-            "truncation": params.get("truncation"),
-            "truncationAgent": bool(params.get("truncationAgent")),
-            "nanHandling": params.get("nanHandling"),
-            "testPeriod": params.get("testPeriod"),
-            "expression": row.template_source if row.sampler in ONE_EXPRESSION else None,
-            "cores": scheduler.cores_of(row),
-            "datasetIds": params.get("datasetIds") or [],
-            "fields": _fields(params.get("space")),
             "target": row.max_trials,
-            "llmModels": (params.get("llm") or {}).get("byModel") or {},
             # What spent quota, as the scheduler counts toward the target.
             "simulated": told - progress["free"] - progress["fullRuns"],
             "cached": progress["free"],
@@ -452,7 +482,6 @@ def _task(row: Study, progress: dict[str, Any]) -> LabTask:
             "best": progress["best"],
             "objectiveLabel": objective.label,
             "createdAt": row.created_at.isoformat() if row.created_at else None,
-            "queuedAt": params.get("queuedAt"),
             "startedAt": row.started_at.isoformat() if row.started_at else None,
             "finishedAt": row.finished_at.isoformat() if row.finished_at else None,
         }
@@ -469,7 +498,11 @@ async def list_tasks(state: State) -> LabTasks:
     """Every task, newest first, and the slots they share."""
     rows = await _rows(state)
     progress = await _progress(state, rows)
-    return LabTasks(slots=state.engine.slots, tasks=[_task(r, progress[r.id]) for r in rows])
+    setups = await _setups(state, rows)
+    return LabTasks(
+        slots=state.engine.slots,
+        tasks=[_task(r, progress[r.id], setups[r.id]) for r in rows if r.id in setups],
+    )
 
 
 async def _queue(state: Any, ids: list[int]) -> None:
@@ -830,6 +863,7 @@ async def remove(task_id: int, state: State) -> TaskRemoved:
         await state.optimizer.delete(task_id)
         await state.engine.set_quota(row.task, 0, enabled=False)
     _COMPLETE_PROGRESS.pop(task_id, None)
+    _SETUPS.pop(task_id, None)
     await state.optimizer.notify()
     return TaskRemoved(removed=task_id)
 

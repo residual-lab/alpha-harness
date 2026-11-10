@@ -59,7 +59,10 @@ def _tfidf(docs: list[list[str]]) -> tuple[np.ndarray, np.ndarray]:
     those columns are words rather than numbers."""
     n = len(docs)
     df = Counter(w for doc in docs for w in set(doc))
-    vocab = {w: i for i, w in enumerate(w for w, k in df.items() if 1 < k <= max(1, n // 2))}
+    # Sorted: in first-seen order the columns followed each run's string hashing, and so did
+    # the last bits of every similarity, which turned near-ties into different picks.
+    shared = sorted(w for w, k in df.items() if 1 < k <= max(1, n // 2))
+    vocab = {w: i for i, w in enumerate(shared)}
     x = np.zeros((n, len(vocab)), np.float32)
     for row, doc in enumerate(docs):
         for w, k in Counter(doc).items():

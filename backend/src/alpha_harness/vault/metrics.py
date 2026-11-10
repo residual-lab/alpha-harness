@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 type Floats = npt.NDArray[np.float64]
 type Bools = npt.NDArray[np.bool_]
+type Days = npt.NDArray[np.datetime64]
 
 #: Days two Alphas must share before their correlation means anything.
 MIN_OVERLAP = 250
@@ -356,28 +357,108 @@ def correlations(m: Floats, against: Floats | None = None) -> Floats:
     # "did they ever overlap" and quietly retire the whole correlation ceiling.
     have = (~np.isnan(m)).astype(np.float64)
     z = np.nan_to_num(m)
-    zz = z * z
     if against is None:
-        have_r, z_r, zz_r = have, z, zz
+        have_r, z_r = have, z
     else:
         have_r = (~np.isnan(against)).astype(np.float64)
         z_r = np.nan_to_num(against)
-        zz_r = z_r * z_r
 
+    # In place, in the order the plain formulas run, so the figures match them to the bit: at
+    # 2,000 Alphas each Alpha-by-Alpha array is 30 MB, and 20,000 against a pool make each
+    # days-by-Alphas one 150 MB.
     count = have.T @ have_r
+    usable = count >= MIN_OVERLAP
+    safe = np.maximum(count, 1.0, out=count)
     sum_l = z.T @ have_r
     sum_r = sum_l.T if against is None else have.T @ z_r
-    square_l = zz.T @ have_r
-    square_r = square_l.T if against is None else have.T @ zz_r
-    safe = np.maximum(count, 1.0)
+    cov = z.T @ z_r
+    # Squared in place once ``cov`` is taken: one days-by-Alphas copy the fewer.
+    np.square(z, out=z)
+    if against is not None:
+        np.square(z_r, out=z_r)
+    square_l = z.T @ have_r
+    square_r = None if against is None else have.T @ z_r
+    del have, have_r, z, z_r
 
-    cov = (z.T @ z_r) - sum_l * sum_r / safe
-    dev_l = np.sqrt(np.maximum(square_l - sum_l**2 / safe, 0.0))
-    dev_r = np.sqrt(np.maximum(square_r - sum_r**2 / safe, 0.0))
-    usable = (dev_l > 0) & (dev_r > 0) & (count >= MIN_OVERLAP)
+    scratch = np.multiply(sum_l, sum_r)
+    scratch /= safe
+    cov -= scratch
+    # Each sum of squares becomes its spread in place.
+    for square, total in ((square_l, sum_l), (square_r, sum_r)):
+        if square is not None:
+            np.square(total, out=scratch)
+            scratch /= safe
+            square -= scratch
+            np.maximum(square, 0.0, out=square)
+            np.sqrt(square, out=square)
+    dev_l = square_l
+    # ``count`` is whole numbers, so exactly symmetric, and so is the spread worked out from it.
+    dev_r = dev_l.T if square_r is None else square_r
+    usable &= dev_l > 0
+    usable &= dev_r > 0
+    np.multiply(dev_l, dev_r, out=scratch)
+    np.maximum(scratch, 1e-12, out=scratch)
+    out = np.divide(cov, scratch, out=cov)
+    out[~usable] = np.nan
     # Cancellation in the one-pass moments can land a correlation a few ulps outside [-1, 1],
     # which is harmless arithmetic and an alarming thing to print next to a 0.50 ceiling.
-    out = np.clip(np.where(usable, cov / np.maximum(dev_l * dev_r, 1e-12), np.nan), -1.0, 1.0)
+    np.clip(out, -1.0, 1.0, out=out)
     if against is None:
         np.fill_diagonal(out, 1.0)
     return out
+
+
+if __name__ == "__main__":
+    import sys
+
+    def plain(m: Floats, against: Floats | None = None) -> Floats:
+        """:func:`correlations` as its formulas read, a new array at every step."""
+        have = (~np.isnan(m)).astype(np.float64)
+        z = np.nan_to_num(m)
+        zz = z * z
+        if against is None:
+            have_r, z_r, zz_r = have, z, zz
+        else:
+            have_r = (~np.isnan(against)).astype(np.float64)
+            z_r = np.nan_to_num(against)
+            zz_r = z_r * z_r
+        count = have.T @ have_r
+        sum_l = z.T @ have_r
+        sum_r = sum_l.T if against is None else have.T @ z_r
+        square_l = zz.T @ have_r
+        square_r = square_l.T if against is None else have.T @ zz_r
+        safe = np.maximum(count, 1.0)
+        cov = (z.T @ z_r) - sum_l * sum_r / safe
+        dev_l = np.sqrt(np.maximum(square_l - sum_l**2 / safe, 0.0))
+        dev_r = np.sqrt(np.maximum(square_r - sum_r**2 / safe, 0.0))
+        usable = (dev_l > 0) & (dev_r > 0) & (count >= MIN_OVERLAP)
+        out = np.clip(np.where(usable, cov / np.maximum(dev_l * dev_r, 1e-12), np.nan), -1.0, 1.0)
+        if against is None:
+            np.fill_diagonal(out, 1.0)
+        return out
+
+    rng = np.random.default_rng(7)
+    days, alphas = 700, 40
+    pnl = rng.normal(0.0, 1e4, (days, alphas))
+    starts = rng.integers(0, 500, alphas)
+    pnl[np.arange(days)[:, None] < starts] = np.nan
+    pnl[rng.random(pnl.shape) < 0.03] = np.nan
+    pnl[:, 0] = 5.0  # never moves: no spread to correlate
+    pnl[:, 1] = np.nan
+    pool = rng.normal(0.0, 1e4, (days, 6))
+    alone, against = correlations(pnl), correlations(pnl, pool)
+    checks = {
+        "every pair as the formulas give it, to the bit": np.array_equal(
+            alone, plain(pnl), equal_nan=True
+        ),
+        "against a pool, to the bit": np.array_equal(against, plain(pnl, pool), equal_nan=True),
+        "the input left as it was": bool(np.isnan(pnl[:, 1]).all() and (pnl[:, 0] == 5.0).all()),
+        "symmetric": np.array_equal(alone, alone.T, equal_nan=True),
+        "an Alpha that never moves is unmeasured": bool(np.isnan(alone[0, 1:]).all()),
+        "some pairs measured, none outside [-1, 1]": bool(
+            np.count_nonzero(~np.isnan(against)) > 0 and np.nanmax(np.abs(alone)) <= 1.0
+        ),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"metrics self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")
