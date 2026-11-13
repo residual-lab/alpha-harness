@@ -100,7 +100,9 @@ async def apply(request: Request, background: BackgroundTasks) -> UpdateStarted:
     if not updates.is_newer(release.version, updates.current()):
         raise refuse(409, "already_current", f"Already running {updates.current()}.")
     try:
-        updates.request(release.version, wheel_url=release.wheel_url)
+        updates.request(
+            release.version, wheel_url=release.wheel_url, wheel_digest=release.wheel_digest
+        )
     except RuntimeError as exc:
         raise refuse(409, "no_launcher", str(exc)) from exc
 

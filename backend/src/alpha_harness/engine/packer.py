@@ -310,13 +310,17 @@ def match_children(
     resolved: dict[int, dict[str, Any]] = {}
     unmatched: list[tuple[str, dict[str, Any]]] = []
     for child_id, body in children:
-        match = next(
+        echoed = (body.get("settings") or {}).keys()
+        # Of the rows that fit, the one that pinned the most of what BRAIN echoed: a row that
+        # left a setting to BRAIN's default fits a sibling's child as well as its own.
+        match = max(
             (
                 record_id
                 for record_id, payload in payloads.items()
                 if record_id not in resolved and _asked_for(payload, body)
             ),
-            None,
+            key=lambda record_id: len((payloads[record_id].get("settings") or {}).keys() & echoed),
+            default=None,
         )
         if match is not None:
             resolved[match] = {"platform_id": child_id, "body": body}

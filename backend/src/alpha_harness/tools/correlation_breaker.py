@@ -402,12 +402,20 @@ def _unbuilt(id_: str, name: str, missing: str) -> Recipe:
 
 #: What a re-shape written by hand is known by, ahead of the id its card gave it.
 CUSTOM = "custom:"
+NAME_LIMIT = 120
+CODE_LIMIT = 4000
 
 
 def custom_recipe(key: str, name: str, code: str) -> Recipe:
     """A re-shape written by hand around ``alpha``: any statements it needs, then the line
     that runs. One that cannot run says why, as a built-in one does."""
     id_ = CUSTOM + key
+    if not name:
+        return _unbuilt(id_, name, "has no name: give it one")
+    if len(name) > NAME_LIMIT:
+        return _unbuilt(id_, name, f"name is {len(name)} characters: keep it to {NAME_LIMIT}")
+    if len(code) > CODE_LIMIT:
+        return _unbuilt(id_, name, f"is {len(code)} characters: keep it to {CODE_LIMIT}")
     try:
         tree = parse(code)
     except ParseError as exc:

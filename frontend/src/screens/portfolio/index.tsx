@@ -11,6 +11,7 @@ import { toast } from 'sonner'
 import { tasks } from '@/api/core'
 import { errorMessage } from '@/api/http'
 import { REGION_AGNOSTIC_CLASS } from '@/api/platform'
+import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
 import { CORE_METRICS, CORE_ORDER, DASH, fmt } from '@/lib/format'
 import { useLive } from '@/lib/live'
@@ -225,9 +226,12 @@ export function PortfolioScreen() {
   const included = all.filter(isIncluded).map((m) => m.alphaId)
   const ids = [...included].sort()
   const copy = useMutation({
-    mutationFn: () => portfolio.markdown(included),
-    onSuccess: async ({ text, unsynced }) => {
-      await navigator.clipboard.writeText(text)
+    mutationFn: () =>
+      copyText(
+        () => portfolio.markdown(included),
+        ({ text }) => text,
+      ),
+    onSuccess: ({ unsynced }) => {
       toast.success(`Copied ${included.length} Alpha${included.length === 1 ? '' : 's'}`)
       if (unsynced > 0)
         toast.warning(

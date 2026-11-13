@@ -299,6 +299,7 @@ export function CorrelationBreakerScreen() {
                               <Input
                                 aria-label="Re-shape name"
                                 className="max-w-md flex-1 font-medium"
+                                maxLength={120}
                                 value={own.name}
                                 onChange={(e) => updateReshape(own.id, { name: e.target.value })}
                               />
@@ -356,6 +357,7 @@ export function CorrelationBreakerScreen() {
                         <Textarea
                           aria-label={`${own.name}, written around alpha`}
                           className="mt-2 font-mono"
+                          maxLength={4000}
                           rows={Math.min(8, Math.max(2, own.code.split('\n').length + 1))}
                           spellCheck={false}
                           value={own.code}

@@ -20,3 +20,5 @@ __pycache__/
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
 desktop/src-tauri/binaries/
+# The browser's Fast Expression parser builds here; its .wasm is committed to the frontend.
+crates/fastexpr/target/

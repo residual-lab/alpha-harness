@@ -469,6 +469,12 @@ class Catalog:
             amount, unit = str(row[0]).split()
             share = float(amount) * MEMORY_SHARE / DUCKDB_DEFAULT_SHARE
             root.execute(f"SET GLOBAL memory_limit = '{share:.1f} {unit}'")
+        # DuckDB's allocator on Linux hands back a thread's freed memory only past a 128 MiB
+        # peak, so sorting 2,000 series left 300 MB behind, measured; at zero it does after
+        # every task, at no cost measured. Windows builds use the system's, which gave it back
+        # unasked. Not ``allocator_background_threads``: any other DuckDB connection opening or
+        # closing switches that off for the whole process.
+        root.execute("SET GLOBAL allocator_flush_threshold = '0 MiB'")
         root.execute(SCHEMA)
         for table, column, kind in root.execute(
             "SELECT table_name, column_name, data_type FROM duckdb_columns() "

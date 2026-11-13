@@ -10,6 +10,7 @@ retry loop that tries each key in turn burns a request from every key on a bad d
 """
 
 import asyncio
+import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -22,9 +23,13 @@ from .budget import Ledger
 from .keys import BudgetExhaustedError, KeyStore, LLMError, LLMUnavailable
 from .openai_compat import OpenAICompatible, ProviderError
 from .providers import PROVIDERS
+from .providers import get as get_provider
 from .text import estimate_tokens
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from openai.types.chat.completion_create_params import ResponseFormat
     from openai.types.shared import ReasoningEffort
 
     from ..db.sqlite import Database
@@ -99,6 +104,17 @@ def _rejects_temperature(exc: Exception) -> bool:
     return _status(exc) == 400 and "temperature" in str(exc).lower()
 
 
+#: How providers word a refusal of the answer's format rather than of the request.
+_FORMAT_WORDS = ("response_format", "response format", "schema", "json_object", "json mode")
+
+
+def _rejects_format(exc: Exception) -> bool:
+    """A 400 about the answer's format: the model takes a looser one. Servers that validate
+    with FastAPI or TGI answer 422 for the same thing."""
+    text = str(exc).lower()
+    return _status(exc) in (400, 422) and any(word in text for word in _FORMAT_WORDS)
+
+
 def _refused(exc: Exception) -> bool:
     """Whether the key was turned away rather than the request: another key may get in."""
     text = str(exc).lower()
@@ -136,6 +152,41 @@ def _effort(model: ModelInfo, thinking: str | None) -> ReasoningEffort:
     return "low" if effort == "minimal" and model.id.startswith(_NO_MINIMAL) else effort
 
 
+#: Providers that take a ``prompt_cache_key``, which keeps requests sharing one on the same
+#: prompt cache: Mistral says it raises the chance of a hit, OpenAI that it steers routing.
+_CACHE_KEYS = frozenset({"mistral", "openai"})
+
+#: Providers whose strict schemas take an array's length. Anthropic refuses ``maxItems`` and a
+#: ``minItems`` above 1 with a 400, Cerebras both, and the rest don't document either.
+_ARRAY_LENGTHS = frozenset({"google", "openai"})
+
+
+def _without_lengths(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {
+            k: _without_lengths(v) for k, v in node.items() if k not in {"minItems", "maxItems"}
+        }
+    if isinstance(node, list):
+        return [_without_lengths(v) for v in node]
+    return node
+
+
+def _formats(provider: str, schema: dict[str, Any]) -> tuple[ResponseFormat | None, ...]:
+    """What a model can be asked to answer in, strictest first: the schema, which the provider
+    holds the answer to; any JSON object; or the prompt's own words alone. Every prompt names
+    its keys and every parser reads a fenced block too, so each one still works."""
+    if provider not in _ARRAY_LENGTHS:
+        schema = _without_lengths(schema)
+    return (
+        {
+            "type": "json_schema",
+            "json_schema": {"name": "answer", "schema": schema, "strict": True},
+        },
+        {"type": "json_object"},
+        None,
+    )
+
+
 class LLMService:
     """The assistant: keys, budget and models in one place."""
 
@@ -147,6 +198,9 @@ class LLMService:
         #: Models that refused a temperature. Learned from the refusal, because nothing
         #: publishes which models take one; forgotten on restart, costing one 400 each.
         self._default_sampling: set[str] = set()
+        #: How many steps down :func:`_formats` each model has gone, learned the same way:
+        #: not every model takes a schema, and Anthropic takes nothing else.
+        self._looser: dict[str, int] = {}
         self._http = DefaultAsyncHttpxClient(
             timeout=TIMEOUT_SECONDS, limits=httpx2.Limits(keepalive_expiry=KEEPALIVE_SECONDS)
         )
@@ -157,10 +211,11 @@ class LLMService:
     # -- plumbing --------------------------------------------------------
 
     def _client(self, provider: str, secret: str) -> OpenAICompatible:
-        # Not providers.get: its fallback to Google would send another provider's key there.
+        # PROVIDERS itself, not get(): a retired provider has a stub there with no endpoint.
         spec = PROVIDERS.get(provider)
         if spec is None:
-            raise LLMError(f"{provider!r} is not a provider this application knows.")
+            gone = get_provider(provider)
+            raise LLMError(f"{gone.label} cannot be used. {gone.retired}")
         return OpenAICompatible(spec.base_url, secret, self._http)
 
     async def runnable(self) -> list[dict[str, Any]]:
@@ -186,13 +241,18 @@ class LLMService:
     def model_for(self, ref: str | None) -> ModelInfo:
         """The model asked for, or with none named, the set-up one with most to spend."""
         if not ref:
-            models = self.registry.all()
+            models = [m for m in self.registry.all() if m.provider in PROVIDERS]
             if not models:
                 raise LLMError("No model is set up yet. Set one up under LLM Integration › Models.")
             return models[0]
         model = self.registry.get(ref)
         if model is None:
             raise LLMError(f"{ref} is not set up. Set it up under LLM Integration › Models.")
+        if model.retired:
+            raise LLMError(
+                f"{model.id} is not used: {model.retired} Remove it under LLM Integration › "
+                "Models and pick another model."
+            )
         return model
 
     # -- the one call ----------------------------------------------------
@@ -212,18 +272,26 @@ class LLMService:
 
         ``thinking`` is one of Google's thinking levels. Not a free upgrade: thinking tokens
         are billed against the same per-minute budget as the answer.
+
+        ``response_schema`` goes as a strict JSON schema; a model that refuses it is asked for
+        a looser format from then on, as :func:`_formats` lists them.
         """
         model = self.model_for(model_ref)
         estimate = estimate_tokens(system) + estimate_tokens(user)
         tried: set[int] = set()
         refusal: LLMError | None = None
         effort = _effort(model, thinking)
-        # Google holds the answer to the schema. The others are only asked for a JSON object,
-        # which not all of them honour either; the prompt names the keys it needs.
-        schema = response_schema if model.provider == "google" else None
+        formats = _formats(model.provider, response_schema)
+        # One per system prompt: every call of a lab, or of the assistant, starts the same way.
+        cache_key = (
+            hashlib.sha256(system.encode()).hexdigest()[:16]
+            if model.provider in _CACHE_KEYS
+            else None
+        )
         sampling = None if model.ref in self._default_sampling else temperature
 
         while True:
+            level = self._looser.get(model.ref, 0)
             try:
                 key_id = await self.keys.choose(model, skip=tried)
             except BudgetExhaustedError as exc:
@@ -247,8 +315,9 @@ class LLMService:
                             system=system,
                             user=user,
                             temperature=sampling,
-                            schema=schema,
+                            response_format=formats[level],
                             reasoning_effort=effort,
+                            prompt_cache_key=cache_key,
                         ),
                         timeout=TIMEOUT_SECONDS,
                     )
@@ -266,6 +335,12 @@ class LLMService:
                         log.info("llm.temperature_refused", model=model.id)
                         self._default_sampling.add(model.ref)
                         sampling = None
+                        tried.discard(key_id)
+                        continue
+                    if level + 1 < len(formats) and _rejects_format(exc):
+                        # Likewise for the format: the next one down, on the same key.
+                        log.info("llm.format_refused", model=model.id, error=str(exc)[:200])
+                        self._looser[model.ref] = max(level + 1, self._looser.get(model.ref, 0))
                         tried.discard(key_id)
                         continue
                     limited, daily = _is_rate_limit(exc)
@@ -348,3 +423,177 @@ class LLMService:
         # The reason is shown beside the field where the id can still be typed.
         except Exception as exc:  # noqa: BLE001
             return {"models": [], "error": str(exc)[:300]}
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+    from types import SimpleNamespace
+
+    from ..labs.power_pool import SCHEMA as ALPHAS
+    from ..labs.power_pool import parse_alphas
+    from ..tools import description
+    from .chat import FIELD_PICK_SCHEMA
+    from .chat import _parse as read_picks  # pyright: ignore[reportPrivateUsage]
+    from .registry import ModelInfo as Model
+
+    def closed(node: Any) -> bool:
+        """Every object shut to other keys and every key required, as strict schemas want."""
+        if isinstance(node, list):
+            return all(closed(v) for v in node)
+        if not isinstance(node, dict):
+            return True
+        shut = node.get("type") != "object" or (
+            node.get("additionalProperties") is False
+            and set(node.get("required", [])) == set(node.get("properties", {}))
+        )
+        return shut and all(closed(v) for v in node.values())
+
+    def completion(content: str) -> httpx2.Response:
+        message = {"role": "assistant", "content": content}
+        body: dict[str, Any] = {"id": "c", "object": "chat.completion", "created": 0, "model": "m"}
+        body["choices"] = [{"index": 0, "finish_reason": "stop", "message": message}]
+        body["usage"] = {"prompt_tokens": 9, "completion_tokens": 3, "total_tokens": 12}
+        return httpx2.Response(200, json=body)
+
+    def refusal(message: str, status: int = 400) -> httpx2.Response:
+        return httpx2.Response(status, json={"error": {"message": message}})
+
+    def kind(body: dict[str, Any]) -> str | None:
+        return (body.get("response_format") or {}).get("type")
+
+    async def nothing(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    opened: list[LLMService] = []
+
+    def service(
+        provider: str, answer: Callable[[dict[str, Any]], httpx2.Response]
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        """An LLMService with one key, whose provider answers each request with ``answer``."""
+        sent: list[dict[str, Any]] = []
+
+        def handle(request: httpx2.Request) -> httpx2.Response:
+            sent.append(json.loads(request.content))
+            return answer(sent[-1])
+
+        model = Model(id="m", provider=provider, rpm=60, rpd=1000, reset_timezone="UTC")
+
+        async def choose(info: Model, *, skip: set[int]) -> int:
+            if 1 in skip:
+                raise BudgetExhaustedError(info, [])
+            return 1
+
+        async def secret(_key_id: int) -> str:
+            return "test-key"
+
+        llm: Any = LLMService.__new__(LLMService)
+        llm.registry = SimpleNamespace(get=lambda _ref: model)
+        llm.keys = SimpleNamespace(choose=choose, secret=secret, mark=nothing)
+        llm.ledger = SimpleNamespace(record=nothing, penalise=nothing, settled=lambda *_: None)
+        llm._default_sampling, llm._looser = set[str](), dict[str, int]()
+        llm._http = DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handle))
+        opened.append(llm)
+        return llm, sent
+
+    async def ask(llm: Any, schema: dict[str, Any]) -> Answer:
+        return await llm.generate(
+            system="s", user="u", model_ref="m", response_schema=schema, temperature=0.5
+        )
+
+    alphas = json.dumps(
+        {"alphas": [{"expression": f"rank(ts_delta(close, {d}))"} for d in range(20)]}
+    )
+    parts = json.dumps({part: f"{part} " * 30 for part in description.PARTS})
+
+    async def mocked() -> dict[str, bool]:
+        found: dict[str, bool] = {}
+
+        llm, sent = service("google", lambda _body: completion(alphas))
+        answer = await ask(llm, ALPHAS)
+        schema = sent[0]["response_format"]["json_schema"]
+        found["google: strict schema, lengths kept"] = (
+            schema["strict"] is True and schema["schema"] == ALPHAS
+        )
+        found["a schema answer parses as before"] = len(parse_alphas(answer.text)) == 20
+        found["no cache key where none is taken"] = "prompt_cache_key" not in sent[0]
+
+        llm, sent = service("mistral", lambda _body: completion(alphas))
+        await ask(llm, ALPHAS)
+        await ask(llm, ALPHAS)
+        keys = {b.get("prompt_cache_key") for b in sent}
+        found["mistral: one cache key for one system prompt"] = len(keys) == 1 and None not in keys
+
+        llm, sent = service(
+            "groq",
+            lambda body: (
+                refusal("`json_schema` is not supported with this model")
+                if kind(body) == "json_schema"
+                else completion(alphas)
+            ),
+        )
+        first = await ask(llm, ALPHAS)
+        await ask(llm, ALPHAS)
+        found["400 to json_schema: json_object on the same key, remembered"] = [
+            kind(b) for b in sent
+        ] == ["json_schema", "json_object", "json_object"] and len(parse_alphas(first.text)) == 20
+        found["no array lengths where they are not documented"] = "minItems" not in json.dumps(
+            sent[0]["response_format"]
+        )
+
+        llm, sent = service(
+            "anthropic",
+            lambda body: (
+                completion(parts)
+                if kind(body) is None
+                else refusal(f"response_format: {kind(body)} is not supported")
+            ),
+        )
+        written = description.read((await ask(llm, description.SCHEMA)).text)
+        found["refused twice: the prompt alone, still read"] = (
+            [kind(b) for b in sent] == ["json_schema", "json_object", None]
+            and "response_format" not in sent[2]
+            and written is not None
+        )
+
+        llm, sent = service(
+            "huggingface",
+            lambda body: (
+                refusal("Input validation error: grammar schema", 422)
+                if kind(body) == "json_schema"
+                else completion(parts)
+            ),
+        )
+        await ask(llm, description.SCHEMA)
+        found["422 about the schema steps down too"] = [kind(b) for b in sent] == [
+            "json_schema",
+            "json_object",
+        ]
+
+        llm, sent = service("openai", lambda _body: refusal("maximum context length is 8192"))
+        try:
+            await ask(llm, ALPHAS)
+            found["any other 400 fails as before"] = False
+        except LLMError:
+            found["any other 400 fails as before"] = len(sent) == 1 and not llm._looser
+
+        for each in opened:
+            await each.aclose()
+        return found
+
+    nothing_fits = {"reply": "Nothing fits.", "picks": [], "datasets": []}
+    checks = {
+        "every response schema is strict": all(
+            closed(s) for s in (ALPHAS, description.SCHEMA, FIELD_PICK_SCHEMA)
+        ),
+        "lengths only for google and openai, schema untouched": (
+            "minItems" in json.dumps(_formats("openai", ALPHAS)[0])
+            and "minItems" not in json.dumps(_formats("cerebras", ALPHAS)[0])
+            and ALPHAS["properties"]["alphas"]["minItems"] == 20
+        ),
+        "picks read as before": read_picks(json.dumps(nothing_fits)) == nothing_fits,
+        **asyncio.run(mocked()),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"service self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

@@ -73,8 +73,25 @@ check:
       run: pnpm check
     - name: contract
       run: sh frontend/tools/codegen/generate.sh --check frontend/src/api/generated.ts
+    # The browser's Fast Expression parser, as crates/fastexpr builds it. `test` reads it beside
+    # labs/fastexpr.py, alpha_harness.labs.fastexpr_conformance being a self-check.
+    - name: fastexpr
+      run: sh crates/fastexpr/build.sh --check frontend/src/lib/fastexpr.wasm
     - name: design
       run: sh frontend/tools/design-lint.sh DESIGN.md
+
+# Property tests (Hypothesis, fast-check), and every backend module's `python -m` self-check.
+test:
+  parallel: true
+  jobs:
+    - name: backend
+      root: backend/
+      run: uv run pytest
+    # Vitest runs from here, so the frontend's scripts stay dev, check, format and build. West
+    # of UTC is where a bare date read in local time shows the day before.
+    - name: frontend
+      root: frontend/
+      run: TZ=America/Los_Angeles pnpm exec vitest run
 
 build:
   jobs:
@@ -86,8 +103,8 @@ build:
       root: backend/
       run: uv export --frozen --no-dev --no-emit-project -o dist/constraints.txt
 
-# Full gate: check -> build, each stage running both halves in parallel.
+# Full gate: check -> test -> build, each stage running both halves in parallel.
 gate:
   jobs:
     - name: gate
-      run: lefthook run check && lefthook run build
+      run: lefthook run check && lefthook run test && lefthook run build

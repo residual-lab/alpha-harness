@@ -7,7 +7,6 @@ only decides how one point of its search is drawn (its ``draw``).
 
 import asyncio
 import functools
-import json
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -17,6 +16,7 @@ from ..brain.platform import MULTI_SIMULATION_SIZE
 from ..brain.schemas import SimulationRequest, SimulationSettings, SimulationType
 from ..brain.settings_schema import validate_settings
 from ..db.models import SimStatus, SimulationRecord, Study, StudyStatus, Trial, TrialState, utcnow
+from ..db.sqlite import loads
 from . import ga, refusals, search, template
 from .objectives import StudyNotFoundError
 from .params import (
@@ -479,7 +479,7 @@ async def advance(optimizer: Optimizer, row: Study) -> int:
                     raw_json(Trial.params),
                     Trial.expression,
                     raw_json(Trial.settings),
-                    raw_json(Trial.values),
+                    Trial.score,
                     Trial.message,
                 ).where(Trial.study_id == study_id, Trial.state != TrialState.PRUNED)
             )
@@ -530,7 +530,7 @@ def _not_free() -> Any:
 
 def full_run() -> Any:
     """SQL for a trial that runs a passing Quick Alpha again in Full mode."""
-    return func.json_extract(Trial.params, "$.fullOf").is_not(None)
+    return Trial.full_of.is_not(None)
 
 
 def _search_memory(
@@ -546,20 +546,19 @@ def _search_memory(
 
     @functools.cache
     def settings_of(raw: str | None) -> str:
-        return search.settings_identity(json.loads(raw or "null"))
+        return search.settings_identity(loads(raw or "null"))
 
     tried: set[Any] = set()
     seen: dict[tuple[str, str], float | bool] = {}
     refused: set[refusals.Refusal] = set()
-    for state, params, expression, settings, values, message in rows:
-        tried.add((json.loads(params or "null") or {}).get(covers))
+    for state, params, expression, settings, score, message in rows:
+        tried.add((loads(params or "null") or {}).get(covers))
         key = (expression or "", settings_of(settings))
-        scores = json.loads(values or "null")
-        if state == TrialState.COMPLETE and scores:
-            seen[key] = float(scores[0])
+        if state == TrialState.COMPLETE and score is not None:
+            seen[key] = float(score)
         elif state == TrialState.FAIL:
             seen[key] = False
-            refused |= refusals.from_message(message, json.loads(settings or "null"))
+            refused |= refusals.from_message(message, loads(settings or "null"))
     return tried, seen, refused
 
 
@@ -617,23 +616,21 @@ async def _breed(
 ) -> int:
     """Evolution Lab's refill: children of the best Alphas so far, until the search stalls."""
     async with optimizer.db.session() as session:
-        # Only what the stall check reads: spent children's scores, in the order asked.
-        spent_rows = (
-            await session.execute(
-                select(
-                    Trial.state,
-                    raw_json(Trial.values),
-                    func.json_extract(Trial.result, "$.implausible"),
+        # Only what the stall check reads: spent children's scores, in the order asked. Sorted
+        # here: ordered in SQL, the read left the index for every child's row, 120 ms against 10.
+        spent_rows = sorted(
+            (
+                await session.execute(
+                    select(Trial.number, Trial.state, Trial.score, Trial.implausible).where(
+                        Trial.study_id == row.id,
+                        Trial.generation > 0,
+                        _not_free(),
+                        Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL]),
+                    )
                 )
-                .where(
-                    Trial.study_id == row.id,
-                    Trial.generation > 0,
-                    _not_free(),
-                    Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL]),
-                )
-                .order_by(Trial.number)
-            )
-        ).all()
+            ).tuples(),
+            key=lambda spent: spent[0],
+        )
     if await asyncio.to_thread(lambda: ga.stalled(_spent(spent_rows))):
         if not waiting:
             await finish(optimizer, row.id, StudyStatus.COMPLETE, ga.STALLED)
@@ -672,12 +669,10 @@ async def _breed(
 def _spent(rows: Sequence[Any]) -> list[float | None]:
     """Each spent child's score, ``None`` for one that failed. An implausible one failed too:
     counted as found, a straight line would keep a stalled search breeding."""
-    out: list[float | None] = []
-    for state, values, flagged in rows:
-        scores = json.loads(values or "null")
-        good = state == TrialState.COMPLETE and scores and not flagged
-        out.append(float(scores[0]) if good else None)
-    return out
+    return [
+        float(score) if state == TrialState.COMPLETE and score is not None and not flagged else None
+        for _number, state, score, flagged in rows
+    ]
 
 
 async def stop_task(optimizer: Optimizer, row: Study, *, force: bool = False) -> None:
@@ -986,6 +981,7 @@ if __name__ == "__main__":
     from types import SimpleNamespace
 
     import optuna as _optuna
+    from sqlalchemy.dialects import sqlite
 
     from ..db.sqlite import Database
     from ..engine.slots import BatchEngine
@@ -1095,6 +1091,44 @@ if __name__ == "__main__":
                 engine_like: Any = SimpleNamespace(db=db, tracker=SimpleNamespace(notify=nothing))
                 held = await BatchEngine.hold_back(engine_like, "queued", known)
                 found["the engine holds back only the refused market"] = held == 1
+
+                tally = await task("tally")
+                async with db.session() as session:
+                    session.add_all(
+                        Trial(study_id=tally, number=n, state=s, values=v, params=p, message=m)
+                        for n, (s, v, p, m) in enumerate(
+                            [
+                                (TrialState.COMPLETE, [1.5], {}, None),
+                                (TrialState.COMPLETE, [2], {"fullOf": 0}, None),
+                                (TrialState.COMPLETE, [], {"fullOf": None}, FREE),
+                                (TrialState.PRUNED, None, {}, PENDING_SEND),
+                            ],
+                            start=1,
+                        )
+                    )
+                committed = select(
+                    func.count().filter(
+                        Trial.state != TrialState.PRUNED, _not_free(), not_(full_run())
+                    )
+                ).where(Trial.study_id == tally)
+                # Planned as sent, bound values and all: a bound JSON path misses the index.
+                compiled = committed.compile(dialect=sqlite.dialect())
+                bound = tuple(compiled.params[name] for name in compiled.positiontup or ())
+                async with db.session() as session:
+                    plan = await (await session.connection()).exec_driver_sql(
+                        f"EXPLAIN QUERY PLAN {compiled}", bound
+                    )
+                    counted = await session.scalar(committed)
+                    scores = await session.execute(
+                        select(Trial.number, Trial.score).where(Trial.study_id == tally)
+                    )
+                    found["a tick's count reads the index alone"] = any(
+                        "COVERING INDEX ix_trial_score" in str(row[3]) for row in plan
+                    )
+                    # The refused trial and number 1: neither a Full run, a free one nor pruned.
+                    found["and counts what the JSON says"] = counted == 2 and dict(
+                        scores.tuples().all()
+                    ) == {0: None, 1: 1.5, 2: 2, 3: None, 4: None}
             finally:
                 await db.dispose()
         return found

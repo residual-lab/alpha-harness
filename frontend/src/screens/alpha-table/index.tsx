@@ -13,6 +13,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { components } from '@/api/generated'
 import { http } from '@/api/http'
+import { fingerprint } from '@/lib/fingerprint'
 import { fmt } from '@/lib/format'
 import { useDebounced } from '@/lib/use-debounced'
 import { alpha } from '@/screens/alpha/api'
@@ -123,9 +124,10 @@ function useLocalNet(view: string, rows: AlphaTableRow[], on: boolean) {
     () => [...new Set(rows.flatMap((r) => (r.alphaId ? [r.alphaId] : [])))].sort(),
     [rows],
   )
+  const idsKey = useMemo(() => fingerprint(ids), [ids])
   const charged = on ? bps : undefined
   const query = useQuery({
-    queryKey: ['after-cost', ids, charged ?? null],
+    queryKey: ['after-cost', idsKey, charged ?? null],
     queryFn: () =>
       http.post<components['schemas']['AfterCost']>('/api/vault/alphas/after-cost', {
         alpha_ids: ids,

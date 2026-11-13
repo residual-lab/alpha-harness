@@ -517,7 +517,7 @@ async def expand(optimizer: Any, row: Any) -> int:
                 .where(
                     Trial.study_id == row.id,
                     Trial.state == TrialState.COMPLETE,
-                    func.json_extract(Trial.params, "$.read").is_(None),
+                    Trial.read.is_(None),
                 )
                 .order_by(Trial.number)
             )

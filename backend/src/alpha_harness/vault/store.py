@@ -348,31 +348,26 @@ def _page_row(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _sorted(table: pa.Table, *columns: str) -> tuple[dict[str, slice], list[npt.NDArray[Any]]]:
-    """A non-empty table's rows as ``ORDER BY alpha_id, date`` gives them: where each Alpha's
-    rows are, and ``date`` then ``columns`` in that order.
+def _runs(table: pa.Table) -> dict[str, slice]:
+    """Where each Alpha's rows are in a table sorted by ``alpha_id``.
 
-    Sorted here rather than by DuckDB, which keeps whatever memory a sort took: over 300 MB
-    more for 2,000 series, measured.
+    DuckDB sorts: on Linux two to three times quicker than reading the rows unsorted and
+    sorting them here, on Windows about as quick. For 2,000 series the sort peaks 190 MB higher
+    on Linux and 40 MB on Windows, measured, and both give it back once done (Linux through
+    the allocator setting in :mod:`..db.duck`).
     """
     ids = table.column("alpha_id").combine_chunks().dictionary_encode()
+    codes = ids.indices.to_numpy()
     names: list[str] = ids.dictionary.to_pylist()
-    ranked = sorted(range(len(names)), key=names.__getitem__)
-    rank = np.empty(len(names), dtype=np.int64)
-    rank[ranked] = np.arange(len(names))
-    days = table.column("date").to_numpy()
-    day = days.view(np.int64)
-    # Alpha above day in one key, so one sort. Stable, which is quickest on the runs of days
-    # each Alpha is stored in; no two rows share both.
-    key = day - day.min()
-    key |= rank[ids.indices.to_numpy()] << 32
-    order = np.argsort(key, kind="stable")
-    alpha = key[order] >> 32
-    del key
-    starts = [0, *(np.flatnonzero(np.diff(alpha)) + 1).tolist()]
-    ends = [*starts[1:], len(alpha)]
-    runs = {names[ranked[alpha[s]]]: slice(s, e) for s, e in zip(starts, ends, strict=True)}
-    return runs, [days[order], *(table.column(c).to_numpy()[order] for c in columns)]
+    starts = [0, *(np.flatnonzero(np.diff(codes)) + 1).tolist()]
+    ends = [*starts[1:], len(codes)]
+    return {names[codes[s]]: slice(s, e) for s, e in zip(starts, ends, strict=True)}
+
+
+def _column(table: pa.Table, name: str) -> npt.NDArray[Any]:
+    """A column as an array NumPy allocated. Arrow's own copy of a column of several chunks
+    kept its memory once freed: 70 MB more for 2,000 series, measured."""
+    return np.concatenate([c.to_numpy(zero_copy_only=False) for c in table.column(name).chunks])
 
 
 # The three below run in a worker thread: on a portfolio's 240,000 days each holds the
@@ -380,28 +375,28 @@ def _sorted(table: pa.Table, *columns: str) -> tuple[dict[str, slice], list[npt.
 
 
 def _daily(table: pa.Table) -> dict[str, dict[date, float]]:
-    """``alpha_id, date, pnl`` rows as each Alpha's PnL by date, oldest first.
+    """``alpha_id, date, pnl`` rows, sorted by Alpha and date, as each Alpha's PnL by date.
 
     Converted to Python an Alpha at a time: one call over the whole table holds the GIL, and
     the event loop with it, for as long as it runs, even from a worker thread.
     """
     if not table.num_rows:
         return {}
-    runs, (days, pnl) = _sorted(table, "pnl")
     # Through numpy: Arrow's own to_pylist builds dates twenty times slower.
+    days, pnl = _column(table, "date"), _column(table, "pnl")
     return {
         alpha_id: dict(zip(days[rows].tolist(), pnl[rows].tolist(), strict=True))
-        for alpha_id, rows in runs.items()
+        for alpha_id, rows in _runs(table).items()
     }
 
 
 def _daily_traded(table: pa.Table) -> Series:
-    """``alpha_id, date, pnl, turnover`` rows as each Alpha's slice of the three columns, oldest
-    first. Never a Python object per day: as dicts, 2,000 series took 1.5 GB."""
+    """``alpha_id, date, pnl, turnover`` rows, sorted by Alpha and date, as each Alpha's slice of
+    the three columns. Never a Python object per day: as dicts, 2,000 series took 1.5 GB."""
     if not table.num_rows:
         return {}
-    runs, (days, pnl, traded) = _sorted(table, "pnl", "turnover")
-    return {a: (days[rows], pnl[rows], traded[rows]) for a, rows in runs.items()}
+    days, pnl, traded = (_column(table, c) for c in ("date", "pnl", "turnover"))
+    return {a: (days[rows], pnl[rows], traded[rows]) for a, rows in _runs(table).items()}
 
 
 def days_of(
@@ -413,8 +408,9 @@ def days_of(
     return list(zip(days.tolist(), pnl.tolist(), turnover.tolist(), strict=True))
 
 
-def _grid(table: pa.Table) -> PnlGrid:
-    """``alpha_id, date, pnl`` rows as a calendar of dates by Alphas, NaN where one has none."""
+def _grid(table: pa.Table, absent: list[str] | None = None) -> PnlGrid:
+    """``alpha_id, date, pnl`` rows as a calendar of dates by Alphas, NaN where one has none.
+    ``absent`` are Alphas without a row in the table, kept as columns of NaN after the rest."""
     ids = table.column("alpha_id").combine_chunks().dictionary_encode()
     # The few thousand distinct days sorted, not every row's: measured, a third of the time.
     dates = table.column("date").combine_chunks().dictionary_encode()
@@ -422,9 +418,10 @@ def _grid(table: pa.Table) -> PnlGrid:
     order = np.argsort(distinct)
     rank = np.empty_like(order)
     rank[order] = np.arange(len(order))
-    grid = np.full((len(distinct), len(ids.dictionary)), np.nan)
+    kept = ids.dictionary.to_pylist()
+    grid = np.full((len(distinct), len(kept) + len(absent or [])), np.nan)
     grid[rank[dates.indices.to_numpy()], ids.indices.to_numpy()] = table.column("pnl").to_numpy()
-    return ids.dictionary.to_pylist(), distinct[order].tolist(), grid
+    return [*kept, *(absent or [])], distinct[order].tolist(), grid
 
 
 def json_list(raw: Any) -> list[str]:
@@ -843,6 +840,7 @@ class AlphaVault:
             f"""
             SELECT alpha_id, date, coalesce(pnl, 0) AS pnl FROM alpha_pnl
             WHERE alpha_id IN ({placeholders})
+            ORDER BY alpha_id, date
             """,  # noqa: S608
             list(alpha_ids),
         )
@@ -858,15 +856,19 @@ class AlphaVault:
             f"""
             SELECT alpha_id, date, coalesce(pnl, 0) AS pnl, turnover FROM alpha_pnl
             WHERE alpha_id IN ({placeholders}) AND turnover IS NOT NULL
+            ORDER BY alpha_id, date
             """,  # noqa: S608
             list(alpha_ids),
         )
         return await asyncio.to_thread(_daily_traded, table)
 
-    async def pnl_grid(self, alpha_ids: list[str]) -> PnlGrid:
+    async def pnl_grid(self, alpha_ids: list[str], since: date | None = None) -> PnlGrid:
         """Of these Alphas, the ones holding a current daily PnL (turnover or not); every date
         any of them traded; and their PnL on that calendar, a column each, NaN where one has
         no row.
+
+        With ``since``, only the days from it on. Every Alpha holding a PnL is still a column,
+        all NaN when it traded none of them, so the Alphas are the same as without it.
 
         Arrow into numpy, never a Python object per day. As dicts a series costs 1.3 MB and
         6 ms, so the Power Pool of a sweep of 1,500 took 1.9 GB and nine seconds a request.
@@ -874,14 +876,44 @@ class AlphaVault:
         if not alpha_ids:
             return [], [], np.empty((0, 0))
         placeholders = ", ".join("?" for _ in alpha_ids)
+        params: list[Any] = [*alpha_ids, SERIES_VERSION]
+        recent = ""
+        if since is not None:
+            recent = "AND date >= ?"
+            params.append(since)
+        # Materialized: DuckDB streams an unordered ``IN`` result into Arrow twice as slowly.
         table = await self.catalog.arrow(
             f"""
-            SELECT alpha_id, date, coalesce(pnl, 0) AS pnl FROM alpha_pnl
-            WHERE alpha_id IN ({placeholders}) AND alpha_id IN ({PNL_STORED})
+            WITH rows AS MATERIALIZED (
+                SELECT alpha_id, date, coalesce(pnl, 0) AS pnl FROM alpha_pnl
+                WHERE alpha_id IN ({placeholders}) AND alpha_id IN ({PNL_STORED}) {recent}
+            )
+            SELECT * FROM rows
             """,  # noqa: S608
-            [*alpha_ids, SERIES_VERSION],
+            params,
         )
-        return await asyncio.to_thread(_grid, table)
+        absent: list[str] = []
+        if since is not None:
+            present = set(table.column("alpha_id").unique().to_pylist())
+            absent = [a for a in await self.last_days(alpha_ids) if a not in present]
+        return await asyncio.to_thread(_grid, table, absent)
+
+    async def last_days(self, alpha_ids: list[str]) -> dict[str, date]:
+        """Of these Alphas, the ones holding a current daily PnL, each with the last day it has
+        a row on: the one :meth:`pnl_grid` marks as traded, whatever its PnL was."""
+        if not alpha_ids:
+            return {}
+        # Every Alpha's, picked here: an ``IN`` list over the table takes a second, this 70 ms.
+        rows = await self.catalog.query(
+            f"""
+            SELECT alpha_id, max(date) AS last FROM alpha_pnl
+            WHERE alpha_id IN ({PNL_STORED})
+            GROUP BY alpha_id
+            """,  # noqa: S608
+            [SERIES_VERSION],
+        )
+        wanted = set(alpha_ids)
+        return {str(r["alpha_id"]): _as_date(r["last"]) for r in rows if r["alpha_id"] in wanted}
 
     async def submitted_members(self) -> list[dict[str, Any]]:
         """Every submitted Alpha with what the Portfolio page filters on.
@@ -960,6 +992,7 @@ class AlphaVault:
                 WHERE alpha_id IN ({placeholders}) GROUP BY alpha_id
             ) c ON p.alpha_id = c.alpha_id
             WHERE p.date < c.cutoff
+            ORDER BY p.alpha_id, p.date
             """,  # noqa: S608
             list(alpha_ids),
         )
@@ -1149,40 +1182,75 @@ if __name__ == "__main__":
             finally:
                 await catalog.close()
 
-    def interleaved() -> dict[str, bool]:
-        """Rows in no order at all come back as ``ORDER BY alpha_id, date`` would give them."""
-        import pyarrow as pa
-
+    async def interleaved() -> dict[str, bool]:
+        """Rows stored in no order at all come back by Alpha, oldest day first, the ids in the
+        order Python sorts them."""
         rows = [
             ("b1", date(2026, 1, 5), 5.0, 0.5),
             ("B2", date(2026, 1, 2), 2.0, 0.2),
             ("a3", date(2026, 1, 3), 3.0, 0.3),
             ("b1", date(2025, 12, 31), -1.0, 0.1),
             ("B2", date(2026, 1, 9), 9.0, 0.9),
+            ("b1", date(2023, 1, 2), 7.0, 0.7),
             ("b1", date(2026, 1, 2), 2.5, 0.25),
+            ("B2", date(2023, 6, 1), 4.0, 0.4),
         ]
-        table = pa.table(
-            {
-                "alpha_id": [r[0] for r in rows],
-                "date": pa.array([r[1] for r in rows], pa.date32()),
-                "pnl": [r[2] for r in rows],
-                "turnover": [r[3] for r in rows],
-            }
-        )
+        with tempfile.TemporaryDirectory() as folder:
+            catalog = Catalog(Path(folder) / "catalog.duckdb")
+            await catalog.open()
+            try:
+                await catalog.upsert("alpha_pnl", ("alpha_id", "date", "pnl", "turnover"), rows)
+                vault = AlphaVault(catalog)
+                ids = ["b1", "B2", "a3"]
+                daily, series = await vault.daily_pnl(ids), await vault.series(ids)
+                train = await vault.train_pnl(ids)
+                await catalog.upsert(
+                    "alpha", ("alpha_id", "series_version"), [(a, SERIES_VERSION) for a in ids]
+                )
+                every = await vault.pnl_grid([*ids, "unstored"])
+                recent = await vault.pnl_grid([*ids, "unstored"], since=date(2026, 1, 4))
+                last = await vault.last_days([*ids, "unstored"])
+            finally:
+                await catalog.close()
         ordered = sorted(rows)
         alphas = list(dict.fromkeys(a for a, *_ in ordered))
+
+        def cells(grid: PnlGrid) -> dict[str, dict[date, float]]:
+            names, days, pnl = grid
+            return {
+                a: {d: v for d, v in zip(days, pnl[:, i].tolist(), strict=True) if v == v}
+                for i, a in enumerate(names)
+            }
+
+        whole = cells(every)
         return {
+            "a grid from a day on keeps the Alphas, and from then on their days alone": set(
+                recent[0]
+            )
+            == set(every[0])
+            and cells(recent)
+            == {
+                a: {d: p for d, p in days.items() if d >= date(2026, 1, 4)}
+                for a, days in whole.items()
+            }
+            and recent[1] == sorted({d for days in cells(recent).values() for d in days}),
+            "last days, the Alphas holding a PnL only": last
+            == {"b1": date(2026, 1, 5), "B2": date(2026, 1, 9), "a3": date(2026, 1, 3)},
             "PnL by Alpha in id order, oldest day first": [
-                (a, list(days.items())) for a, days in _daily(table).items()
+                (a, list(days.items())) for a, days in daily.items()
             ]
             == [(a, [(d, p) for b, d, p, _ in ordered if b == a]) for a in alphas],
             "series by Alpha in id order, oldest day first": [
-                (a, days_of(s)) for a, s in _daily_traded(table).items()
+                (a, days_of(s)) for a, s in series.items()
             ]
             == [(a, [(d, p, t) for b, d, p, t in ordered if b == a]) for a in alphas],
+            "train PnL before each Alpha's last two years, in the same order": [
+                (a, list(days.items())) for a, days in train.items()
+            ]
+            == [("B2", [(date(2023, 6, 1), 4.0)]), ("b1", [(date(2023, 1, 2), 7.0)])],
         }
 
-    checks = interleaved() | asyncio.run(filtered())
+    checks = asyncio.run(interleaved()) | asyncio.run(filtered())
     if failed := [name for name, ok in checks.items() if not ok]:
         raise SystemExit(f"vault store self-check failed: {'; '.join(failed)}")
     sys.stdout.write(f"{len(checks)} cases as expected\n")

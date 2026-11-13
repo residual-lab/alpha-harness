@@ -8,6 +8,7 @@ import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
 import { REGION_AGNOSTIC_REGION } from '@/api/platform'
 import type { Scope } from '@/api/types'
+import { copyFromWorker } from '@/lib/clipboard'
 import { CORE_ORDER, fmt } from '@/lib/format'
 import { regionLabel } from '@/lib/scope'
 import { useDebounced } from '@/lib/use-debounced'
@@ -33,7 +34,7 @@ import {
   Segmented,
 } from '@/ui/kit'
 import { Pager, type Sort } from '@/ui/table'
-import { alphasMarkdown } from './copy'
+import type { alphasMarkdown } from './copy'
 import { alphaIds } from './detail'
 
 /** Bounds as the user types them; `div` converts the display unit to the wire fraction. */
@@ -237,8 +238,11 @@ export function Stored({
               disabled={!page.data?.total}
               onClick={() => {
                 setCopying(true)
-                alphasMarkdown(body, 'Submitted Alphas')
-                  .then((text) => navigator.clipboard.writeText(text))
+                copyFromWorker<typeof alphasMarkdown>(
+                  new Worker(new URL('./copy.worker.ts', import.meta.url), { type: 'module' }),
+                  body,
+                  'Submitted Alphas',
+                )
                   .then(
                     () =>
                       toast.success(`Copied ${fmt.int(page.data?.total ?? 0)} Submitted Alphas`),

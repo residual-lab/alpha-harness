@@ -9,16 +9,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-#: The pages that may open the telemetry socket: the Vite dev server, and the built UI the
-#: backend serves itself.
-ALLOWED_ORIGINS = frozenset(
-    {
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-    }
-)
+#: The pages besides the backend's own that may open the telemetry socket: the Vite dev server.
+#: The built UI is accepted as the backend's own page on whatever port it serves (``api/ws.py``).
+#: 8000 is not listed: when the app has moved off it, another program holds it.
+ALLOWED_ORIGINS = frozenset({"http://localhost:5173", "http://127.0.0.1:5173"})
 
 
 #: Home-relative. Must stay on native ext4 — see CLAUDE.md.

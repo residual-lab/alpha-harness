@@ -1,7 +1,7 @@
 /**
  * The Blocks view: the template the Code view types, drawn as nested blocks. It is read with
- * the same grammar every task runs on and written back as text, so the two never disagree.
- * Click an empty input to fill it, or a block to wrap, replace or remove it.
+ * the same grammar every task runs on, here in the browser, and written back as text, so the
+ * two never disagree. Click an empty input to fill it, or a block to wrap, replace or remove it.
  */
 
 import { Popover } from '@base-ui/react/popover'
@@ -12,9 +12,9 @@ import { createContext, type ReactNode, use, useState } from 'react'
 import { catalog } from '@/api/catalog'
 import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
+import { parse, type TreeNode, write } from '@/lib/fastexpr'
 import { MOD } from '@/shell/desktop'
-import { Button, Notice, Segmented, Skeleton } from '@/ui/kit'
-import { type TreeNode, templateLab } from './api'
+import { Button, Notice, Segmented } from '@/ui/kit'
 import { GROUPS, inputsOf, type OperatorDoc, WORDS } from './fast-expression'
 
 // ── The tree ───────────────────────────────────────────────────────────────────────────
@@ -52,70 +52,6 @@ function put(root: TreeNode, path: Path, next: TreeNode): TreeNode {
     i === index - root.args.length ? { ...k, value: put(child, rest, next) } : k,
   )
   return { ...root, kwargs }
-}
-
-const PRECEDENCE: Record<string, number> = {
-  '||': 2,
-  '&&': 3,
-  '==': 4,
-  '!=': 4,
-  '<': 4,
-  '<=': 4,
-  '>': 4,
-  '>=': 4,
-  '+': 5,
-  '-': 5,
-  '*': 6,
-  '/': 6,
-  '^': 7,
-}
-const TERNARY = 1
-const UNARY = 8
-
-function precedence(n: TreeNode): number {
-  if (n.kind === 'binary') return PRECEDENCE[n.value] ?? 0
-  if (n.kind === 'unary') return UNARY
-  if (n.kind === 'ternary') return TERNARY
-  if (n.kind === 'assign' || n.kind === 'seq') return 0
-  return 9
-}
-
-const wrapped = (n: TreeNode, parens: boolean) => (parens ? `(${write(n)})` : write(n))
-
-/** The tree as text, bracketed exactly where the grammar needs it. */
-export function write(n: TreeNode): string {
-  switch (n.kind) {
-    case 'num':
-    case 'str':
-    case 'name':
-      return n.value
-    case 'call':
-      return `${n.value}(${[
-        ...n.args.map(write),
-        ...n.kwargs.map((k) => `${k.name}=${write(k.value)}`),
-      ].join(', ')})`
-    case 'unary': {
-      const child = argOf(n, 0)
-      return n.value + wrapped(child, precedence(child) < UNARY)
-    }
-    case 'binary': {
-      const own = precedence(n)
-      const [left, right] = [argOf(n, 0), argOf(n, 1)]
-      // `^` binds to the right; every other operator to the left.
-      const power = n.value === '^'
-      const l = power ? precedence(left) <= own : precedence(left) < own
-      const r = power ? precedence(right) < own : precedence(right) <= own
-      return `${wrapped(left, l)} ${n.value} ${wrapped(right, r)}`
-    }
-    case 'ternary': {
-      const test = argOf(n, 0)
-      return `${wrapped(test, precedence(test) <= TERNARY)} ? ${write(argOf(n, 1))} : ${write(argOf(n, 2))}`
-    }
-    case 'assign':
-      return `${n.value} = ${write(argOf(n, 0))}`
-    case 'seq':
-      return n.args.map(write).join(';\n')
-  }
 }
 
 // ── What can be placed ─────────────────────────────────────────────────────────────────
@@ -243,15 +179,7 @@ export function TemplateBlocks({
   onCode: () => void
 }) {
   const blank = text.trim() === ''
-  const read = useQuery({
-    queryKey: ['template-lab', 'tree', text],
-    queryFn: ({ signal }) => templateLab.tree(text, signal),
-    enabled: !blank,
-    staleTime: Number.POSITIVE_INFINITY,
-    placeholderData: keepPreviousData,
-  })
-  // The tree just built here, shown at once rather than after the text is read back.
-  const [mine, setMine] = useState<{ text: string; tree: TreeNode } | null>(null)
+  const read = blank ? { tree: hole() } : parse(text)
   const [history, setHistory] = useState<{ before: string; after: string }[]>([])
   const [undone, setUndone] = useState<{ before: string; after: string }[]>([])
   const last = history.at(-1)
@@ -260,14 +188,11 @@ export function TemplateBlocks({
   const canUndo = last?.after === text
   const canRedo = next?.before === text
 
-  const fresh = read.data && !read.isPlaceholderData ? read.data : undefined
-  const root = mine?.text === text ? mine.tree : blank ? hole() : fresh?.tree
   const operators = new Map(reference.map((op) => [op.name, op]))
 
   const change = (next: TreeNode) => {
     const written = isHole(next) ? '' : write(next)
     if (written === text) return
-    setMine({ text: written, tree: next })
     setHistory((h) => [...h.slice(-49), { before: text, after: written }])
     setUndone([])
     onChange(written)
@@ -285,26 +210,23 @@ export function TemplateBlocks({
     onChange(next.after)
   }
 
-  if (!root) {
-    if (fresh?.problem)
-      return (
-        <Notice
-          tone="warn"
-          title="Blocks can't show this template yet"
-          action={
-            <Button size="sm" onClick={onCode}>
-              <CodeIcon />
-              Fix in Code
-            </Button>
-          }
-        >
-          {fresh.problem}
-        </Notice>
-      )
-    if (read.isError) return <Notice tone="error" title="Could not read this template" />
-    return <Skeleton className="h-40" />
-  }
+  if ('error' in read)
+    return (
+      <Notice
+        tone="warn"
+        title="Blocks can't show this template yet"
+        action={
+          <Button size="sm" onClick={onCode}>
+            <CodeIcon />
+            Fix in Code
+          </Button>
+        }
+      >
+        {read.error}
+      </Notice>
+    )
 
+  const root = read.tree
   const statements = root.kind === 'seq' ? root.args : [root]
   // A named step before the last line, which stays the Alpha: `step1 = …;`.
   const addStep = () => {

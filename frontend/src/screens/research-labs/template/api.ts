@@ -36,7 +36,6 @@ export type TemplateLabOptions = Schemas['TemplateLabOptions']
 export type TemplateLabPreview = Schemas['TemplateLabPreview']
 export type VariableInfo = Schemas['VariableInfo']
 export type TemplateStats = Schemas['TemplateStats']
-export type TreeNode = Schemas['TreeNode']
 export type TemplateSummary = Omit<Schemas['TemplateSummary'], 'variables'> & {
   variables: Record<string, VariableDef>
 }
@@ -85,9 +84,6 @@ export const templateLab = {
   /** Each template's operators and fields, and the kinds of Alpha it makes. Free. */
   stats: (body: { region: string; delay: number; templates: Sizing[] }) =>
     http.post<{ stats: TemplateStats[] }>(`${B}/stats`, body),
-  /** The template as the Blocks view draws it, or why it can't be read. */
-  tree: (text: string, signal?: AbortSignal) =>
-    http.post<Schemas['TemplateTree']>(`${B}/tree`, { text }, signal),
   /** Free; queues nothing. */
   preview: (body: TemplateLabRequest, signal?: AbortSignal) =>
     http.post<TemplateLabPreview>(`${B}/preview`, body, signal),

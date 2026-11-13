@@ -40,6 +40,7 @@ from ..db.models import (
     TrialState,
     utcnow,
 )
+from ..db.sqlite import loads
 from ..vault.yields import checks_of, clean, gating_results, implausible, limits_of, verdict
 from . import objectives as obj
 from . import scheduler
@@ -516,32 +517,30 @@ class Optimizer:
             return study
 
         async with self.db.session() as session:
-            history = [
-                {
-                    "params": params or {},
-                    "distributions": distributions or {},
-                    "values": values,
-                    "penalty": penalty,
-                    "implausible": flagged,
-                    "state": state,
-                }
-                for params, distributions, values, penalty, flagged, state in (
+            rows = (
+                (
                     await session.execute(
                         select(
-                            Trial.params,
-                            Trial.distributions,
-                            Trial.values,
-                            func.json_extract(Trial.result, "$.penalty"),
-                            func.json_extract(Trial.result, "$.implausible"),
+                            scheduler.raw_json(Trial.params),
+                            scheduler.raw_json(Trial.distributions),
+                            scheduler.raw_json(Trial.values),
+                            Trial.penalty,
+                            Trial.implausible,
                             Trial.state,
                         )
                         .where(Trial.study_id == study_id)
                         .order_by(Trial.number)
                     )
-                ).tuples()
-            ]
+                )
+                .tuples()
+                .all()
+            )
 
         loader = _Distributions(scheduler.field_slots(row))
+        # Decoded in a worker too: on the event loop, 100,000 trials held it for seconds. The raw
+        # text goes before the rebuild, which otherwise peaked 90 MB higher holding both.
+        history = await asyncio.to_thread(_history, rows)
+        del rows
         study = await asyncio.to_thread(_rebuild, sampler, history, loader)
         self.studies[study_id] = study
         return study
@@ -581,6 +580,21 @@ class Optimizer:
 
 
 # --- optuna plumbing, all synchronous ------------------------------------
+
+
+def _history(rows: Sequence[Any]) -> list[dict[str, Any]]:
+    """The trial rows :func:`_rebuild` replays, decoded from their stored JSON."""
+    return [
+        {
+            "params": loads(params or "null") or {},
+            "distributions": loads(distributions or "null") or {},
+            "values": loads(values or "null"),
+            "penalty": penalty,
+            "implausible": flagged,
+            "state": state,
+        }
+        for params, distributions, values, penalty, flagged, state in rows
+    ]
 
 
 def _tell_many(
@@ -1025,6 +1039,18 @@ if __name__ == "__main__":
         == [(*scores[i], big[i]["params"]["field"]) for i in kept(scores)],
         "what it dropped still counts toward the random start": trimmed.user_attrs[DROPPED]
         == learned - len(kept(scores)),
+        "stored JSON replays as the columns read it": _history(
+            [
+                ('{"field": "f1"}', None, "[1.5]", 1.0, 0, "COMPLETE"),
+                ("null", "{}", "null", None, None, "FAIL"),
+            ]
+        )
+        == [
+            {"params": {"field": "f1"}, "distributions": {}, "values": [1.5], "penalty": 1.0}
+            | {"implausible": 0, "state": "COMPLETE"},
+            {"params": {}, "distributions": {}, "values": None, "penalty": None}
+            | {"implausible": None, "state": "FAIL"},
+        ],
     }
     if failed := [name for name, ok in checks.items() if not ok]:
         raise SystemExit(f"study self-check failed: {'; '.join(failed)}")

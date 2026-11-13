@@ -1,10 +1,14 @@
 /**
- * Fast Expression for the template editor: a tokenizer that knows a template's `$variables`,
- * `...` and grouping fields, and the plain-text scans its completions and checks read.
+ * Fast Expression for the template editor: a highlighter that knows a template's `$variables`,
+ * `...` and grouping fields, the plain-text scans its completions read, and its checks. The
+ * highlighter is CodeMirror's own line-at-a-time stream, which colours only what is on screen;
+ * everything else reads the text with the grammar every task runs on.
  */
 
 import { StreamLanguage } from '@codemirror/language'
+import type { Diagnostic } from '@codemirror/lint'
 import { Tag, tags as t } from '@lezer/highlight'
+import { parse, tokens } from '@/lib/fastexpr'
 
 /** An operator the account can call, as the editor documents it. */
 export interface OperatorDoc {
@@ -107,11 +111,17 @@ export const fastExpression = StreamLanguage.define<Reading>({
 })
 
 /** The text with comments and strings blanked, every position and line break kept, so a scan
- *  reads only code and a statement still ends where its line does. */
+ *  reads only code and a statement still ends where its line does. One left open while it is
+ *  typed runs to the end. */
 export function code(text: string): string {
-  return text.replace(/\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\n]*|#[^\n]*|"[^"]*"?|'[^']*'?/g, (m) =>
-    m.replace(/[^\n]/g, ' '),
-  )
+  let blank = ''
+  let end = 0
+  for (const [kind, from, to] of tokens(text)) {
+    if (kind !== 'comment' && kind !== 'str') continue
+    blank += text.slice(end, from) + text.slice(from, to).replace(/[^\n]/g, ' ')
+    end = to
+  }
+  return blank + text.slice(end)
 }
 
 /** A name being assigned, read from where a statement starts. */
@@ -180,4 +190,117 @@ export function snippetOf(op: OperatorDoc): string {
     .map((p) => `\${${p.replace(/[{}$\\]/g, '')}}`)
     .join(', ')
   return `${op.name}(${fields || `\${}`})`
+}
+
+/**
+ * The preview's problems that name something in the text, by the exact words it writes them in:
+ * a variable's own as `$name: …`, the rest as a sentence about a named operator or field. Any
+ * other sentence has no place and stays below the editor.
+ */
+const SHAPES: { pattern: RegExp; call?: boolean }[] = [
+  { pattern: /^(\$[A-Za-z_]\w*): (.+)$/ },
+  { pattern: /^(\$[A-Za-z_]\w*) is chosen by the search/ },
+  { pattern: /^([A-Za-z_]\w*) is not one of your operators\.$/, call: true },
+  { pattern: /^([A-Za-z_]\w*) does not take \d+ inputs?\.$/, call: true },
+  { pattern: /^([A-Za-z_]\w*) is not a data field in /, call: false },
+]
+
+/** The backend's words for a template its grammar cannot read, before what stopped it. */
+const UNREAD = "The template can't be read"
+
+/**
+ * What the editor marks on the text: each `...` to fill, a bracket left open or closed twice,
+ * an operator the account lacks (`operators`, once known), where the grammar stopped reading,
+ * and the preview's `problems` that name something written.
+ */
+export function lint(
+  text: string,
+  operators: ReadonlySet<string>,
+  problems: string[],
+): Diagnostic[] {
+  const read = tokens(text)
+  const word = ([, from, to]: (typeof read)[number]) => text.slice(from, to)
+  const found: Diagnostic[] = []
+  for (const token of read)
+    if (token[0] === 'name' && word(token) === '...')
+      found.push({
+        from: token[1],
+        to: token[2],
+        severity: 'warning',
+        message: 'Write a signal here.',
+      })
+  const open: number[] = []
+  for (const token of read) {
+    if (token[0] !== 'op') continue
+    if (word(token) === '(') open.push(token[1])
+    else if (word(token) === ')' && open.pop() === undefined)
+      found.push({
+        from: token[1],
+        to: token[2],
+        severity: 'error',
+        message: 'Nothing opens this bracket.',
+      })
+  }
+  for (const at of open)
+    found.push({
+      from: at,
+      to: at + 1,
+      severity: 'error',
+      message: 'This bracket is never closed.',
+    })
+  if (operators.size) {
+    read.forEach((token, i) => {
+      const name = word(token)
+      const next = read[i + 1]
+      const called = next?.[0] === 'op' && word(next) === '('
+      // A name stuck to a `.` or a number is a typo already marked where reading stops.
+      const stuck = /[\w$.]/.test(text[token[1] - 1] ?? '')
+      if (
+        token[0] === 'name' &&
+        called &&
+        !stuck &&
+        /^[A-Za-z_]/.test(name) &&
+        !operators.has(name)
+      )
+        found.push({
+          from: token[1],
+          to: token[2],
+          severity: 'error',
+          message: `${name} is not one of your operators.`,
+        })
+    })
+  }
+
+  // Read here rather than waiting on the preview, in the same words; its own copy is dropped.
+  const parsed = parse(text)
+  if ('error' in parsed && / at \d+/.test(parsed.error)) {
+    const at = Math.min(parsed.at, Math.max(0, text.length - 1))
+    const message = `${UNREAD}: ${parsed.error}`
+    found.push({ from: at, to: Math.min(text.length, at + 1), severity: 'error', message })
+  }
+  const blank = code(text)
+  for (const problem of problems) {
+    if (problem.startsWith(UNREAD)) continue
+    for (const shape of SHAPES) {
+      const named = shape.pattern.exec(problem)
+      const name = named?.[1]
+      if (!name) continue
+      const message = named[2] ?? problem
+      const escaped = name.replace('$', '\\$')
+      const where = name.startsWith('$')
+        ? `${escaped}(?!\\w)`
+        : `(?<![$\\w])${escaped}(?!\\w)${shape.call ? '(?=\\s*\\()' : '(?!\\s*\\()'}`
+      for (const m of blank.matchAll(new RegExp(where, 'g')))
+        found.push({ from: m.index, to: m.index + name.length, severity: 'error', message })
+      break
+    }
+  }
+
+  const seen = new Set<string>()
+  return found.filter((d) => {
+    const key = `${d.from}:${d.to}:${d.message}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }

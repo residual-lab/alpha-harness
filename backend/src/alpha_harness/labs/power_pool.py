@@ -55,7 +55,7 @@ FIELDS_PER_CALL = 200
 #: Price and volume basics every market has, offered beside the chosen datasets' own fields.
 DATA_FIELDS = ("close", "open", "high", "low", "vwap", "volume", "adv20", "returns", "cap")
 PROPOSED = "Written by the LLM; waiting for cores."
-SCHEMA = {
+SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "alphas": {
@@ -66,10 +66,12 @@ SCHEMA = {
                 "type": "object",
                 "properties": {"expression": {"type": "string"}},
                 "required": ["expression"],
+                "additionalProperties": False,
             },
         }
     },
     "required": ["alphas"],
+    "additionalProperties": False,
 }
 
 #: In memory, so a restart loses at most one in-flight LLM request per task.
@@ -167,8 +169,11 @@ async def context_for(
             r["region_coverage"],
         )
 
+    # Ties broken by name: a set's order changes between calls and restarts, which would move
+    # fields between the slices ``offset`` walks and break the prompt's cached prefix.
     fields = sorted(
-        (field(f) for f in own if f not in GROUPING_FIELDS), key=lambda x: -(x.coverage or 0)
+        (field(f) for f in own if f not in GROUPING_FIELDS),
+        key=lambda x: (-(x.coverage or 0), x.id),
     )
     m = meta[0] if meta else {}
     return Context(
@@ -257,7 +262,7 @@ async def memory_of(optimizer: Optimizer, study_id: int, dataset: str) -> str:
     Three slices read by the database: loading every trial of a task (up to 100,000) for
     forty lines cost each LLM call a full table load.
     """
-    score = func.json_extract(Trial.values, "$[0]")
+    score = Trial.score
     mine = (Trial.study_id == study_id, func.json_extract(Trial.params, "$.dataset") == dataset)
     async with optimizer.db.session() as session:
         done = (
@@ -334,7 +339,12 @@ def user_prompt(
     offset: int,
     budget: int,
 ) -> tuple[str, int]:
-    """The user turn, and how many field lines it shows."""
+    """The user turn, and how many field lines it shows.
+
+    Laid out for the providers' prompt caches, which reuse the longest start a recent request
+    shared: what every call of the task repeats comes first, then the dataset and its slice of
+    fields, and what changes on every call last.
+    """
     head = "\n\n".join(
         [
             f"MARKET\n{run.region} · Delay {run.delay} · Universes {', '.join(run.universes)}"
@@ -348,14 +358,14 @@ def user_prompt(
                 if run.favour_operators
                 else []
             ),
+            "PRICE AND VOLUME FIELDS · count as data fields\n"
+            + "\n".join(_line(f) for f in ctx.basics),
+            "GROUPING_FIELDS FIELDS · not counted\n" + ", ".join(ctx.groups),
             f"DATASET\n{ctx.id} · {ctx.name} · {ctx.category}\n{ctx.description}",
         ]
     )
     tail = "\n\n".join(
         [
-            "PRICE AND VOLUME FIELDS · count as data fields\n"
-            + "\n".join(_line(f) for f in ctx.basics),
-            "GROUPING_FIELDS FIELDS · not counted\n" + ", ".join(ctx.groups),
             f"YOUR EARLIER ALPHAS ON {ctx.id}\n{memory}",
             *(
                 [
@@ -385,6 +395,14 @@ def user_prompt(
         f"FIELDS OF {ctx.id} · {start + 1}-{start + len(lines)} of {total:,}, most complete first"
     )
     return f"{head}\n\n{title}\n" + "\n".join(lines) + f"\n\n{tail}", len(lines)
+
+
+def next_offset(offset: int, shown: int, total: int) -> int:
+    """Where the next call's fields start: after this call's, or back at the first once the
+    whole dataset has been shown. Every pass then splits it at the same places, so a slice
+    that comes round again can still be in the provider's cache."""
+    end = (offset % total if total else 0) + shown
+    return end if end < total else 0
 
 
 # --- the running task ----------------------------------------------------------
@@ -620,7 +638,7 @@ async def _write(optimizer: Optimizer, study_id: int) -> None:
                 by = dict(llm.get("byDataset") or {})
                 mine = dict(by.get(dataset) or {})
                 mine["calls"] = int(mine.get("calls") or 0) + 1
-                mine["offset"] = offset + shown
+                mine["offset"] = next_offset(offset, shown, len(ctx.fields))
                 by[dataset] = mine
                 llm["byDataset"] = by
                 tally = dict(llm.get("byModel") or {})
@@ -664,3 +682,98 @@ def parse_alphas(text: str) -> list[dict[str, Any]]:
         if isinstance(payload, list):
             return [a for a in payload if isinstance(a, dict) and a.get("expression")]
     return []
+
+
+if __name__ == "__main__":
+    import re
+    import sys
+
+    def made(i: int) -> Field:
+        return Field(f"f{i:03}", "MATRIX", 1 - i / 1000, f"field {i}", None)
+
+    def dataset(name: str, size: int) -> Context:
+        own = tuple(made(i) for i in range(size))
+        return Context(
+            id=name,
+            name=name.title(),
+            category="Fundamental › Ratios",
+            description="What it holds.",
+            fields=own,
+            basics=(Field("close", "MATRIX", 1.0, "Close price", None),),
+            groups=("industry", "sector"),
+            types={f.id: f.type for f in own},
+            own=frozenset(f.id for f in own),
+            names=frozenset(f.id for f in own) | {"close", "industry", "sector"},
+            held={},
+        )
+
+    operators = [
+        {"name": "rank", "definition": "rank(x)", "category": "Cross Sectional"},
+        {"name": "ts_delta", "definition": "ts_delta(x, d)", "category": "Time Series"},
+    ]
+    run = PowerPoolParams(
+        region="USA",
+        delay=1,
+        universes=["TOP3000"],
+        neutralizations=["MARKET"],
+        hypothesis="Quiet firms drift.",
+        favour_operators=["ts_delta"],
+    )
+    big, small = dataset("big", 450), dataset("small", 150)
+
+    def ask(ctx: Context, memory: str = "None yet.", offset: int = 0) -> tuple[str, int]:
+        return user_prompt(ctx, operators, run, memory, offset, 40_000)
+
+    def shared(a: str, b: str) -> int:
+        return next((i for i, (x, y) in enumerate(zip(a, b, strict=False)) if x != y), len(a))
+
+    def walk(ctx: Context, calls: int) -> tuple[list[int], set[str]]:
+        """Where each call's fields started, and every field the calls showed."""
+        starts, seen, offset = [], set[str](), 0
+        for _ in range(calls):
+            prompt, shown = ask(ctx, offset=offset)
+            starts.append(offset)
+            seen |= set(re.findall(r"^(f\d{3}) ·", prompt, re.MULTILINE))
+            offset = next_offset(offset, shown, len(ctx.fields))
+        return starts, seen
+
+    prompt, _ = ask(big)
+    order = [
+        "MARKET\n",
+        "OPERATORS\n",
+        "OPERATORS NOT USED",
+        "PRICE AND VOLUME",
+        "GROUPING_FIELDS",
+        "DATASET\n",
+        "FIELDS OF big",
+        "YOUR EARLIER ALPHAS",
+        "HYPOTHESIS TO TEST",
+        "Write 20 new",
+    ]
+    places = [prompt.find(heading) for heading in order]
+    later, _ = ask(big, memory="Simulated, best Sharpe first:\n1.20 | rank(close)")
+    starts, seen = walk(big, 6)
+    fenced = '```json\n{"alphas": [{"expression": "rank(close)"}]}\n```'
+    checks = {
+        "sections in cache order, every one present": -1 not in places and places == sorted(places),
+        "a new memory changes only the end": prompt.index("YOUR EARLIER")
+        < shared(prompt, later)
+        < prompt.index("HYPOTHESIS"),
+        "another dataset shares all up to DATASET": shared(prompt, ask(small)[0])
+        >= prompt.index("DATASET\n"),
+        "each pass splits the dataset at the same places": starts == [0, 200, 400] * 2,
+        "every field shown each pass": len(walk(big, 3)[1]) == 450 == len(seen),
+        "a dataset that fits whole always starts at its first": walk(small, 3)[0] == [0, 0, 0],
+        "an offset saved before this goes on, then starts over": next_offset(1050, 200, 450) == 350
+        and next_offset(1250, 200, 450) == 0,
+        "no fields, no offset": next_offset(7, 0, 0) == 0,
+        "a strict answer parses": parse_alphas(json.dumps({"alphas": [{"expression": "a"}] * 2}))
+        == [{"expression": "a"}] * 2,
+        "a fenced or bare list still parses": parse_alphas(fenced)
+        == parse_alphas('[{"expression": "rank(close)"}]')
+        == [{"expression": "rank(close)"}],
+        "prose is no Alphas": parse_alphas("Here are some ideas.") == [],
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"power_pool self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

@@ -38,6 +38,8 @@ class Provider:
     paid: bool = False
     #: What a paid tier bills, in plain words; shown above its key field.
     tier_note: str = ""
+    #: Why this provider can no longer answer; empty for one that can.
+    retired: str = ""
 
 
 class LLMProvider(Out):
@@ -53,8 +55,18 @@ class LLMProvider(Out):
     paid: bool
 
 
+class RetiredProvider(Out):
+    """A provider that is gone but still has Keys or models stored under it."""
+
+    id: str
+    label: str
+    note: str
+
+
 class LLMProviders(Out):
     providers: list[LLMProvider]
+    #: Gone providers, so a Key or model left behind can be named and its removal explained.
+    retired: list[RetiredProvider]
     default: str
     paid_note: str
 
@@ -108,14 +120,6 @@ PROVIDERS: dict[str, Provider] = {
         limits_url="https://admin.mistral.ai/plateforme/limits",
         key_hint="…",
     ),
-    "github": Provider(
-        id="github",
-        label="GitHub Models",
-        base_url="https://models.github.ai/inference",
-        onboarding_url="https://github.com/settings/tokens",
-        limits_url="https://docs.github.com/en/github-models/use-github-models/prototyping-with-ai-models#rate-limits",
-        key_hint="ghp_… or github_pat_…",
-    ),
     "huggingface": Provider(
         id="huggingface",
         label="Hugging Face",
@@ -147,9 +151,9 @@ PROVIDERS: dict[str, Provider] = {
         # Anthropic's OpenAI-compatible endpoint, which takes the same Bearer token and the
         # same ``/chat/completions`` shape, so no second client is needed. Anthropic calls
         # it a compatibility layer for evaluation rather than a production path; the ways it
-        # differs that matter here are that ``response_format`` is ignored — callers already
-        # ask for JSON in the prompt and parse defensively — and that thinking output is not
-        # returned, which nothing here reads.
+        # differs that matter here are that ``response_format`` must be a strict JSON schema
+        # (a bare JSON object is a 400), that it caches no prompts, and that thinking output
+        # is not returned, which nothing here reads.
         label="Anthropic Claude",
         base_url="https://api.anthropic.com/v1",
         onboarding_url="https://platform.claude.com/settings/keys",
@@ -157,6 +161,20 @@ PROVIDERS: dict[str, Provider] = {
         key_hint="sk-ant-…",
         tier_note="Your own Anthropic account — billed to you, not free.",
         paid=True,
+    ),
+}
+
+#: Providers that shut down. Rows stored for one are kept, labelled and never used, because
+#: deleting a user's Key unasked is worse than showing it once more.
+RETIRED: dict[str, Provider] = {
+    "github": Provider(
+        id="github",
+        label="GitHub Models (retired)",
+        base_url="",
+        onboarding_url="",
+        limits_url="",
+        key_hint="",
+        retired="GitHub Models stopped serving requests on 30 July 2026.",
     ),
 }
 
@@ -173,8 +191,24 @@ PAID_NOTE = (
 
 
 def get(provider_id: str | None) -> Provider:
-    """One provider, or Google when nothing was said."""
-    return PROVIDERS.get(provider_id or DEFAULT_PROVIDER, PROVIDERS[DEFAULT_PROVIDER])
+    """One provider: Google when nothing was said, and for a stored id this build no longer
+    offers, a stub whose ``retired`` says so. Never Google, which would be sent that
+    provider's key."""
+    if not provider_id:
+        return PROVIDERS[DEFAULT_PROVIDER]
+    return (
+        PROVIDERS.get(provider_id)
+        or RETIRED.get(provider_id)
+        or Provider(
+            id=provider_id,
+            label=f"{provider_id} (unknown)",
+            base_url="",
+            onboarding_url="",
+            limits_url="",
+            key_hint="",
+            retired="This application does not know that provider.",
+        )
+    )
 
 
 def catalogue() -> LLMProviders:
@@ -186,6 +220,7 @@ def catalogue() -> LLMProviders:
             LLMProvider.model_validate(p, from_attributes=True)
             for p in sorted(PROVIDERS.values(), key=lambda p: p.paid)
         ],
+        retired=[RetiredProvider(id=p.id, label=p.label, note=p.retired) for p in RETIRED.values()],
         default=DEFAULT_PROVIDER,
         paid_note=PAID_NOTE,
     )

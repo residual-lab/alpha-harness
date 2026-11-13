@@ -8,13 +8,14 @@ stopped, changed or removed. Search Lab, Template Lab and Evolution Lab add sche
 import asyncio
 import contextlib
 import itertools
-import json
 import math
 from collections import Counter
+from functools import partial
 from typing import Annotated, Any, Literal
 
+import msgspec
 import structlog
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import defer
@@ -37,6 +38,7 @@ from ..db.models import (
     TrialState,
     utcnow,
 )
+from ..db.sqlite import loads
 from ..engine.slots import POSITIONAL_NOTE
 from ..labs import scheduler, search
 from ..labs.objectives import FAILURE, OBJECTIVES, StudyNotFoundError
@@ -334,7 +336,7 @@ async def _progress(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
             ids.append(row.id)
     if not ids:
         return out
-    value = func.json_extract(Trial.values, "$[0]")
+    value = Trial.score
     answered = Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL])
     async with state.db.session() as session:
         states = await session.execute(
@@ -743,14 +745,16 @@ async def power_pool_order(body: AlphaIds, state: State) -> SubmissionOrder:
     candidates = {
         a: r for a, r in stored.items() if power_pool.is_power_pool(r) and not is_submitted(r)
     }
-    grid = await state.alphas.pnl_grid([*candidates, *pool_meta])
     pools: dict[str, list[str]] = {}
     for alpha_id, row in pool_meta.items():
         if (region := power_pool.scope_of(row)) is not None:
             pools.setdefault(region, []).append(alpha_id)
     meta = candidates | pool_meta
+    last_days = await state.alphas.last_days([*candidates, *pool_meta])
+    since = power_pool.correlation_floor(last_days, meta, pools, list(candidates))
+    grid = await state.alphas.pnl_grid([*candidates, *pool_meta], since=since)
     picks, blocked, unmeasured = await asyncio.to_thread(
-        power_pool.submission_order, grid, meta, list(candidates), pools
+        power_pool.submission_order, grid, meta, list(candidates), pools, last_days=last_days
     )
     blocks = Counter(blocked.values())
     return SubmissionOrder(
@@ -868,14 +872,14 @@ async def remove(task_id: int, state: State) -> TaskRemoved:
     return TaskRemoved(removed=task_id)
 
 
-@router.get("/{task_id}/top")
+@router.get("/{task_id}/top", response_model=list[RankedAlpha])
 async def top(
     task_id: int,
     state: State,
     # A sweep's whole result set is worth scrolling, so the ceiling is a day's
     # simulations rather than a page; the caller asks for what it means to show.
     limit: Annotated[int, Query(ge=1, le=5000)] = 20,
-) -> list[RankedAlpha]:
+) -> Response:
     """The task's best Alphas on what it searches for. Seeds are not among them."""
     await _one(state, task_id)  # 404 for an unknown task
     async with state.db.session() as session:
@@ -888,7 +892,7 @@ async def top(
                         Trial.state == TrialState.COMPLETE,
                         or_(Trial.generation.is_(None), Trial.generation != 0),
                     )
-                    .order_by(func.json_extract(Trial.values, "$[0]").desc())
+                    .order_by(Trial.score.desc(), Trial.number)
                     .limit(limit)
                 )
             ).all()
@@ -902,10 +906,10 @@ async def top(
     # three BRAIN requests per Alpha: enough of them earns a 429, which holds up every read of
     # an Alpha, captures included. Calculate After-Cost Sharpe is the way to ask, and it says
     # how many it will fetch before it does.
-    return [
-        RankedAlpha.model_validate(r | _from_vault(r["alphaId"], stored, prod))
-        for r in ranked(best, current)
-    ]
+    rows = [r | _from_vault(r["alphaId"], stored, prod) for r in ranked(best, current)]
+    # The rows already have the model's fields, as this module's self-check holds them to: made
+    # into models only to be dumped, 5,000 took 80-120 ms on the event loop, against 9-16 ms.
+    return Response(msgspec.json.encode(rows), media_type="application/json")
 
 
 def _from_vault(
@@ -944,9 +948,6 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
     # BRAIN attaches POWER_POOL_CORRELATION only to Alphas it would judge this way, so the
     # rest of the sweep is nothing to do with the Power Pool and is counted, not measured.
     candidates = {a: r for a, r in stored.items() if power_pool.is_power_pool(r)}
-    grid = await state.alphas.pnl_grid([*candidates, *pool_meta])
-    has_pnl = set(grid[0])
-
     by_region: dict[str, list[str]] = {}
     for alpha_id, r in pool_meta.items():
         region = power_pool.scope_of(r)
@@ -954,6 +955,10 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
             by_region.setdefault(region, []).append(alpha_id)
 
     meta = candidates | pool_meta
+    last_days = await state.alphas.last_days([*candidates, *pool_meta])
+    since = power_pool.correlation_floor(last_days, meta, by_region)
+    grid = await state.alphas.pnl_grid([*candidates, *pool_meta], since=since)
+    has_pnl = set(grid[0])
     without_pnl: list[str] = []
     wanted: dict[str, list[str]] = {}
     # A region with nothing submitted in it needs no series and no arithmetic: there is
@@ -983,7 +988,7 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
     measured: list[PowerPoolRow] = [
         PowerPoolRow.model_validate(r | {"region": region})
         for region, ids in unopposed.items()
-        for r in power_pool.correlate(grid, meta, ids, [])
+        for r in power_pool.correlate(grid, meta, ids, [], last_days=last_days)
     ]
     scopes.extend(
         PowerPoolScope(region=region, pool=[], pool_without_pnl=[]) for region in unopposed
@@ -992,7 +997,9 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
         members = by_region[region]
         # Every member, synced or not: a member without PnL is a collision nobody measured,
         # and an unsynced pool must read as unmeasured, not as an empty one.
-        found = await asyncio.to_thread(power_pool.correlate, grid, meta, wanted[region], members)
+        found = await asyncio.to_thread(
+            partial(power_pool.correlate, grid, meta, wanted[region], members, last_days=last_days)
+        )
         measured.extend(PowerPoolRow.model_validate(r | {"region": region}) for r in found)
         scopes.append(
             PowerPoolScope(
@@ -1053,7 +1060,7 @@ async def _not_refused(session: Any, ids: list[tuple[int, str | None]]) -> list[
             # FAIL only: an ERROR is BRAIN failing to run the check, which a re-check can turn
             # into a PASS, so that Alpha is judged on the vault's current checks instead.
             refused = region != REGION_AGNOSTIC_REGION and (
-                "FAIL" in gating_results(json.loads(checks) if checks else [])
+                "FAIL" in gating_results(loads(checks) if checks else [])
             )
             _REFUSED[trial_id, alpha_id] = refused
 
@@ -1072,19 +1079,20 @@ async def submittable_alphas(state: State) -> list[TaskAlpha]:
     """
     tasks = {row.id: row for row in await _rows(state)}
     async with state.db.session() as session:
-        ids = list(
+        # In row order, so each chunk below reads neighbouring rows. Sorted here: ordered in SQL,
+        # the read left the index for every finished trial's row, 400 ms against 80.
+        ids = sorted(
             (
                 await session.execute(
-                    select(Trial.id, Trial.alpha_id)
-                    .where(
+                    select(Trial.id, Trial.alpha_id).where(
                         Trial.study_id.in_(list(tasks)),
                         Trial.state == TrialState.COMPLETE,
                         Trial.alpha_id.is_not(None),
                         or_(Trial.generation.is_(None), Trial.generation != 0),
                     )
-                    .order_by(Trial.study_id, Trial.number)
                 )
-            ).tuples()
+            ).tuples(),
+            key=lambda found: found[0],
         )
         # A check that FAILed at simulation time stays failed: BRAIN's later checks only settle
         # what was PENDING or ERROR. Only the rest are read whole, about one in ten measured.
@@ -1120,3 +1128,36 @@ async def submittable_alphas(state: State) -> list[TaskAlpha]:
             )
         )
     return out
+
+
+if __name__ == "__main__":
+    import sys
+
+    from pydantic import TypeAdapter
+
+    trial = Trial(
+        id=1,
+        study_id=1,
+        number=0,
+        state=TrialState.COMPLETE,
+        alpha_id="a",
+        expression="rank(close)",
+        settings={"region": "USA"},
+        params={},
+        values=[2],
+        result={"stats": {"sharpe": 2}, "checks": [{"name": "LOW_SHARPE", "limit": 1.25}]},
+    )
+    rows = [r | _from_vault(r["alphaId"], {}, {}) for r in ranked([trial])]
+    shape = TypeAdapter(list[RankedAlpha])
+    modelled = shape.dump_json(shape.validate_python(rows), by_alias=True)
+    checks = {
+        "a ranked row has every field of the response, and only those": set(rows[0])
+        == {field.alias for field in RankedAlpha.model_fields.values()},
+        "encoded as it is, it reads as the model writes it": msgspec.json.decode(
+            msgspec.json.encode(rows)
+        )
+        == msgspec.json.decode(modelled),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"lab_tasks self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

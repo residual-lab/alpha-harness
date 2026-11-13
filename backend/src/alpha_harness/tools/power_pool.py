@@ -24,6 +24,7 @@ against the USA D1 pool. Delay and universe are not part of the bucket.
 
 import math
 from bisect import bisect_left
+from datetime import date
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -39,8 +40,7 @@ from ..vault.store import json_list
 from ..vault.yields import checks_of
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from datetime import date
+    from collections.abc import Mapping, Sequence
 
     from ..vault.store import PnlGrid
 
@@ -68,10 +68,13 @@ def correlate(
     candidates: Sequence[str],
     pool: Sequence[str],
     ceiling: float = POWER_POOL_CORRELATION_CEILING,
+    last_days: Mapping[str, date] | None = None,
 ) -> list[dict[str, Any]]:
     """Each candidate against every pool member, with the verdict BRAIN would reach.
 
-    Both lists are one scope's, ``grid`` their stored PnL (:meth:`AlphaVault.pnl_grid`). A
+    Both lists are one scope's, ``grid`` their stored PnL (:meth:`AlphaVault.pnl_grid`), read
+    from :func:`correlation_floor` on when ``last_days`` (:meth:`AlphaVault.last_days`) says
+    where each series ended. Without it the grid is taken to hold every day stored. A
     candidate that is itself in the pool is never measured against itself. A member with no
     PnL stored still counts in ``against``, and while any has none the answer is
     ``unmeasured`` unless a collision already refuses it: the missing one could hide another.
@@ -81,7 +84,7 @@ def correlate(
     right = [p for p in dict.fromkeys(pool) if p in at]
     rho = np.full((len(left), len(right)), np.nan)
     if left and right:
-        ends = _ends(grid, meta, at, [*left, *right])
+        ends = _ends(grid, meta, at, [*left, *right], last_days)
         rho = _rho(grid, at, left, right, ends[: len(left)], max(ends[len(left) :]))
     row_of = {a: i for i, a in enumerate(left)}
     return [
@@ -100,19 +103,61 @@ def correlate(
 
 
 def _ends(
-    grid: PnlGrid, meta: dict[str, dict[str, Any]], at: dict[str, int], alpha_ids: list[str]
+    grid: PnlGrid,
+    meta: dict[str, dict[str, Any]],
+    at: dict[str, int],
+    alpha_ids: list[str],
+    last_days: Mapping[str, date] | None = None,
 ) -> list[date]:
     """The last day BRAIN counts for each Alpha: its stored series' last, plus closing days."""
-    _, dates, pnl = grid
-    # Tested on the grid, then picked: picking first copied every column's floats.
-    traded = ~np.isnan(pnl)[:, [at[a] for a in alpha_ids]]
-    stored_last = [dates[i] for i in len(dates) - 1 - traded[::-1].argmax(axis=0)]
+    if last_days is not None:
+        stored_last = [last_days[a] for a in alpha_ids]
+    else:
+        _, dates, pnl = grid
+        # Tested on the grid, then picked: picking first copied every column's floats.
+        traded = ~np.isnan(pnl)[:, [at[a] for a in alpha_ids]]
+        stored_last = [dates[i] for i in len(dates) - 1 - traded[::-1].argmax(axis=0)]
+    return _closed(stored_last, meta, alpha_ids)
+
+
+def _closed(
+    stored_last: list[date], meta: dict[str, dict[str, Any]], alpha_ids: list[str]
+) -> list[date]:
     # Closing days move where BRAIN's window ends, as ``portfolio.frame`` counts them, but are
     # never correlated: that is what makes these match BRAIN's own figures.
     return [
         metrics.with_closing([(day, 0.0, 0.0)], meta.get(a, {}))[-1][0]
         for a, day in zip(alpha_ids, stored_last, strict=True)
     ]
+
+
+def correlation_floor(
+    last_days: Mapping[str, date],
+    meta: dict[str, dict[str, Any]],
+    pools: dict[str, list[str]],
+    candidates: Sequence[str] = (),
+) -> date:
+    """The first day :func:`correlate` and :func:`submission_order` can read: a grid from it on
+    gives the same answers as every stored day, with ``last_days`` passed along.
+
+    Every window starts at :func:`vault.metrics.window_start` of an end no earlier than its
+    region's pool's. A region with no pool member holding a PnL has its first pick's end
+    instead, never before its earliest candidate's: pass ``candidates`` for that, as
+    :func:`submission_order` does. ``date.max`` when nothing is read.
+    """
+    ids = list(last_days)
+    end_of = dict(zip(ids, _closed(list(last_days.values()), meta, ids), strict=True))
+    floor = date.max
+    pooled: set[str] = set()
+    for region, members in pools.items():
+        if ends := [end_of[p] for p in members if p in end_of]:
+            pooled.add(region)
+            floor = min(floor, metrics.window_start(max(ends)))
+    for alpha_id in candidates:
+        region = scope_of(meta.get(alpha_id) or {})
+        if region is not None and region not in pooled and alpha_id in end_of:
+            floor = min(floor, metrics.window_start(end_of[alpha_id]))
+    return floor
 
 
 def _rho(
@@ -169,6 +214,7 @@ def submission_order(
     candidates: Sequence[str],
     pools: dict[str, list[str]],
     ceiling: float = POWER_POOL_CORRELATION_CEILING,
+    last_days: Mapping[str, date] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str], list[str]]:
     """Submit greedily, best After-Cost Sharpe first, without submitting anything: each pick
     joins its region's pool, and the region's other candidates are judged again against it.
@@ -176,7 +222,7 @@ def submission_order(
     Returns the picks in order, each with its :func:`correlate` row at its turn; the
     candidates an earlier pick blocked, each with that pick; and those that could not be
     measured against a pick, having no stored series. ``pools`` is the submitted Power Pool
-    by region.
+    by region. ``last_days`` is as for :func:`correlate`.
 
     Each pick is measured against the rivals alone, their earlier pairs kept: the same answer
     as judging them against the whole pool again, unless the pick ends later than the pool,
@@ -193,7 +239,9 @@ def submission_order(
     pool = {region: list(ids) for region, ids in pools.items()}
     everyone = dict.fromkeys([*remaining, *(p for ids in pool.values() for p in ids)])
     stored = [a for a in everyone if a in at]
-    end_of = dict(zip(stored, _ends(grid, meta, at, stored) if stored else [], strict=True))
+    end_of = dict(
+        zip(stored, _ends(grid, meta, at, stored, last_days) if stored else [], strict=True)
+    )
     pool_end: dict[str, date] = {}
     values: dict[str, dict[str, float]] = {a: {} for a in remaining}
 

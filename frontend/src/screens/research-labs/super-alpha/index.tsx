@@ -390,6 +390,7 @@ function RecipeList({
                 <Input
                   aria-label={`${SINGULAR[kind]} name`}
                   className="max-w-md flex-1 font-medium"
+                  maxLength={120}
                   value={r.name}
                   onChange={(e) => updateOwn(kind, r.id, { name: e.target.value })}
                 />
@@ -407,6 +408,7 @@ function RecipeList({
                 aria-label={`${r.name} code`}
                 autoFocus={r.id === fresh}
                 className="font-mono"
+                maxLength={8000}
                 rows={Math.min(8, Math.max(2, r.code.split('\n').length + 1))}
                 spellCheck={false}
                 value={r.code}

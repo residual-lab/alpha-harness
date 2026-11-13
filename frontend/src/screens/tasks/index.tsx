@@ -18,6 +18,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
 import { SUPER_ALPHA_SLOTS } from '@/api/platform'
+import { copyFromWorker, copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useNow } from '@/lib/now'
@@ -28,7 +29,7 @@ import { alphaIds, useDetailSheet } from '@/screens/pool/detail'
 import { MAX_SIMULATIONS } from '@/screens/research-labs/lab-task'
 import { type LabTask, labTasks, type RankedAlpha, TOP_LIMIT } from '@/screens/tasks/api'
 import { TASK_OFFER, taskStatus } from '@/screens/tasks/columns'
-import { resultsMarkdown } from '@/screens/tasks/copy'
+import type { resultsMarkdown } from '@/screens/tasks/copy'
 import { SubmittableAlphas } from '@/screens/tasks/submittable'
 import { pasteAlphas } from '@/screens/tools/paste-alphas/api'
 import {
@@ -680,15 +681,22 @@ function TaskDetail({
               ? `${task.universe ?? DASH} · ${fmt.int(task.seeds)} seeds · Population ${fmt.int(task.population)} · Mutation ${fmt.pct(task.mutationRate, 0)}`
               : `Decay ${task.decays?.length ? task.decays.join(', ') : (task.decay ?? DASH)} · ${fmt.int(task.fields)} fields`
   const copyResults = () =>
-    navigator.clipboard.writeText(resultsMarkdown(task, found)).then(
+    copyFromWorker<typeof resultsMarkdown>(
+      new Worker(new URL('./copy.worker.ts', import.meta.url), { type: 'module' }),
+      task,
+      found,
+    ).then(
       () => toast.success(`Copied ${fmt.int(found.length)} results`),
       (e: unknown) => toast.error(errorMessage(e)),
     )
   // Pasted Alphas go back the way they came: in Copy Alphas' shape, for the next output.
   const copyAlphas = useMutation({
-    mutationFn: () => pasteAlphas.copy(task.id),
-    onSuccess: async ({ text, alphas, failed, waiting, downloading }) => {
-      await navigator.clipboard.writeText(text)
+    mutationFn: () =>
+      copyText(
+        () => pasteAlphas.copy(task.id),
+        ({ text }) => text,
+      ),
+    onSuccess: ({ alphas, failed, waiting, downloading }) => {
       toast.success(
         `Copied ${fmt.int(alphas)} Alpha${alphas === 1 ? '' : 's'}` +
           (failed ? ` and ${fmt.int(failed)} failed simulation${failed === 1 ? '' : 's'}` : ''),

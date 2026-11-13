@@ -40,7 +40,8 @@ from .fastexpr import data_fields as names_read
 from .fastexpr import render as write
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Set as AbstractSet
 
     from .params import TemplateParams
 
@@ -88,6 +89,11 @@ def values(text: str) -> list[str]:
     Read as the inputs of one call, so a comma inside brackets or quotes stays in its value:
     ``sector, bucket(rank(cap), range="0, 1, 0.1")`` is two values.
     """
+    return list(_listed(text))
+
+
+@functools.lru_cache(maxsize=4096)
+def _listed(text: str) -> tuple[str, ...]:
     # A comma left at the end is the next value not typed yet, not a mistake.
     text = text.strip().rstrip(",").rstrip()
     if not text:
@@ -103,7 +109,7 @@ def values(text: str) -> list[str]:
         raise ValueError("A value can't hold another $variable.")
     if any(n.value == HOLE for arg in listed.args for _, n in walk(arg)):
         raise ValueError(f"A value can't be {HOLE}: type the signal itself.")
-    found = list(dict.fromkeys(write(arg) for arg in listed.args))
+    found = tuple(dict.fromkeys(write(arg) for arg in listed.args))
     if len(found) > MAX_VALUES:
         raise ValueError(f"A variable holds at most {MAX_VALUES} values.")
     return found
@@ -149,9 +155,31 @@ def uses(tree: Node, vector: Callable[[str], bool]) -> dict[str, Use]:
     return found
 
 
-def assigned(tree: Node) -> set[str]:
+# The tree-wide facts below are memoised on the tree itself: its hash is cached, and a template
+# is read by its stats, its problems and its search in turn.
+
+
+@functools.lru_cache(maxsize=4096)
+def assigned(tree: Node) -> frozenset[str]:
     """The names a template's own lines define, ``x = ...;``."""
-    return {node.value for _, node in walk(tree) if node.kind == "assign"}
+    return frozenset(node.value for _, node in walk(tree) if node.kind == "assign")
+
+
+@functools.lru_cache(maxsize=4096)
+def called(tree: Node) -> frozenset[str]:
+    """Every operator the tree calls, ``$variables`` included."""
+    return frozenset(node.value for _, node in walk(tree) if node.kind == "call")
+
+
+@functools.lru_cache(maxsize=4096)
+def _names(tree: Node) -> tuple[str, ...]:
+    return tuple(names_read(tree))
+
+
+@functools.lru_cache(maxsize=4096)
+def _written(tree: Node) -> dict[str, Use]:
+    """:func:`uses` with no vector operators. Shared between callers, so not to be changed."""
+    return uses(tree, lambda _: False)
 
 
 def template_problems(tree: Node, table: dict[str, OperatorInfo]) -> list[str]:
@@ -168,6 +196,7 @@ def template_problems(tree: Node, table: dict[str, OperatorInfo]) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+@functools.lru_cache(maxsize=4096)
 def holes(tree: Node) -> int:
     """How many ``...`` are still to be filled with a signal."""
     return sum(1 for _, node in walk(tree) if node.value == HOLE and node.kind in ("name", "call"))
@@ -250,13 +279,18 @@ def fields_problems(use: Use, types: list[str], vector: list[str]) -> list[str]:
     return found
 
 
-def data_names(tree: Node, defined: set[str]) -> list[str]:
+def data_names(tree: Node, defined: AbstractSet[str]) -> list[str]:
     """Fixed data fields a tree reads: not variables, groups, options or the template's steps."""
-    return [n for n in names_read(tree) if not n.startswith("$") and n not in defined | {HOLE}]
+    return _fixed(_names(tree), defined)
 
 
-def value_names(listed: list[str], defined: set[str]) -> list[str]:
-    return sorted({n for value in listed for n in data_names(_value(value), defined)})
+def _fixed(names: Iterable[str], defined: AbstractSet[str]) -> list[str]:
+    skipped = defined | {HOLE}
+    return [n for n in names if not n.startswith("$") and n not in skipped]
+
+
+def value_names(listed: list[str], defined: AbstractSet[str]) -> list[str]:
+    return sorted({n for value in listed for n in _fixed(_names(_value(value)), defined)})
 
 
 # --- arithmetic on numbers, and how large a template's Alphas are ------------------
@@ -278,14 +312,29 @@ def _number(node: Node) -> float | None:
     return None
 
 
+def _mapped(node: Node, step: Callable[[Node], Node], value: str | None = None) -> Node:
+    """``node`` with ``step`` applied to every input and, if given, a new value: the same node
+    when nothing changed, so a tree is rebuilt only where it differs."""
+    if value is None and not (node.args or node.kwargs):
+        return node
+    args = tuple(step(arg) for arg in node.args)
+    kwargs = tuple((key, step(arg)) for key, arg in node.kwargs)
+    if (
+        (value is None or value == node.value)
+        and all(new is old for new, old in zip(args, node.args, strict=True))
+        and all(new[1] is old[1] for new, old in zip(kwargs, node.kwargs, strict=True))
+    ):
+        return node
+    return Node(node.kind, node.value if value is None else value, args, kwargs)
+
+
 def fold(node: Node) -> Node:
     """Arithmetic between numbers worked out, so ``$lookback / 2`` reaches BRAIN as ``10.5``
     rather than as an operator Power Pool counts."""
-    node = replace(
-        node,
-        args=tuple(fold(arg) for arg in node.args),
-        kwargs=tuple((key, fold(arg)) for key, arg in node.kwargs),
-    )
+    return _arithmetic(_mapped(node, fold))
+
+
+def _arithmetic(node: Node) -> Node:
     if node.kind != "binary" or node.value not in _ARITHMETIC:
         return node
     left, right = (_number(arg) for arg in node.args)
@@ -300,6 +349,13 @@ def fold(node: Node) -> Node:
         return node
     number = Node("num", f"{abs(result):.10g}")
     return Node("unary", "-", (number,)) if result < 0 else number
+
+
+@functools.lru_cache(maxsize=4096)
+def _folded(text: str) -> tuple[Node, int, tuple[str, ...]]:
+    """A variable's value folded, with its operator count and the data fields it reads."""
+    node = fold(_value(text))
+    return node, operator_count(node), tuple(names_read(node))
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,41 +388,48 @@ def size(tree: Node, typed: dict[str, list[str]]) -> Size:
     A variable not typed as values stands for one field. Written as an operator, it is the
     operator it draws, so one that may be ``ts_backfill`` may cost nothing.
     """
-    written = uses(tree, lambda _: False)
+    return _size(tree, tuple((name, tuple(listed)) for name, listed in typed.items()))
+
+
+@functools.lru_cache(maxsize=4096)
+def _size(tree: Node, choices: tuple[tuple[str, tuple[str, ...]], ...]) -> Size:
+    typed = {name: list(listed) for name, listed in choices}
+    written = _written(tree)
     defined = assigned(tree)
     calls = {name for name, use in written.items() if use.calls}
 
-    def fields_of(node: Node) -> set[str]:
-        return {n for n in names_read(node) if n not in defined and n != HOLE}
+    def fields_of(names: Iterable[str]) -> set[str]:
+        return {n for n in names if n not in defined and n != HOLE}
 
     def weight(name: str, text: str) -> tuple[int, int]:
         if name in calls:
             return int(text not in UNCOUNTED_OPERATORS), 0
-        value = fold(_value(text))
-        return operator_count(value), len(fields_of(value))
+        _, operators, names = _folded(text)
+        return operators, len(fields_of(names))
 
-    def counted(pick: Callable[..., str]) -> tuple[int, int]:
-        chosen = {
-            name: pick(listed, key=functools.partial(weight, name))
-            for name, listed in typed.items()
-            if listed
-        }
+    weights = {
+        name: {text: weight(name, text) for text in listed}
+        for name, listed in typed.items()
+        if listed
+    }
 
+    def counted(chosen: dict[str, str]) -> tuple[int, int]:
         def filled(node: Node) -> Node:
+            """The template with its choices written in, folded on the way back up."""
             drawn = chosen.get(node.value[1:]) if node.value.startswith("$") else None
-            if node.kind == "name" and drawn is not None:
-                return _value(drawn)
-            return replace(
-                node,
-                value=drawn if node.kind == "call" and drawn is not None else node.value,
-                args=tuple(filled(arg) for arg in node.args),
-                kwargs=tuple((key, filled(arg)) for key, arg in node.kwargs),
-            )
+            if drawn is None:
+                return _arithmetic(_mapped(node, filled))
+            if node.kind == "name":
+                return _folded(drawn)[0]
+            return _arithmetic(_mapped(node, filled, drawn if node.kind == "call" else None))
 
-        whole = fold(filled(tree))
-        return operator_count(whole), len(fields_of(whole))
+        whole = filled(tree)
+        return operator_count(whole), len(fields_of(names_read(whole)))
 
-    (fewest_ops, fewest_fields), (most_ops, most_fields) = counted(min), counted(max)
+    fewest = {name: min(each, key=each.__getitem__) for name, each in weights.items()}
+    most = {name: max(each, key=each.__getitem__) for name, each in weights.items()}
+    (fewest_ops, fewest_fields) = counted(fewest)
+    (most_ops, most_fields) = (fewest_ops, fewest_fields) if most == fewest else counted(most)
     read = set(data_names(tree, defined))
     for name, listed in typed.items():
         if name in written and written[name].inputs:
@@ -396,7 +459,7 @@ def single_dataset(
         frozenset({datasets[name]}) if name in datasets else None for name in sized.read
     ]
     sources.extend(slot_datasets.get(slot) for slot in sized.slots)
-    if any(n.kind == "call" and n.value in PV1_OPERATORS for _, n in walk(tree)):
+    if called(tree) & PV1_OPERATORS:
         sources.append(frozenset({"pv1"}))
     if sized.holes or not sources:
         return False
@@ -425,11 +488,11 @@ def most_pyramids(
     if any(n not in categories for n in fixed):
         return None
     base = {categories[n] for n in fixed}
-    written = uses(tree, lambda _: False)
+    written = _written(tree)
     choices: list[list[set[str]]] = []
     for name, listed in typed.items():
         if name in written and written[name].inputs:
-            names = [data_names(_value(v), defined) for v in listed]
+            names = [_fixed(_names(_value(v)), defined) for v in listed]
             if any(n not in categories for each in names for n in each):
                 return None
             choices.append([{categories[n] for n in each} for each in names])
@@ -707,6 +770,10 @@ if __name__ == "__main__":
         )
         == (2, (2, 1)),
         "arithmetic on numbers is worked out": write(fold(parse("x > 21 / 2 - -1"))) == "x > 11.5",
+        "a tree with nothing to fold is not rebuilt": fold(power_pool) is power_pool,
+        "counting twice gives the same size, as one object": size(idea, lookbacks)
+        is size(idea, dict(lookbacks)),
+        "a typed list is a copy each time": values("5, 21") is not values("5, 21"),
         "an operator variable costs what it draws": size(
             program("rank($clean($f, 21))"), {"clean": ["ts_backfill", "ts_mean"]}
         ).operators

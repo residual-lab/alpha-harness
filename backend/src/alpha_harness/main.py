@@ -116,7 +116,9 @@ def create_app() -> FastAPI:
             raise
 
         async def install(release: updates.Release) -> None:
-            updates.request(release.version, wheel_url=release.wheel_url)
+            updates.request(
+                release.version, wheel_url=release.wheel_url, wheel_digest=release.wheel_digest
+            )
             await stop_server(getattr(app.state, "server", None))
 
         watcher = asyncio.create_task(updates.watch(state.engine.idle, install), name="updates")

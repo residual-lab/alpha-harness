@@ -27,7 +27,7 @@ from ..brain.schemas import region_label
 from ..catalog.queries import FieldFilter, Tuple4
 from ..db.models import Template, utcnow
 from ..labs import search, template
-from ..labs.fastexpr import Node, ParseError, operator_table, walk
+from ..labs.fastexpr import Node, ParseError, operator_table
 from ..labs.launch import (
     NO_NEUTRALIZATION,
     NO_SIMULATIONS,
@@ -252,8 +252,8 @@ async def options(state: State, refresh: bool = False) -> TemplateLabOptions:
 
 
 def _missing(tree: Node, known: set[str]) -> list[str]:
-    called = {n.value for _, n in walk(tree) if n.kind == "call" and not n.value.startswith("$")}
-    return sorted(called - known - {template.HOLE})
+    named = {n for n in template.called(tree) if not n.startswith("$")}
+    return sorted(named - known - {template.HOLE})
 
 
 def _saved(row: Template) -> TemplateSummary:
@@ -299,7 +299,8 @@ Sized = list[tuple[Node, template.Size] | str]
 
 
 def _sized(items: list[StatsItem]) -> Sized:
-    """Each template parsed and counted, or why it can't be read. Half a millisecond each."""
+    """Each template parsed and counted, or why it can't be read. A quarter of a millisecond
+    each, mostly parsing; one read before is nearly free."""
     read: Sized = []
     for item in items:
         try:
@@ -376,8 +377,9 @@ def _judged(
     return found
 
 
-#: Templates counted between turns of the event loop: a millisecond or two of parsing.
-CHUNK = 5
+#: Templates counted between turns of the event loop: about 3 ms for ten seen for the first
+#: time, far less once seen.
+CHUNK = 10
 
 
 async def _stats(
@@ -385,9 +387,10 @@ async def _stats(
 ) -> list[dict[str, Any]]:
     """Each template's size and kind of Alpha, its fields' datasets read in one query.
 
-    Counted a few at a time, yielding between: two thousand templates are a fifth of a second
-    of parsing, and the engine's polling shares this loop. A worker thread would not help, as
-    pure-Python parsing holds the GIL and slowed every other request for the whole count.
+    Counted a few at a time, yielding between: two thousand templates read for the first time
+    are half a second, mostly parsing, and the engine's polling shares this loop. A worker
+    thread would not help, as pure-Python counting holds the GIL and slowed every other request
+    for the whole count.
     """
     known = await _known(state)
     read: Sized = []
@@ -428,50 +431,6 @@ async def stats(body: StatsRequest, state: State) -> TemplateStatsList:
     dataset ones. Free; reads only the catalog."""
     found = await _stats(state, body.templates, body.region, body.delay)
     return TemplateStatsList.model_validate({"stats": found})
-
-
-class TreeOption(Out):
-    name: str
-    value: TreeNode
-
-
-class TreeNode(Out):
-    """One step of a template, as the Blocks view draws it. ``...`` is a name: an empty input."""
-
-    kind: Literal["num", "str", "name", "call", "unary", "binary", "ternary", "assign", "seq"]
-    value: str
-    args: list[TreeNode]
-    kwargs: list[TreeOption]
-
-
-class TreeRequest(BaseModel):
-    text: str = Field(max_length=template.MAX_TEXT)
-
-
-class TemplateTree(Out):
-    tree: TreeNode | None = None
-    #: Why the text has no tree: the Code view is where to fix it.
-    problem: str | None = None
-
-
-def _tree(node: Node) -> TreeNode:
-    return TreeNode.model_validate(
-        {
-            "kind": node.kind,
-            "value": node.value,
-            "args": [_tree(a) for a in node.args],
-            "kwargs": [{"name": k, "value": _tree(v)} for k, v in node.kwargs],
-        }
-    )
-
-
-@router.post("/tree")
-async def tree(body: TreeRequest) -> TemplateTree:
-    """The template as blocks, read with the same grammar every task runs on."""
-    try:
-        return TemplateTree(tree=_tree(template.program(body.text)))
-    except ParseError as exc:
-        return TemplateTree(problem=str(exc))
 
 
 @router.get("/templates")

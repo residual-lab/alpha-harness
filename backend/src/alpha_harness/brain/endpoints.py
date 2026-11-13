@@ -343,8 +343,9 @@ class BrainEndpoints:
     async def list_data_fields_paged(self, dataset_id: str, **params: Any) -> list[BulkField]:
         """Every field of one dataset in one scope, fifty at a time.
 
-        Region ``ALL`` refuses an unlimited read (``400 ["Invalid query"]``) and caps its flat
-        listing well below what it holds, so the only complete route is one dataset at a time.
+        Region ``ALL`` answers an unlimited read with an empty list (it once refused it with
+        ``400 ["Invalid query"]``) and caps its flat listing at 10,000, well below what it holds,
+        so the only complete route is one dataset at a time.
         Every other region is served whole by :meth:`list_data_fields_all`.
         """
         out: list[BulkField] = []

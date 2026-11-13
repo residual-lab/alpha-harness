@@ -5,7 +5,18 @@ import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
 import { DASH, fmt } from '@/lib/format'
 import { type LLMKey, llm } from '@/screens/ai/api'
-import { Badge, Button, Checkbox, Empty, ErrorNotice, Input, LINK, Panel, Skeleton } from '@/ui/kit'
+import {
+  Badge,
+  Button,
+  Checkbox,
+  Empty,
+  ErrorNotice,
+  Input,
+  LINK,
+  Notice,
+  Panel,
+  Skeleton,
+} from '@/ui/kit'
 import { Confirm } from '@/ui/overlay'
 import { type Column, DataTable } from '@/ui/table'
 import { useInvalidateKeys, useKeys, useProviderLabel } from './shared'
@@ -42,6 +53,7 @@ export function Keys() {
   if (!keys.data) return <Skeleton className="h-64" />
 
   const { data } = keys
+  const retired = data.keys.filter((k) => k.retired)
   if (data.keys.length === 0) {
     return (
       <Panel>
@@ -117,36 +129,44 @@ export function Keys() {
   ]
 
   return (
-    <Panel
-      title="Key Pool"
-      description={`${fmt.int(data.enabled)} of ${fmt.int(data.keys.length)} Keys enabled. Requests rotate across enabled Keys; usage counts each model's current day.`}
-      bodyClassName="p-0"
-      actions={
-        <Button size="sm" loading={checkAll.isPending} onClick={() => checkAll.mutate()}>
-          Check all
-        </Button>
-      }
-    >
-      <DataTable
-        label="API keys"
-        rows={data.keys}
-        columns={columns}
-        rowKey={(k) => String(k.id)}
-        rowHeight={40}
-      />
-      <Confirm
-        open={deleting !== null}
-        onOpenChange={(open) => !open && setDeleting(null)}
-        title={`Remove ${deleting ? nameOf(deleting) : 'Key'}?`}
-        confirmLabel="Remove Key"
-        danger
-        pending={remove.isPending}
-        onConfirm={() => deleting && remove.mutate(deleting)}
+    <div className="flex flex-col gap-3">
+      {retired.length > 0 && (
+        <Notice tone="warn" title="Some Keys belong to a provider that no longer exists">
+          {retired.map((k) => `${providerLabel(k.provider)}: ${k.retired}`).join(' ')} These Keys
+          are never used. Delete them below.
+        </Notice>
+      )}
+      <Panel
+        title="Key Pool"
+        description={`${fmt.int(data.enabled)} of ${fmt.int(data.keys.length)} Keys enabled. Requests rotate across enabled Keys; usage counts each model's current day.`}
+        bodyClassName="p-0"
+        actions={
+          <Button size="sm" loading={checkAll.isPending} onClick={() => checkAll.mutate()}>
+            Check all
+          </Button>
+        }
       >
-        The Key is deleted from the local vault and its daily budget leaves the pool. You can add it
-        again later.
-      </Confirm>
-    </Panel>
+        <DataTable
+          label="API keys"
+          rows={data.keys}
+          columns={columns}
+          rowKey={(k) => String(k.id)}
+          rowHeight={40}
+        />
+        <Confirm
+          open={deleting !== null}
+          onOpenChange={(open) => !open && setDeleting(null)}
+          title={`Remove ${deleting ? nameOf(deleting) : 'Key'}?`}
+          confirmLabel="Remove Key"
+          danger
+          pending={remove.isPending}
+          onConfirm={() => deleting && remove.mutate(deleting)}
+        >
+          The Key is deleted from the local vault and its daily budget leaves the pool. You can add
+          it again later.
+        </Confirm>
+      </Panel>
+    </div>
   )
 }
 
@@ -274,6 +294,7 @@ function RowActions({ apiKey: k, onDelete }: { apiKey: LLMKey; onDelete: () => v
 }
 
 function KeyStatus({ apiKey: k }: { apiKey: LLMKey }) {
+  if (k.retired) return <Badge tone="muted">Retired</Badge>
   if (k.lastError)
     return (
       <Badge tone="loss" title={k.lastError}>

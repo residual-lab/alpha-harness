@@ -291,7 +291,9 @@ function ModelDialog({ editing, onClose }: { editing: Editing | null; onClose: (
   const keys = useKeys()
   const [picked, setPicked] = useState<string | null>(null)
 
-  const keyed = new Set(keys.data?.keys.filter((k) => k.enabled).map((k) => k.provider))
+  const keyed = new Set(
+    keys.data?.keys.filter((k) => k.enabled && !k.retired).map((k) => k.provider),
+  )
   const choices = (providers.data?.providers ?? []).filter((p) => keyed.has(p.id))
   const wanted = editing?.model?.provider ?? editing?.provider ?? picked
   const provider = choices.find((p) => p.id === wanted) ?? choices[0]
@@ -360,7 +362,9 @@ export function Models() {
   if (!models.data || !keys.data) return <Skeleton className="h-64" />
 
   const setUp = models.data.models
-  const keyed = [...new Set(keys.data.keys.filter((k) => k.enabled).map((k) => k.provider))]
+  const keyed = [
+    ...new Set(keys.data.keys.filter((k) => k.enabled && !k.retired).map((k) => k.provider)),
+  ]
   const bare = keyed.filter((p) => !setUp.some((m) => m.provider === p))
   const budget = new Map(keys.data.budget.map((b) => [b.ref, b]))
 
@@ -423,6 +427,7 @@ export function Models() {
       width: 'minmax(180px,1fr)',
       cell: (m) => {
         const b = budget.get(m.ref)
+        if (m.retired) return <span className="text-ink-subtle">Retired</span>
         if (!b || b.allowedToday === 0)
           return <span className="text-ink-subtle">No enabled Key</span>
         return (
@@ -445,9 +450,11 @@ export function Models() {
       width: '150px',
       cell: (m) => (
         <div className="flex w-full justify-end gap-1">
-          <Button variant="ghost" size="sm" onClick={() => setEditing({ model: m })}>
-            Edit limits
-          </Button>
+          {!m.retired && (
+            <Button variant="ghost" size="sm" onClick={() => setEditing({ model: m })}>
+              Edit limits
+            </Button>
+          )}
           <Button variant="danger" size="sm" onClick={() => setRemoving(m)}>
             Remove
           </Button>
@@ -458,6 +465,12 @@ export function Models() {
 
   return (
     <div className="flex flex-col gap-3">
+      {setUp.some((m) => m.retired) && (
+        <Notice tone="warn" title="Some models belong to a provider that no longer exists">
+          {[...new Set(setUp.flatMap((m) => (m.retired ? [m.retired] : [])))].join(' ')} These
+          models are never used. Remove them below.
+        </Notice>
+      )}
       {bare.map((p) => (
         <Notice
           key={p}

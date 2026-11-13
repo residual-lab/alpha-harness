@@ -331,7 +331,7 @@ class CatalogSync:
         if target.region != REGION_AGNOSTIC_REGION:
             return await self.endpoints.list_data_fields_all(**target.params)
 
-        # Region ALL refuses an unlimited read and stops answering past 10,000 of the ~28,000
+        # Region ALL answers an unlimited read with nothing and stops past 10,000 of the ~28,000
         # fields it holds, so it is read one dataset at a time. Hundreds of requests, hence
         # the running count: a market that reports nothing for ten minutes looks hung.
         datasets = await _shared_datasets(bulk_datasets, target)

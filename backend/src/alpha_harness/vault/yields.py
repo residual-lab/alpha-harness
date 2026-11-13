@@ -32,6 +32,7 @@ from ..brain.platform import (
 )
 from ..brain.schemas import QUICK_MODE
 from ..db.models import SimulationRecord
+from ..db.sqlite import loads
 
 if TYPE_CHECKING:
     from ..db.sqlite import Database
@@ -73,7 +74,7 @@ def checks_of(checks_json: str | None) -> list[dict[str, Any]]:
     if not checks_json:
         return []
     try:
-        checks = json.loads(checks_json)
+        checks = loads(checks_json)
     except json.JSONDecodeError, TypeError:
         return []
     if not isinstance(checks, list):

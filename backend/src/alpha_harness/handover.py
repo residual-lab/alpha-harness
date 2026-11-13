@@ -231,6 +231,26 @@ if __name__ == "__main__":
     )
     thread.join(timeout=5)
     checks["...and the server is gone"] = not thread.is_alive()
+
+    # The socket this page and the app serve on: a taken port moves them, never stops them.
+    from . import __main__ as entry
+
+    taken = [socket.socket() for _ in range(2)]
+    for held in taken:
+        held.bind(("127.0.0.1", 0))
+        held.listen()
+    entry.PORT, entry.FALLBACK_PORT = (held.getsockname()[1] for held in taken)
+    with entry._listen() as moved:  # pyright: ignore[reportPrivateUsage]
+        checks["both ports taken, any free one"] = moved.getsockname()[1] not in {
+            entry.PORT,
+            entry.FALLBACK_PORT,
+        }
+    taken[1].close()
+    with entry._listen() as fallback:  # pyright: ignore[reportPrivateUsage]
+        checks["the usual port taken, the fallback"] = (
+            fallback.getsockname()[1] == entry.FALLBACK_PORT
+        )
+    taken[0].close()
     if failed := [name for name, ok in checks.items() if not ok]:
         raise SystemExit(f"handover self-check failed: {'; '.join(failed)}")
     sys.stdout.write(f"{len(checks)} cases as expected\n")

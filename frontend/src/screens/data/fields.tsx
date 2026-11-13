@@ -14,6 +14,7 @@ import {
 } from '@/api/catalog'
 import { errorMessage } from '@/api/http'
 import { type Scope, scopeLabel } from '@/api/types'
+import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useDebounced } from '@/lib/use-debounced'
@@ -297,11 +298,11 @@ export function FieldsTab({ scope }: { scope: Scope }) {
     setPicked(next)
   }
   const copy = useMutation({
-    mutationFn: async () => {
-      const outline = await catalog.outline(scope, { field_ids: [...picked] })
-      await navigator.clipboard.writeText(outline.text)
-      return outline
-    },
+    mutationFn: () =>
+      copyText(
+        () => catalog.outline(scope, { field_ids: [...picked] }),
+        (outline) => outline.text,
+      ),
     onSuccess: (outline) =>
       toast.success(`Copied ${fmt.int(picked.size - outline.missing.length)} Data Fields`, {
         description: outline.missing.length

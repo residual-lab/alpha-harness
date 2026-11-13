@@ -334,8 +334,9 @@ class CustomReshape(BaseModel):
 
     #: The card's own id, which the recipe is chosen by as ``custom:{id}``.
     id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
-    name: str = Field(min_length=1, max_length=120)
-    code: str = Field(max_length=4000)
+    # Kept loose: a blank or overlong one is refused on its own card, which stays there to fix.
+    name: str = Field(max_length=10_000)
+    code: str = Field(max_length=100_000)
 
 
 class BreakerRequest(BaseModel):

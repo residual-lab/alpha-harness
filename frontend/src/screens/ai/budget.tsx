@@ -38,7 +38,7 @@ export function Budget() {
   const left = status.budget.reduce((s, b) => s + b.remainingToday, 0)
 
   const perKey: KeyModelRow[] = status.keys
-    .filter((k) => k.enabled)
+    .filter((k) => k.enabled && !k.retired)
     .flatMap((k) =>
       (models.data?.models ?? [])
         .filter((m) => m.provider === k.provider)

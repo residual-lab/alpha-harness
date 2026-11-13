@@ -389,12 +389,9 @@ def frame(
     """
     stored = [series[a] for a in ids]
     # The final days BRAIN counts in each Alpha's IS and test figures but exports in no
-    # recordset (see :func:`metrics.closing_days`), all after its stored days. Python, an Alpha
-    # at a time: every Alpha's days at once as Python objects took 1.5 GB for 2,000 of them.
-    tails = [
-        metrics.with_closing(rows, meta.get(a, {}))[len(rows) :]
-        for a, rows in zip(ids, map(days_of, stored), strict=True)
-    ]
+    # recordset (see :func:`metrics.closing_days`), all after its stored days. Worked out from
+    # the arrays: a Python row per stored day was two thirds of the frame's time.
+    tails = [metrics.closing_of(s, meta.get(a, {})) for a, s in zip(ids, stored, strict=True)]
     tail_days = np.array([d for tail in tails for d, _, _ in tail], dtype="datetime64[D]")
     calendar = np.unique(np.concatenate([*(days for days, _, _ in stored), tail_days]))
     dates: list[date] = calendar.tolist()
