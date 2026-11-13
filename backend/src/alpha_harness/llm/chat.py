@@ -86,11 +86,14 @@ FIELD_PICK_SCHEMA: dict[str, Any] = {
                     "why": {"type": "string"},
                 },
                 "required": ["field", "why"],
+                "additionalProperties": False,
             },
         },
         "datasets": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["reply"],
+    # A strict schema requires every key: no picks is an empty list, as the prompt asks.
+    "required": ["reply", "picks", "datasets"],
+    "additionalProperties": False,
 }
 
 

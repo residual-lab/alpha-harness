@@ -81,8 +81,8 @@ export function DatasetPicker({
             'Tick categories, subcategories or datasets.'
           ) : (
             <>
-              <span className="num font-medium">{fmt.int(matching)}</span> field
-              {matching === 1 ? '' : 's'} match
+              <span className="num font-medium">{fmt.int(matching)}</span>{' '}
+              {matching === 1 ? 'field matches' : 'fields match'}
             </>
           )}
         </span>

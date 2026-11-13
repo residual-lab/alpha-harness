@@ -16,12 +16,13 @@ from sqlalchemy import select
 from . import preferences, updates
 from .account import AuthService, PlatformMetadata
 from .brain.client import BrainClient
+from .brain.connection import Connection, Link
 from .brain.endpoints import BrainEndpoints
 from .brain.errors import BrainError, BrainTransportError
-from .brain.platform import API_BASE
+from .brain.platform import API_BASE, REGION_AGNOSTIC_REGION
 from .catalog import search
 from .catalog.queries import CatalogQueries
-from .catalog.sync import CatalogSync, serialise_run
+from .catalog.sync import STARTER, CatalogSync, offered_markets, serialise_run
 from .config import Settings
 from .db.duck import Catalog
 from .db.models import SimStatus, SimulationRecord, utcnow
@@ -53,6 +54,10 @@ RECAPTURE_WINDOW = timedelta(days=3)
 
 #: Least time between asking BRAIN whether a refused session is usable again.
 SESSION_CHECK_SECONDS = 60.0
+#: How often the session is looked at while the connection is open.
+SESSION_WATCH_SECONDS = 60.0
+#: A closed connection is probed after this, doubling up to the cap while it stays closed.
+PROBE_FIRST_SECONDS, PROBE_MAX_SECONDS = 5.0, 60.0
 #: Least time between silent sign-ins; a failed one spends BRAIN's lockout budget.
 LOGIN_RETRY_SECONDS = 3600.0
 
@@ -118,6 +123,7 @@ class AppState:
         self.optimizer.llm = self.llm
 
         self._renew_lock = asyncio.Lock()
+        self._first_sync_lock = asyncio.Lock()
         self._last_session_check = float("-inf")
         self._last_login_attempt = float("-inf")
         #: Set when startup could not read the saved session: BRAIN or the network was down.
@@ -163,6 +169,10 @@ class AppState:
             await self._replay_last_sync()
         except Exception:
             log.warning("startup.sync_reset_failed", exc_info=True)
+        # After the reset, or a sync killed with the last process would read as one running. A
+        # restored session never passes through sign-in, where the first sync otherwise starts.
+        if self.auth.session.authenticated:
+            spawn(self.first_sync(), name="catalog-first-sync")
 
         # A capture in flight when we last stopped died with the process; retry those.
         try:
@@ -211,11 +221,21 @@ class AppState:
             self.tracker.alpha_landed(alpha_id)
 
     async def _watch_session(self) -> None:
-        """Renew the BRAIN session shortly before it expires, so running work keeps going, and
-        read the saved one again while startup could not."""
+        """Renew the BRAIN session shortly before it expires, so running work keeps going, read
+        the saved one again while startup could not, and bring a closed connection back
+        (:mod:`.brain.connection`): background work stands down until this probe reopens it."""
+        backoff = PROBE_FIRST_SECONDS
         while True:
-            await asyncio.sleep(60)
+            link = self.client.connection
+            await asyncio.sleep(SESSION_WATCH_SECONDS if link.open else backoff)
             try:
+                if not link.open:
+                    await self._probe(link)
+                    backoff = (
+                        PROBE_FIRST_SECONDS if link.open else min(backoff * 2, PROBE_MAX_SECONDS)
+                    )
+                    continue
+                backoff = PROBE_FIRST_SECONDS
                 session = self.auth.session
                 left = session.expires_in_seconds
                 if session.authenticated:
@@ -228,12 +248,48 @@ class AppState:
                     if restored.authenticated:
                         self.engine.configure_from_permissions(restored.permissions)
                         await self.hub.broadcast(TOPIC_SESSION, restored.to_dict())
+                        spawn(self.first_sync(), name="catalog-first-sync")
             except BrainError as exc:
                 # BRAIN or the network still down: the next minute tries again.
                 log.info("session.watch_unreachable", error=str(exc))
             # One failed check must not end renewal for the rest of the process.
             except Exception:
                 log.exception("session.watch_failed")
+
+    async def _probe(self, link: Connection) -> None:
+        """One try at reopening the connection, by what closed it. Every answer moves the state
+        itself (``BrainClient._judge``); an expired identity check waits for the person, since a
+        new one spends BRAIN's lockout budget."""
+        if link.state == Link.OFFLINE:
+            await self.auth.status()
+        elif link.state == Link.SIGNED_OUT:
+            await self.renew_session()
+        elif link.state == Link.VERIFYING and link.inquiry:
+            # Finished in the browser while nothing here was asking: closing it is all it takes.
+            info = await self.auth.verify(link.inquiry)
+            if info.authenticated:
+                self.engine.configure_from_permissions(info.permissions)
+                await self.hub.broadcast(TOPIC_SESSION, info.to_dict())
+                spawn(self.first_sync(), name="catalog-first-sync")
+
+    async def first_sync(self) -> None:
+        """After a sign-in or a restored session, download an empty catalog by itself, the
+        starter market first, so the Dashboard's first step needs no trip to Sync. Spawned, so
+        it never holds up a sign-in, and as background work it stands down while BRAIN cannot
+        be asked; a sync that fails says why on the Sync screen, like one started there."""
+        # Two sign-in paths can finish together; the second must find the first one's sync.
+        async with self._first_sync_lock:
+            if not await self.sync.first_wanted():
+                return
+            schema = (
+                await self.metadata.cached_settings_schema()
+                or await self.metadata.refresh_metadata()
+            )
+            # Region ALL is a download of its own, started only from the Sync screen.
+            targets = [t for t in offered_markets(schema) if t.region != REGION_AGNOSTIC_REGION]
+            if targets:
+                log.info("sync.first_started", markets=len(targets))
+                await self.sync.start_all(targets, first=STARTER)
 
     async def renew_session(self, *, expiring: bool = False) -> bool:
         """Whether BRAIN will take requests now, signing in again if it will not.

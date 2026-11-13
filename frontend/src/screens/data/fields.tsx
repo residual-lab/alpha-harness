@@ -14,10 +14,11 @@ import {
 } from '@/api/catalog'
 import { errorMessage } from '@/api/http'
 import { type Scope, scopeLabel } from '@/api/types'
+import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useDebounced } from '@/lib/use-debounced'
-import { useDatasetPick } from '@/screens/data/dataset-pick'
+import { useDatasetPick, useFieldPick } from '@/screens/data/dataset-pick'
 import { LAB_TABS } from '@/shell/nav'
 import {
   Badge,
@@ -297,11 +298,11 @@ export function FieldsTab({ scope }: { scope: Scope }) {
     setPicked(next)
   }
   const copy = useMutation({
-    mutationFn: async () => {
-      const outline = await catalog.outline(scope, { field_ids: [...picked] })
-      await navigator.clipboard.writeText(outline.text)
-      return outline
-    },
+    mutationFn: () =>
+      copyText(
+        () => catalog.outline(scope, { field_ids: [...picked] }),
+        (outline) => outline.text,
+      ),
     onSuccess: (outline) =>
       toast.success(`Copied ${fmt.int(picked.size - outline.missing.length)} Data Fields`, {
         description: outline.missing.length
@@ -336,6 +337,19 @@ export function FieldsTab({ scope }: { scope: Scope }) {
   })
   const filtered = Object.values(active).some(isActive)
   const picking = useDatasetPick((s) => s.active)
+  const labFields = useFieldPick((s) => s.fields)
+  const forLab = useMemo(() => new Set(Object.keys(labFields)), [labFields])
+  const pickForLab = (ids: string[], on: boolean) => {
+    const datasetOf = new Map(query.data?.results.map((r) => [r.field_id, r.dataset_id ?? '']))
+    useFieldPick.setState(({ fields }) => {
+      const next = { ...fields }
+      for (const id of ids) {
+        if (on) next[id] = datasetOf.get(id) ?? next[id] ?? ''
+        else delete next[id]
+      }
+      return { fields: next }
+    })
+  }
 
   return (
     <>
@@ -388,7 +402,10 @@ export function FieldsTab({ scope }: { scope: Scope }) {
               activeKey={openId}
               page={offset}
               // While a lab picks datasets, its ticks are the only ones on the page.
-              {...(picking ? {} : { selected: picked, onSelect: pick })}
+              // While a lab picks, a tick hands it that field; otherwise it is for copying.
+              {...(picking
+                ? { selected: forLab, onSelect: pickForLab }
+                : { selected: picked, onSelect: pick })}
               loading={query.isPending || query.isPlaceholderData}
               error={query.error}
               maxHeight={full.on ? 'calc(100vh - 17rem)' : undefined}
@@ -420,6 +437,7 @@ export function FieldsTab({ scope }: { scope: Scope }) {
 function PickBar({ matching }: { matching: number | undefined }) {
   const navigate = useNavigate()
   const count = useDatasetPick((s) => s.ids.length)
+  const fields = useFieldPick((s) => Object.keys(s.fields).length)
   const from = useDatasetPick((s) => s.from)
   const back = (done: boolean) => {
     // The filter goes with the datasets: the lab searches only the fields it shows.
@@ -430,15 +448,19 @@ function PickBar({ matching }: { matching: number | undefined }) {
   return (
     <div className="sticky top-0 z-10 flex flex-wrap items-center gap-3 rounded-lg border border-hairline bg-surface-1 p-3">
       <Metric boxed size="sm" label="Datasets Selected" value={fmt.int(count)} />
-      <Metric boxed size="sm" label="Matching Fields" value={fmt.int(count ? matching : null)} />
+      {fields > 0 ? (
+        <Metric boxed size="sm" label="Fields Selected" value={fmt.int(fields)} />
+      ) : (
+        <Metric boxed size="sm" label="Matching Fields" value={fmt.int(count ? matching : null)} />
+      )}
       <span className="min-w-0 flex-1 text-body-compact text-pretty text-ink-subtle">
-        Tick whole categories, whole subcategories or single datasets in More Filters. The lab uses
-        only the fields your filters show.
+        Tick whole categories, subcategories or datasets in More Filters, or single fields in the
+        table: with fields ticked, the lab uses only those.
       </span>
       <Button variant="ghost" onClick={() => back(false)}>
         Cancel
       </Button>
-      <Button variant="primary" disabled={count === 0} onClick={() => back(true)}>
+      <Button variant="primary" disabled={count === 0 && fields === 0} onClick={() => back(true)}>
         Use in {LAB_TABS.find((lab) => lab.to === from)?.label ?? 'the Lab'}
       </Button>
     </div>

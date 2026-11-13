@@ -32,9 +32,12 @@ scripts.alpha-harness = "alpha_harness.__main__:main"
 [dependency-groups]
 dev = [
     "basedpyright>=1.40.1",
+    "hypothesis>=6.170.15",
     "pyproject-fmt>=2.29.4",
     "pyrefly>=1.3.1",
+    "pytest>=9.2.0",
     "ruff>=0.16.8",
+    "wasmtime>=50.0.1",
 ]
 
 [tool.ruff]
@@ -81,6 +84,8 @@ lint.ignore = [ "ANN401", "N818", "S311" ]
 lint.per-file-ignores."src/alpha_harness/api/*" = [ "TC" ]
 # `type_annotation_map` is SQLAlchemy's documented declarative idiom.
 lint.per-file-ignores."src/alpha_harness/db/models.py" = [ "RUF012" ]
+# Tests state their properties with `assert`, which pytest rewrites to show the values.
+lint.per-file-ignores."tests/*" = [ "S101" ]
 # "›" is the category breadcrumb separator shown in the UI.
 lint.allowed-confusables = [ "›" ]
 # Pydantic and SQLAlchemy resolve annotations at runtime; their imports must stay real.
@@ -96,16 +101,21 @@ generate_python_version_classifiers = false
 
 # pyrefly is the sub-second loop (pre-commit); basedpyright strict stays in `check`.
 [tool.pyrefly]
-project-includes = [ "src" ]
+project-includes = [ "src", "tests" ]
 # Honor the audited `# pyright: ignore[...]` sites instead of duplicating them.
 permissive-ignores = true
+
+# Property tests (Hypothesis) and every module's `python -m` self-check: `lefthook run test`.
+[tool.pytest]
+strict = true
+testpaths = [ "tests" ]
 
 [tool.basedpyright]
 pythonVersion = "3.14"
 venv = ".venv"
 venvPath = "."
 typeCheckingMode = "strict"
-include = [ "src" ]
+include = [ "src", "tests" ]
 # pyarrow ships no stubs; its values are Unknown like duckdb's.
 reportMissingTypeStubs = false
 # Unknown leaks come from JSON payloads and un-stubbed duckdb/optuna; casting them away would

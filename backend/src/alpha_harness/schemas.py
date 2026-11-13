@@ -83,6 +83,17 @@ class Pause(Out):
     end: datetime
 
 
+class Connection(Out):
+    """The session layer (``brain.connection``)."""
+
+    state: Literal["CONNECTED", "OFFLINE", "VERIFYING", "VERIFYING_EXPIRED", "SIGNED_OUT"]
+    since: datetime
+    detail: str | None
+    #: The identity check to finish, while ``state`` is ``VERIFYING``.
+    verification_url: str | None
+    inquiry: str | None
+
+
 class EngineStatus(Out):
     """Slot occupancy, queue depth and task quotas — what the matrix header shows."""
 
@@ -100,6 +111,12 @@ class EngineStatus(Out):
     daily_limit_hit: bool
     #: BRAIN refused the session; sending waits until it is renewed or the user signs in.
     session_lost: bool
+    #: Whether BRAIN can be asked anything now, which every background caller waits on.
+    connection: Connection
+    #: BRAIN refused new simulations because the account runs its maximum elsewhere (website,
+    #: notebook); sending waits until ``busy_until``. In-flight ones are polled meanwhile.
+    busy_elsewhere: bool
+    busy_until: datetime | None
     #: OS sleep block: held while work is pending, unavailable where the OS cannot be asked.
     awake: Literal["idle", "held", "unavailable"]
     #: The account holds QUICK_MODE, so the regions Settings name run in Quick mode.

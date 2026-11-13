@@ -110,6 +110,8 @@ def serialise(
         "id": row.id,
         "label": row.label,
         "provider": row.provider,
+        #: Why this key can no longer be used, or None. Its row stays so the user can delete it.
+        "retired": providers.get(row.provider).retired or None,
         "hint": row.hint,
         "enabled": row.enabled,
         "dailyLimit": row.daily_limit,
@@ -144,6 +146,11 @@ class KeyStore:
         clean = key.strip()
         if not clean:
             raise LLMError("That key is empty.")
+        if provider not in providers.PROVIDERS:
+            raise LLMError(
+                f"{providers.get(provider).label} cannot take a new key. "
+                f"{providers.get(provider).retired}"
+            )
         # A free tier stops on its own; a paid account stops when told to. Refusing the key
         # outright is the only point at which the app can be sure it was told — afterwards
         # the key is stored, and anything that reads it can spend money.
@@ -301,7 +308,10 @@ class KeyStore:
         #: Key id -> model id -> requests that key may still send that model today.
         left: dict[int, dict[str, int]] = {}
         for model in models:
-            if model.provider not in configured_providers:
+            if (
+                model.provider not in configured_providers
+                or model.provider not in providers.PROVIDERS
+            ):
                 continue
             usable = [r for r in rows if r.enabled and r.provider == model.provider]
             remaining = 0
@@ -327,7 +337,7 @@ class KeyStore:
 
         return {
             "keys": [serialise(r, by_key.get(r.id, []), left.get(r.id)) for r in rows],
-            "enabled": sum(1 for r in rows if r.enabled),
+            "enabled": sum(1 for r in rows if r.enabled and r.provider in providers.PROVIDERS),
             "budget": budget,
             # The soonest any model's day turns over; each budget row carries its own.
             "resetInSeconds": min((b["resetInSeconds"] for b in budget), default=None),

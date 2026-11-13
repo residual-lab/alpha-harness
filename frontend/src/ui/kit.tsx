@@ -148,6 +148,7 @@ export function PageHeader({
 }
 
 export function Panel({
+  id,
   title,
   description,
   actions,
@@ -155,6 +156,8 @@ export function Panel({
   className,
   bodyClassName,
 }: {
+  /** For a link that lands on this panel: `<Link hash={id}>`. */
+  id?: string
   title?: ReactNode
   description?: ReactNode
   actions?: ReactNode
@@ -164,6 +167,7 @@ export function Panel({
 }) {
   return (
     <section
+      id={id}
       className={cn(
         'panel-highlight flex min-w-0 flex-col rounded-lg border border-hairline bg-surface-1',
         className,

@@ -10,8 +10,12 @@ export const useSearchLab = create<LabDraft>()(
   persist(() => LAB_DEFAULTS, {
     name: 'alpha-harness-search-lab',
     // Version 1 leaves cores unchosen, so Settings' default for new tasks applies.
-    version: 1,
-    migrate: (stored) => ({ ...(stored as LabDraft), cores: null }),
+    // Version 2 keeps Decay as typed, so it can hold several.
+    version: 2,
+    migrate: (stored, version) => {
+      const { decay = 0, ...draft } = stored as LabDraft & { decay?: number }
+      return { ...draft, ...(version < 1 ? { cores: null } : {}), decays: String(decay) }
+    },
   }),
 )
 followOtherTabs(useSearchLab)

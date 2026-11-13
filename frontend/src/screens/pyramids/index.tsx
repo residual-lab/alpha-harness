@@ -1,18 +1,19 @@
 /**
  * Pyramids: BRAIN's Pyramid Multiplier for every Region · Delay · Dataset Category, and the
- * Alphas submitted in each this quarter. A cell opens its market in the Data Explorer.
+ * Alphas submitted in each, in a quarter or ever. A cell opens its market in the Data Explorer.
  */
 
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { useMemo, useState } from 'react'
-import { catalog } from '@/api/catalog'
+import { ALL_TIME, catalog } from '@/api/catalog'
 import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useScope } from '@/lib/scope'
 import { useFieldFilter } from '@/screens/data/state'
 import { Empty, ErrorNotice, Page, PageHeader, Panel, Segmented, Skeleton } from '@/ui/kit'
+import { Select } from '@/ui/overlay'
 
 const REFRESH_MS = 10 * 60 * 1000
 
@@ -66,6 +67,10 @@ const key = (categoryId: string, region: string, delay: number) =>
   `${categoryId}|${region}|${delay}`
 const times = (m: number | null) => (m == null ? DASH : `×${fmt.ratio(m, 1)}`)
 
+/** An Alpha sits in one pyramid per Dataset Category it uses, so totals count it once in each. */
+const TOTAL_NOTE = 'counts an Alpha once in every pyramid it is in'
+const TOTAL_CELL = 'num h-8 text-center font-medium text-ink-muted'
+
 const SWATCH = 'h-4 w-6 shrink-0 rounded-xs border border-hairline-strong bg-pyramid-5'
 
 /** What each cell reads out. Two questions about the same grid, never mixed in one figure. */
@@ -77,12 +82,20 @@ const VIEWS: { value: View; label: string }[] = [
 ]
 
 /**
- * A pyramid's standing this quarter, as three states rather than a ramp: BRAIN either counts
+ * A pyramid's standing in a quarter, as three states rather than a ramp: BRAIN either counts
  * it as formulated or it does not, and the only other thing worth knowing is how far off it
- * is. Deliberately not the Multiplier green — these are two different readings of one cell,
+ * is. Formulating is per quarter, so across all time a count is only submitted or not.
+ * Deliberately not the Multiplier green — these are two different readings of one cell,
  * and sharing a palette would let them be mistaken for each other.
  */
-function standing(count: number, needed: number) {
+function standing(count: number, needed: number, allTime: boolean) {
+  if (allTime && count > 0) {
+    return {
+      face: 'bg-primary-subtle text-ink',
+      label: fmt.int(count),
+      note: 'formulating counts per quarter',
+    }
+  }
   if (count >= needed) {
     return {
       face: 'bg-primary font-semibold text-on-primary',
@@ -101,7 +114,22 @@ function standing(count: number, needed: number) {
 }
 
 /** Three marks, three meanings: without this the edges are a puzzle rather than a signal. */
-function Legend({ view, needed }: { view: View; needed: number }) {
+function Legend({ view, needed, allTime }: { view: View; needed: number; allTime: boolean }) {
+  if (view === 'alphas' && allTime) {
+    return (
+      <div className="mt-5 flex flex-wrap items-center gap-x-7 gap-y-3 border-t border-hairline pt-4 text-body-compact text-ink-subtle">
+        <span className="flex items-center gap-1.5">
+          <span className={cn(SWATCH, 'border-hairline-strong bg-surface-2')} />
+          none submitted
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className={cn(SWATCH, 'bg-primary-subtle')} />
+          submitted, counted across every quarter
+        </span>
+        <span>click a cell to browse that pyramid&rsquo;s Data Fields</span>
+      </div>
+    )
+  }
   if (view === 'alphas') {
     return (
       <div className="mt-5 flex flex-wrap items-center gap-x-7 gap-y-3 border-t border-hairline pt-4 text-body-compact text-ink-subtle">
@@ -115,7 +143,7 @@ function Legend({ view, needed }: { view: View; needed: number }) {
         </span>
         <span className="flex items-center gap-1.5">
           <span className={cn(SWATCH, 'bg-primary')} />
-          formulated &mdash; <span className="num">{needed}</span> or more submitted this quarter
+          formulated &mdash; <span className="num">{needed}</span> or more submitted in the quarter
         </span>
         <span>click a cell to browse that pyramid&rsquo;s Data Fields</span>
       </div>
@@ -169,25 +197,46 @@ function useSyncedUniverses() {
 }
 
 export function PyramidsScreen() {
+  // `null` until chosen: BRAIN's quarter in progress, named by the response.
+  const [period, setPeriod] = useState<string | null>(null)
   const query = useQuery({
-    queryKey: ['catalog', 'pyramids'],
-    queryFn: catalog.pyramids,
+    queryKey: ['catalog', 'pyramids', period],
+    queryFn: () => catalog.pyramids(period),
     refetchInterval: REFRESH_MS,
     staleTime: REFRESH_MS / 2,
+    placeholderData: keepPreviousData,
   })
   const data = query.data
-  const { cells, tint, bestInRow, bestInColumn } = useMemo(() => {
+  const allTime = data?.period === ALL_TIME
+  const during = allTime ? 'across all time' : `in ${data?.period ?? 'this quarter'}`
+  const periods = useMemo(
+    () => [
+      { value: ALL_TIME, label: 'All Time' },
+      ...(data?.quarters ?? []).map((q, i) => ({
+        value: q.name,
+        label: i === 0 ? `${q.name} (Current)` : q.name,
+      })),
+    ],
+    [data?.quarters],
+  )
+  const { cells, tint, bestInRow, bestInColumn, rowTotals, columnTotals, total } = useMemo(() => {
     const all = data?.cells ?? []
     const byRow = new Map<string, number[]>()
     const byColumn = new Map<string, number[]>()
     const multipliers: number[] = []
+    const rowTotals = new Map<string, number>()
+    const columnTotals = new Map<string, number>()
+    let total = 0
     for (const c of all) {
+      const id = `${c.region}-${c.delay}`
+      rowTotals.set(c.categoryId, (rowTotals.get(c.categoryId) ?? 0) + c.alphaCount)
+      columnTotals.set(id, (columnTotals.get(id) ?? 0) + c.alphaCount)
+      total += c.alphaCount
       if (c.multiplier == null) continue
       multipliers.push(c.multiplier)
       const row = byRow.get(c.categoryId) ?? []
       row.push(c.multiplier)
       byRow.set(c.categoryId, row)
-      const id = `${c.region}-${c.delay}`
       const column = byColumn.get(id) ?? []
       column.push(c.multiplier)
       byColumn.set(id, column)
@@ -197,6 +246,9 @@ export function PyramidsScreen() {
       tint: ramp(multipliers),
       bestInRow: peaks(byRow),
       bestInColumn: peaks(byColumn),
+      rowTotals,
+      columnTotals,
+      total,
     }
   }, [data?.cells])
   const navigate = useNavigate()
@@ -207,6 +259,8 @@ export function PyramidsScreen() {
   }
   const universes = useSyncedUniverses()
   const [view, setView] = useState<View>('multiplier')
+  // Multipliers are rates, so only the Alphas view has anything to add up.
+  const totalled = view === 'alphas'
   const needed = data?.alphasPerPyramid ?? 3
 
   /** A cell is a way in: open its market and narrow the Fields tab to just that category. */
@@ -223,16 +277,29 @@ export function PyramidsScreen() {
     <Page>
       <PageHeader
         title="Pyramids"
-        description="BRAIN's Pyramid Multiplier for every Region, Delay and Dataset Category, and the Alphas you submitted in each this quarter."
+        description="BRAIN's Pyramid Multiplier for every Region, Delay and Dataset Category, and the Alphas you submitted in each."
       />
       <Panel
         title={view === 'alphas' ? 'Pyramid Alpha Distribution' : 'Pyramid Multiplier Map'}
         description={
           view === 'alphas'
-            ? 'Alphas you submitted in each pyramid this quarter.'
+            ? `Alphas you submitted in each pyramid ${during}.`
             : 'What BRAIN pays for a submission in each pyramid.'
         }
-        actions={<Segmented label="Cell value" value={view} onChange={setView} items={VIEWS} />}
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            {view === 'alphas' && data && (
+              <Select
+                label="Period"
+                mono
+                items={periods}
+                value={data.period}
+                onChange={setPeriod}
+              />
+            )}
+            <Segmented label="Cell value" value={view} onChange={setView} items={VIEWS} />
+          </div>
+        }
       >
         {query.isError ? (
           <ErrorNotice error={query.error} title="Could not load pyramids from BRAIN" />
@@ -277,6 +344,15 @@ export function PyramidsScreen() {
                         {column.region} D{column.delay}
                       </th>
                     ))}
+                    {totalled && (
+                      <th
+                        scope="col"
+                        title={TOTAL_NOTE}
+                        className="w-16 px-1 font-medium text-ink-subtle"
+                      >
+                        Total
+                      </th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
@@ -307,8 +383,8 @@ export function PyramidsScreen() {
                           topOfRow && 'best market for this category',
                           topOfColumn && 'best category in this market',
                         ].filter(Boolean)
-                        const quarter = standing(cell.alphaCount, needed)
-                        const reading = `${category.name} · ${column.region} D${column.delay} · Pyramid Multiplier ${times(cell.multiplier)} · ${fmt.int(cell.alphaCount)} of your Alphas this quarter, ${quarter.note}${notes.length ? ` · ${notes.join(' · ')}` : ''}`
+                        const quarter = standing(cell.alphaCount, needed, allTime)
+                        const reading = `${category.name} · ${column.region} D${column.delay} · Pyramid Multiplier ${times(cell.multiplier)} · ${fmt.int(cell.alphaCount)} of your Alphas ${during}, ${quarter.note}${notes.length ? ` · ${notes.join(' · ')}` : ''}`
                         // Openable only where this category's Fields are downloaded for the
                         // market: the Data Explorer reads the local catalog, so a cell BRAIN
                         // pays for is still a dead end until the market is synced.
@@ -351,14 +427,49 @@ export function PyramidsScreen() {
                           </td>
                         )
                       })}
+                      {totalled && (
+                        <td className={TOTAL_CELL} title={`${category.name}: ${TOTAL_NOTE}`}>
+                          {fmt.int(rowTotals.get(category.id) ?? 0)}
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>
+                {totalled && (
+                  <tfoot>
+                    <tr>
+                      <th
+                        scope="row"
+                        title={TOTAL_NOTE}
+                        className="pr-3 text-left font-medium text-ink-subtle"
+                      >
+                        Total
+                      </th>
+                      {data.columns.map((column) => {
+                        const id = `${column.region}-${column.delay}`
+                        return (
+                          <td
+                            key={id}
+                            className={TOTAL_CELL}
+                            title={`${column.region} D${column.delay}: ${TOTAL_NOTE}`}
+                          >
+                            {fmt.int(columnTotals.get(id) ?? 0)}
+                          </td>
+                        )
+                      })}
+                      <td className={cn(TOTAL_CELL, 'text-ink')} title={TOTAL_NOTE}>
+                        {fmt.int(total)}
+                      </td>
+                    </tr>
+                  </tfoot>
+                )}
               </table>
             </div>
           </div>
         )}
-        {data && data.categories.length > 0 && <Legend view={view} needed={needed} />}
+        {data && data.categories.length > 0 && (
+          <Legend view={view} needed={needed} allTime={allTime} />
+        )}
       </Panel>
     </Page>
   )

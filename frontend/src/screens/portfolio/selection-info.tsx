@@ -3,7 +3,7 @@
 import { InfoButton, InfoSection } from '@/ui/info'
 import { FUNCTIONS } from './selection'
 
-const EXAMPLE = 'information_ratio >= 0.10;\nreturns / turnover >= 1;\nreturns / drawdown >= 1'
+export const EXAMPLE = 'sharpe >= 1.58;\nreturns / turnover >= 1;\nreturns / drawdown >= 1'
 
 const List = ({ names }: { names: string[] }) => (
   <ul className="flex flex-wrap gap-x-3 gap-y-1">
@@ -46,11 +46,6 @@ export function SelectionInfo({ metrics }: { metrics: string[] }) {
           write <span className="num text-ink">10%</span>; a Margin of{' '}
           <span className="num text-ink">5bps</span> is <span className="num text-ink">0.0005</span>
           .
-        </p>
-        <p>
-          <span className="num text-ink">information_ratio</span> is Sharpe /{' '}
-          <span className="num text-ink">√250</span>, the days BRAIN annualizes over, so it is as
-          exact as BRAIN's two-place Sharpe.
         </p>
         <p>An Alpha missing a metric fails any condition on it.</p>
         <List names={metrics} />

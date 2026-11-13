@@ -8,15 +8,17 @@ stopped, changed or removed. Search Lab, Template Lab and Evolution Lab add sche
 import asyncio
 import contextlib
 import itertools
-import json
 import math
 from collections import Counter
+from functools import partial
 from typing import Annotated, Any, Literal
 
+import msgspec
 import structlog
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.orm import defer
 
 from ..brain.errors import BrainError, BrainRateLimited
 from ..brain.platform import (
@@ -36,6 +38,7 @@ from ..db.models import (
     TrialState,
     utcnow,
 )
+from ..db.sqlite import loads
 from ..engine.slots import POSITIONAL_NOTE
 from ..labs import scheduler, search
 from ..labs.objectives import FAILURE, OBJECTIVES, StudyNotFoundError
@@ -52,7 +55,7 @@ from ..labs.study import ranked
 from ..schemas import Out
 from ..tasks import Task
 from ..tools import power_pool
-from ..vault.yields import checks_of, clean, is_submitted, verdict
+from ..vault.yields import checks_of, clean, gating_results, is_submitted
 from .deps import State, refuse
 
 log = structlog.get_logger(__name__)
@@ -128,6 +131,11 @@ class LabTask(Out):
     mutation_rate: float | None
     #: Search Lab and Template Lab only.
     decay: int | None
+    #: Settings Sampler: every simulation draws BRAIN's visualizations.
+    visualization: bool = False
+    #: The Decays a Settings Sampler sweeps or a Search Lab task searches, in place of
+    #: ``decay``; empty when it holds one.
+    decays: list[int] = Field(default_factory=list[int])
     cores: int
     dataset_ids: list[str]
     fields: int
@@ -190,6 +198,9 @@ class RankedAlpha(Out):
     #: shows it. Shown, never searched on, so they stay out of sample. Null without a test period.
     test_sharpe: float | None = None
     test_fitness: float | None = None
+    #: The train years', from the vault: with ``sharpe`` and ``test_sharpe``, what tells a
+    #: straight line (an implausible Sharpe in any period) from a signal.
+    train_sharpe: float | None = None
     #: The highest correlation with any consultant Alpha in production, which BRAIN wants
     #: below 0.7. Null until BRAIN has been asked: it limits these checks per hour.
     prod_correlation: float | None = None
@@ -281,11 +292,16 @@ class PowerPoolCorrelation(Out):
 
 
 async def _rows(state: Any) -> list[Study]:
+    """Every task, without its parameters and source: megabytes for a Search Lab space or a
+    long paste, and the list is read every few seconds. :func:`_setups` reads what it shows."""
     async with state.db.session() as session:
         return list(
             (
                 await session.scalars(
-                    select(Study).where(Study.sampler.in_(TASK_SAMPLERS)).order_by(Study.id.desc())
+                    select(Study)
+                    .options(defer(Study.sampler_params), defer(Study.template_source))
+                    .where(Study.sampler.in_(TASK_SAMPLERS))
+                    .order_by(Study.id.desc())
                 )
             ).all()
         )
@@ -320,7 +336,7 @@ async def _progress(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
             ids.append(row.id)
     if not ids:
         return out
-    value = func.json_extract(Trial.values, "$[0]")
+    value = Trial.score
     answered = Trial.state.in_([TrialState.COMPLETE, TrialState.FAIL])
     async with state.db.session() as session:
         states = await session.execute(
@@ -384,44 +400,74 @@ def _fields(space: Any) -> int:
     return sum(len(v.get("fields") or {}) for v in variables if isinstance(v, dict))
 
 
-def _task(row: Study, progress: dict[str, Any]) -> LabTask:
+def _setup(row: Study) -> dict[str, Any]:
+    """What a task's entry reads from its parameters and source."""
     # Read raw on purpose: this only displays, and one malformed old row must not take the
     # whole Tasks list down with a validation error.
     params = row.sampler_params or {}
+    space = params.get("space")
+    searched = space.get("decays") if isinstance(space, dict) else None
+    # Several decays, swept (Settings Sampler) or searched (Search Lab), stand in for one.
+    decays = params.get("decays") or (searched if searched and len(searched) > 1 else [])
+    return {
+        "template": row.template_source if row.sampler == TEMPLATE_SAMPLER else None,
+        "stopping": bool(params.get("stopping")),
+        "region": params.get("region"),
+        "delay": params.get("delay"),
+        "universe": params.get("universe"),
+        "seeds": len(params.get("seeds") or []),
+        "population": params.get("population"),
+        "mutationRate": params.get("mutationRate"),
+        "decay": None if decays else params.get("decay"),
+        "decays": decays,
+        "visualization": bool(params.get("visualization")),
+        "alphaId": params.get("alphaId"),
+        "markets": params.get("markets"),
+        "truncation": params.get("truncation"),
+        "truncationAgent": bool(params.get("truncationAgent")),
+        "nanHandling": params.get("nanHandling"),
+        "testPeriod": params.get("testPeriod"),
+        "expression": row.template_source if row.sampler in ONE_EXPRESSION else None,
+        "cores": scheduler.cores_of(row),
+        "datasetIds": params.get("datasetIds") or [],
+        "fields": _fields(params.get("space")),
+        "llmModels": (params.get("llm") or {}).get("byModel") or {},
+        "queuedAt": params.get("queuedAt"),
+    }
+
+
+#: Each task's :func:`_setup`, with the update time it was read at: a task is read whole again
+#: only once its row has changed.
+_SETUPS: dict[int, tuple[Any, dict[str, Any]]] = {}
+
+
+async def _setups(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
+    """Each of ``rows``' :func:`_setup`. A task deleted since they were read may be missing."""
+    changed = [r.id for r in rows if r.id not in _SETUPS or _SETUPS[r.id][0] != r.updated_at]
+    async with state.db.session() as session:
+        for chunk in itertools.batched(changed, TRIAL_CHUNK, strict=False):
+            for row in await session.scalars(select(Study).where(Study.id.in_(chunk))):
+                _SETUPS[row.id] = (row.updated_at, _setup(row))
+    return {r.id: _SETUPS[r.id][1] for r in rows if r.id in _SETUPS}
+
+
+def _task(row: Study, progress: dict[str, Any], setup: dict[str, Any] | None = None) -> LabTask:
+    """A task's entry; ``setup`` is its :func:`_setup`, read from ``row`` when not given."""
     states = progress["states"]
     told = states.get(TrialState.COMPLETE, 0) + states.get(TrialState.FAIL, 0)
     template = row.sampler == TEMPLATE_SAMPLER
     objective = OBJECTIVES.get((row.objectives or ["sharpe"])[0], OBJECTIVES["sharpe"])
     return LabTask.model_validate(
-        {
+        (_setup(row) if setup is None else setup)
+        | {
             "id": row.id,
             "name": row.label,
             "lab": row.sampler,
             "labName": TASK_SAMPLERS.get(row.sampler, row.sampler),
             "templateName": row.template_name if template else None,
-            "template": row.template_source if template else None,
             "status": row.status,
-            "stopping": bool(params.get("stopping")),
             "message": row.message,
-            "region": params.get("region"),
-            "delay": params.get("delay"),
-            "universe": params.get("universe"),
-            "seeds": len(params.get("seeds") or []),
-            "population": params.get("population"),
-            "mutationRate": params.get("mutationRate"),
-            "decay": params.get("decay"),
-            "alphaId": params.get("alphaId"),
-            "markets": params.get("markets"),
-            "truncation": params.get("truncation"),
-            "truncationAgent": bool(params.get("truncationAgent")),
-            "nanHandling": params.get("nanHandling"),
-            "testPeriod": params.get("testPeriod"),
-            "expression": row.template_source if row.sampler in ONE_EXPRESSION else None,
-            "cores": scheduler.cores_of(row),
-            "datasetIds": params.get("datasetIds") or [],
-            "fields": _fields(params.get("space")),
             "target": row.max_trials,
-            "llmModels": (params.get("llm") or {}).get("byModel") or {},
             # What spent quota, as the scheduler counts toward the target.
             "simulated": told - progress["free"] - progress["fullRuns"],
             "cached": progress["free"],
@@ -438,7 +484,6 @@ def _task(row: Study, progress: dict[str, Any]) -> LabTask:
             "best": progress["best"],
             "objectiveLabel": objective.label,
             "createdAt": row.created_at.isoformat() if row.created_at else None,
-            "queuedAt": params.get("queuedAt"),
             "startedAt": row.started_at.isoformat() if row.started_at else None,
             "finishedAt": row.finished_at.isoformat() if row.finished_at else None,
         }
@@ -455,7 +500,11 @@ async def list_tasks(state: State) -> LabTasks:
     """Every task, newest first, and the slots they share."""
     rows = await _rows(state)
     progress = await _progress(state, rows)
-    return LabTasks(slots=state.engine.slots, tasks=[_task(r, progress[r.id]) for r in rows])
+    setups = await _setups(state, rows)
+    return LabTasks(
+        slots=state.engine.slots,
+        tasks=[_task(r, progress[r.id], setups[r.id]) for r in rows if r.id in setups],
+    )
 
 
 async def _queue(state: Any, ids: list[int]) -> None:
@@ -544,6 +593,8 @@ async def power_pool_workflow(body: AlphaIds, state: State) -> WorkflowStarted:
 #: The least to wait once BRAIN still refuses a correlation check after the client's own
 #: retries: its limit is per hour, so asking again a minute later only spends another refusal.
 PROD_WAIT = 300.0
+#: How often a check waiting on a closed connection looks again.
+PAUSED_WAIT = 10.0
 
 
 def _prod_key(alpha_id: str) -> str:
@@ -594,6 +645,13 @@ async def check_prod_correlation(body: AlphaIds, state: State) -> WorkflowStarte
             progress = f"{done} of {len(wanted)}"
             await state.tasks.update(task, progress=done / len(wanted), detail=progress)
             while True:
+                link = state.client.connection
+                if not link.open:
+                    # Offline or signed out: wait for the connection rather than fail every Alpha
+                    # left, as 303 did in one consultant's log.
+                    await state.tasks.update(task, detail=f"{progress} · waiting for BRAIN")
+                    await asyncio.sleep(PAUSED_WAIT)
+                    continue
                 try:
                     answer = await state.endpoints.correlations(alpha_id, "prod")
                 except BrainRateLimited as exc:
@@ -608,6 +666,8 @@ async def check_prod_correlation(body: AlphaIds, state: State) -> WorkflowStarte
                     continue
                 # One Alpha BRAIN cannot check must not abandon the rest.
                 except BrainError as exc:
+                    if not state.client.connection.open:
+                        continue  # The connection closed under it: this Alpha is asked again.
                     log.warning("prod_correlation.failed", alpha_id=alpha_id, error=exc.message)
                     failed += 1
                     break
@@ -685,14 +745,16 @@ async def power_pool_order(body: AlphaIds, state: State) -> SubmissionOrder:
     candidates = {
         a: r for a, r in stored.items() if power_pool.is_power_pool(r) and not is_submitted(r)
     }
-    grid = await state.alphas.pnl_grid([*candidates, *pool_meta])
     pools: dict[str, list[str]] = {}
     for alpha_id, row in pool_meta.items():
         if (region := power_pool.scope_of(row)) is not None:
             pools.setdefault(region, []).append(alpha_id)
     meta = candidates | pool_meta
+    last_days = await state.alphas.last_days([*candidates, *pool_meta])
+    since = power_pool.correlation_floor(last_days, meta, pools, list(candidates))
+    grid = await state.alphas.pnl_grid([*candidates, *pool_meta], since=since)
     picks, blocked, unmeasured = await asyncio.to_thread(
-        power_pool.submission_order, grid, meta, list(candidates), pools
+        power_pool.submission_order, grid, meta, list(candidates), pools, last_days=last_days
     )
     blocks = Counter(blocked.values())
     return SubmissionOrder(
@@ -805,18 +867,19 @@ async def remove(task_id: int, state: State) -> TaskRemoved:
         await state.optimizer.delete(task_id)
         await state.engine.set_quota(row.task, 0, enabled=False)
     _COMPLETE_PROGRESS.pop(task_id, None)
+    _SETUPS.pop(task_id, None)
     await state.optimizer.notify()
     return TaskRemoved(removed=task_id)
 
 
-@router.get("/{task_id}/top")
+@router.get("/{task_id}/top", response_model=list[RankedAlpha])
 async def top(
     task_id: int,
     state: State,
     # A sweep's whole result set is worth scrolling, so the ceiling is a day's
     # simulations rather than a page; the caller asks for what it means to show.
     limit: Annotated[int, Query(ge=1, le=5000)] = 20,
-) -> list[RankedAlpha]:
+) -> Response:
     """The task's best Alphas on what it searches for. Seeds are not among them."""
     await _one(state, task_id)  # 404 for an unknown task
     async with state.db.session() as session:
@@ -829,7 +892,7 @@ async def top(
                         Trial.state == TrialState.COMPLETE,
                         or_(Trial.generation.is_(None), Trial.generation != 0),
                     )
-                    .order_by(func.json_extract(Trial.values, "$[0]").desc())
+                    .order_by(Trial.score.desc(), Trial.number)
                     .limit(limit)
                 )
             ).all()
@@ -843,10 +906,10 @@ async def top(
     # three BRAIN requests per Alpha: enough of them earns a 429, which holds up every read of
     # an Alpha, captures included. Calculate After-Cost Sharpe is the way to ask, and it says
     # how many it will fetch before it does.
-    return [
-        RankedAlpha.model_validate(r | _from_vault(r["alphaId"], stored, prod))
-        for r in ranked(best, current)
-    ]
+    rows = [r | _from_vault(r["alphaId"], stored, prod) for r in ranked(best, current)]
+    # The rows already have the model's fields, as this module's self-check holds them to: made
+    # into models only to be dumped, 5,000 took 80-120 ms on the event loop, against 9-16 ms.
+    return Response(msgspec.json.encode(rows), media_type="application/json")
 
 
 def _from_vault(
@@ -860,6 +923,7 @@ def _from_vault(
         "afterCostSharpe": vault.get("after_cost_5bps"),
         "testSharpe": vault.get("test_sharpe"),
         "testFitness": vault.get("test_fitness"),
+        "trainSharpe": vault.get("train_sharpe"),
         "prodCorrelation": prod.get(alpha_id),
         "submitted": is_submitted(vault),
     }
@@ -884,9 +948,6 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
     # BRAIN attaches POWER_POOL_CORRELATION only to Alphas it would judge this way, so the
     # rest of the sweep is nothing to do with the Power Pool and is counted, not measured.
     candidates = {a: r for a, r in stored.items() if power_pool.is_power_pool(r)}
-    grid = await state.alphas.pnl_grid([*candidates, *pool_meta])
-    has_pnl = set(grid[0])
-
     by_region: dict[str, list[str]] = {}
     for alpha_id, r in pool_meta.items():
         region = power_pool.scope_of(r)
@@ -894,6 +955,10 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
             by_region.setdefault(region, []).append(alpha_id)
 
     meta = candidates | pool_meta
+    last_days = await state.alphas.last_days([*candidates, *pool_meta])
+    since = power_pool.correlation_floor(last_days, meta, by_region)
+    grid = await state.alphas.pnl_grid([*candidates, *pool_meta], since=since)
+    has_pnl = set(grid[0])
     without_pnl: list[str] = []
     wanted: dict[str, list[str]] = {}
     # A region with nothing submitted in it needs no series and no arithmetic: there is
@@ -923,7 +988,7 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
     measured: list[PowerPoolRow] = [
         PowerPoolRow.model_validate(r | {"region": region})
         for region, ids in unopposed.items()
-        for r in power_pool.correlate(grid, meta, ids, [])
+        for r in power_pool.correlate(grid, meta, ids, [], last_days=last_days)
     ]
     scopes.extend(
         PowerPoolScope(region=region, pool=[], pool_without_pnl=[]) for region in unopposed
@@ -932,7 +997,9 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
         members = by_region[region]
         # Every member, synced or not: a member without PnL is a collision nobody measured,
         # and an unsynced pool must read as unmeasured, not as an empty one.
-        found = await asyncio.to_thread(power_pool.correlate, grid, meta, wanted[region], members)
+        found = await asyncio.to_thread(
+            partial(power_pool.correlate, grid, meta, wanted[region], members, last_days=last_days)
+        )
         measured.extend(PowerPoolRow.model_validate(r | {"region": region}) for r in found)
         scopes.append(
             PowerPoolScope(
@@ -990,8 +1057,10 @@ async def _not_refused(session: Any, ids: list[tuple[int, str | None]]) -> list[
         for trial_id, alpha_id, checks, region in raw:
             # A region-agnostic trial ran with one child's checks standing in; the family is
             # judged on all its children once read, so it is never dropped here.
+            # FAIL only: an ERROR is BRAIN failing to run the check, which a re-check can turn
+            # into a PASS, so that Alpha is judged on the vault's current checks instead.
             refused = region != REGION_AGNOSTIC_REGION and (
-                verdict(json.loads(checks) if checks else []) == "refused"
+                "FAIL" in gating_results(loads(checks) if checks else [])
             )
             _REFUSED[trial_id, alpha_id] = refused
 
@@ -1010,22 +1079,23 @@ async def submittable_alphas(state: State) -> list[TaskAlpha]:
     """
     tasks = {row.id: row for row in await _rows(state)}
     async with state.db.session() as session:
-        ids = list(
+        # In row order, so each chunk below reads neighbouring rows. Sorted here: ordered in SQL,
+        # the read left the index for every finished trial's row, 400 ms against 80.
+        ids = sorted(
             (
                 await session.execute(
-                    select(Trial.id, Trial.alpha_id)
-                    .where(
+                    select(Trial.id, Trial.alpha_id).where(
                         Trial.study_id.in_(list(tasks)),
                         Trial.state == TrialState.COMPLETE,
                         Trial.alpha_id.is_not(None),
                         or_(Trial.generation.is_(None), Trial.generation != 0),
                     )
-                    .order_by(Trial.study_id, Trial.number)
                 )
-            ).tuples()
+            ).tuples(),
+            key=lambda found: found[0],
         )
-        # A check that FAILed at simulation time stays failed: BRAIN's later checks only
-        # settle what was PENDING. Only the rest are read whole, about one in ten measured.
+        # A check that FAILed at simulation time stays failed: BRAIN's later checks only settle
+        # what was PENDING or ERROR. Only the rest are read whole, about one in ten measured.
         kept = await _not_refused(session, ids)
         trials: list[Trial] = []
         for chunk in itertools.batched(kept, TRIAL_CHUNK, strict=False):
@@ -1058,3 +1128,36 @@ async def submittable_alphas(state: State) -> list[TaskAlpha]:
             )
         )
     return out
+
+
+if __name__ == "__main__":
+    import sys
+
+    from pydantic import TypeAdapter
+
+    trial = Trial(
+        id=1,
+        study_id=1,
+        number=0,
+        state=TrialState.COMPLETE,
+        alpha_id="a",
+        expression="rank(close)",
+        settings={"region": "USA"},
+        params={},
+        values=[2],
+        result={"stats": {"sharpe": 2}, "checks": [{"name": "LOW_SHARPE", "limit": 1.25}]},
+    )
+    rows = [r | _from_vault(r["alphaId"], {}, {}) for r in ranked([trial])]
+    shape = TypeAdapter(list[RankedAlpha])
+    modelled = shape.dump_json(shape.validate_python(rows), by_alias=True)
+    checks = {
+        "a ranked row has every field of the response, and only those": set(rows[0])
+        == {field.alias for field in RankedAlpha.model_fields.values()},
+        "encoded as it is, it reads as the model writes it": msgspec.json.decode(
+            msgspec.json.encode(rows)
+        )
+        == msgspec.json.decode(modelled),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"lab_tasks self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

@@ -9,6 +9,8 @@ import {
   CheckIcon,
   ChevronsUpDownIcon,
   ExternalLinkIcon,
+  FolderOpenIcon,
+  LifeBuoyIcon,
   LogOutIcon,
   MessageSquareTextIcon,
   PanelLeftIcon,
@@ -17,9 +19,11 @@ import {
   ShieldCheckIcon,
 } from 'lucide-react'
 import { Fragment, useEffect, useState } from 'react'
+import { toast } from 'sonner'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
-import { auth } from '@/api/core'
+import { auth, diagnostics } from '@/api/core'
+import { errorMessage } from '@/api/http'
 import { PLATFORM_URL } from '@/api/platform'
 import type { Today } from '@/api/types'
 import { cn } from '@/lib/cn'
@@ -285,6 +289,32 @@ export function Sidebar({
               icon: <ExternalLinkIcon />,
               onClick: () => window.open(PLATFORM_URL, '_blank', 'noopener,noreferrer'),
             },
+            {
+              label: 'Export Diagnostics',
+              icon: <LifeBuoyIcon />,
+              onClick: () =>
+                toast.promise(diagnostics.export(), {
+                  loading: 'Saving diagnostics…',
+                  success: (saved) => ({
+                    message: 'Diagnostics saved',
+                    description: `${saved.path}. Send this file when you ask for help: names and ids in it are scrubbed.`,
+                  }),
+                  error: (error) => errorMessage(error),
+                }),
+            },
+            // Only a launcher keeps a log file; run any other way, the log is the terminal.
+            ...(launched
+              ? [
+                  {
+                    label: 'Open Log Folder',
+                    icon: <FolderOpenIcon />,
+                    onClick: () =>
+                      void diagnostics
+                        .openLogs()
+                        .catch((error) => toast.error(errorMessage(error))),
+                  },
+                ]
+              : []),
             {
               label: 'Sign Out',
               icon: <LogOutIcon />,

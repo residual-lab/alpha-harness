@@ -9,6 +9,7 @@
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useMemo } from 'react'
+import { fingerprint } from '@/lib/fingerprint'
 import { labTasks, type PowerPoolCorrelation, type PowerPoolRow } from '@/screens/tasks/api'
 
 export type { PowerPoolRow }
@@ -41,16 +42,19 @@ export const powerPoolTone = (r: PowerPoolRow | undefined) =>
       : 'blocked'
 
 export function usePowerPool(alphaIds: string[]): PowerPool {
+  const idsKey = useMemo(() => fingerprint(alphaIds), [alphaIds])
   const query = useQuery({
     // The id list is part of the key: a different set of Alphas is a different answer. The
     // last one stays up meanwhile, still right for the Alphas it holds: blanking the table on
     // every new Alpha threw the reader back to the top.
-    queryKey: ['power-pool', alphaIds],
+    queryKey: ['power-pool', idsKey],
     placeholderData: keepPreviousData,
     queryFn: () => labTasks.powerPoolFor(alphaIds),
     enabled: alphaIds.length > 0,
     retry: false,
     staleTime: 60_000,
+    // A running task re-keys this with every clean Alpha; superseded answers go sooner.
+    gcTime: 30_000,
   })
   const by = useMemo(
     () => new Map((query.data?.rows ?? []).map((r) => [r.alphaId, r])),

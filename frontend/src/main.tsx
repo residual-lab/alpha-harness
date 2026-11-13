@@ -7,17 +7,17 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Toaster, toast } from 'sonner'
 import { ApiError, errorMessage } from '@/api/http'
-import { useLive } from '@/lib/live'
 import { telemetry } from '@/lib/ws'
 import { router } from '@/router'
-import { useDatasetPick } from '@/screens/data/dataset-pick'
+import { useDatasetPick, useFieldPick } from '@/screens/data/dataset-pick'
 import { endDatasetPick, startDatasetPick, useFieldFilter } from '@/screens/data/state'
 import { useSeedPick } from '@/screens/research-labs/evolution/seed-pick'
 
-/** Any call BRAIN answers with a verification demand raises the global banner. */
+/** Any call BRAIN answers with an identity check raises the banner at once, rather than at the
+ * engine status's next read, which carries the check. */
 const noteVerification = (error: unknown) => {
   if (error instanceof ApiError && error.body.verificationUrl)
-    useLive.setState({ verificationUrl: error.body.verificationUrl })
+    void queryClient.invalidateQueries({ queryKey: ['simulations', 'engine'] })
 }
 
 const queryClient = new QueryClient({
@@ -59,6 +59,7 @@ router.subscribe('onResolved', ({ toLocation: { pathname } }) => {
   if (datasets.active && !within(pathname, ['/data', '/sync', '/pyramids'])) {
     const { scope, ids, byMarket, from } = datasets
     const { filter } = useFieldFilter.getState()
+    const { fields } = useFieldPick.getState()
     endDatasetPick(false)
     if (scope && ids.length)
       toast('Dataset pick closed', {
@@ -68,6 +69,7 @@ router.subscribe('onResolved', ({ toLocation: { pathname } }) => {
           onClick: () => {
             startDatasetPick(scope, ids, from, filter)
             useDatasetPick.setState({ byMarket })
+            useFieldPick.setState({ fields })
             void router.navigate({ to: '/data' })
           },
         },

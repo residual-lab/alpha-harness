@@ -37,6 +37,8 @@ CORRELATION_BREAKER = "correlation-breaker"
 FIELDS_SAMPLER = "fields-sampler"
 #: Studies that combine your submitted Alphas into SuperAlphas (labs.super_alpha).
 SUPER_LAB = "super-alpha"
+#: Studies that run Alphas pasted from an LLM's answer, as given (tools.paste_alphas).
+PASTE_ALPHAS = "paste-alphas"
 #: Studies that are research-lab tasks, run only from the Tasks tab, by their lab's name.
 TASK_SAMPLERS = {
     SEARCH_SAMPLER: "Search Lab",
@@ -47,6 +49,7 @@ TASK_SAMPLERS = {
     CORRELATION_BREAKER: "Correlation Breaker",
     FIELDS_SAMPLER: "Fields Sampler",
     SUPER_LAB: "Super Alpha Lab",
+    PASTE_ALPHAS: "Paste Alphas",
 }
 
 
@@ -71,6 +74,7 @@ class TaskParams(Out):
 
 class SearchParams(TaskParams):
     space: dict[str, Any]
+    #: Held for every simulation, unless the space searches its own ``decays``.
     decay: int = 0
     dataset_ids: list[str] = Field(default_factory=list)
     n_startup_trials: int = 20
@@ -92,6 +96,8 @@ class EvolutionParams(TaskParams):
     mutation_rate: float | None = None
     test_period: str | None = None
     neutralizations: list[str] = Field(default_factory=list)
+    #: On, a child always has one of its parents' decays: mutation never changes it.
+    keep_decay: bool = False
 
 
 class PowerPoolParams(TaskParams):
@@ -105,6 +111,11 @@ class PowerPoolParams(TaskParams):
     #: Off, a call ``model`` cannot make (no budget left, provider down) goes to the next model
     #: a Key can run; on, the task waits for ``model`` alone.
     only_model: bool = False
+    #: The consultant's own idea, which every call writes its Alphas to test; empty explores.
+    hypothesis: str = ""
+    #: Operators no Alpha submitted this quarter used, as the task was added; every call asks
+    #: the LLM to use them where they fit. Empty leaves the choice to it.
+    favour_operators: list[str] = Field(default_factory=list[str])
     #: Running LLM tallies: ``calls``, ``empty``, ``failed``, ``byDataset`` and ``byModel``.
     llm: dict[str, Any] = Field(default_factory=dict)
     #: The last hundred LLM calls, for the task's detail view.
@@ -123,12 +134,15 @@ class SettingsParams(TaskParams):
     markets: int = 0
     #: Held at the source Alpha's values for every simulation in the sweep.
     decay: int = 0
+    #: Swept in place of ``decay`` when given, every simulation run at each.
+    decays: list[int] = Field(default_factory=list[int])
     truncation: float = DEFAULT_TRUNCATION
     #: Truncation set per market by the Truncation Agent instead of held at ``truncation``.
     truncation_agent: bool = False
     nan_handling: str = DEFAULT_NAN_HANDLING
     #: ``P{years}Y{months}M0D``. Empty on a task added before it was recorded.
     test_period: str = ""
+    visualization: bool = False
 
 
 class BreakerParams(TaskParams):
@@ -172,6 +186,14 @@ class SuperParams(TaskParams):
     recipes: list[str] = Field(default_factory=list)
 
 
+class PasteParams(TaskParams):
+    """Paste Alphas: every simulation written up front, each at the settings it was pasted
+    with. ``region`` and ``delay`` are the first Alpha's, shown on the task card."""
+
+    #: How many region/delay/universe markets they run in, for the task's detail line.
+    markets: int = 0
+
+
 BY_SAMPLER: dict[str, type[TaskParams]] = {
     SEARCH_SAMPLER: SearchParams,
     TEMPLATE_SAMPLER: TemplateParams,
@@ -181,6 +203,7 @@ BY_SAMPLER: dict[str, type[TaskParams]] = {
     CORRELATION_BREAKER: BreakerParams,
     FIELDS_SAMPLER: FieldsSamplerParams,
     SUPER_LAB: SuperParams,
+    PASTE_ALPHAS: PasteParams,
 }
 
 

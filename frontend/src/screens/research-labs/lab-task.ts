@@ -3,6 +3,7 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { useEffect } from 'react'
+import { MAX_DECAY } from '@/api/platform'
 import type { Scope } from '@/api/types'
 import { DEFAULT_SCOPE, useScope } from '@/lib/scope'
 import { useDebounced } from '@/lib/use-debounced'
@@ -21,7 +22,10 @@ export interface LabDraft {
   cores: number | null
   /** `null` until the user assigns them: a task always has simulations chosen on purpose. */
   simulations: number | null
-  decay: number
+  /** As typed, e.g. `5` or `4, 12, 20`: several are searched. */
+  decays: string
+  /** Keeps the market's other downloaded universes out of the search. */
+  onlyUniverse: boolean
   /** `null` until the user chooses: then the lab allows `vec_avg`. */
   vectorOperators: string[] | null
   /** Empty leaves the lab on its own four group neutralizations. */
@@ -36,12 +40,24 @@ export const LAB_DEFAULTS: LabDraft = {
   fieldFilter: null,
   cores: null,
   simulations: null,
-  decay: 0,
+  decays: '0',
+  onlyUniverse: false,
   vectorOperators: null,
   neutralizations: [],
 }
 
 export const MAX_SIMULATIONS = 100_000
+
+/** The decays typed, or `null` unless there is one and each is a whole number BRAIN takes. */
+export function decaysOf(text: string): number[] | null {
+  const typed = text
+    .split(/[\s,]+/)
+    .filter(Boolean)
+    .map(Number)
+  const valid =
+    typed.length > 0 && typed.every((d) => Number.isInteger(d) && d >= 0 && d <= MAX_DECAY)
+  return valid ? [...new Set(typed)] : null
+}
 
 /** A draft's market and datasets, and the round trip to the Data Explorer to choose them. */
 type LabMarket = Pick<LabDraft, 'region' | 'delay' | 'universe' | 'datasetIds' | 'fieldFilter'>
@@ -139,11 +155,13 @@ export function labBody(
     region: draft.region,
     delay: draft.delay,
     universe: draft.universe,
+    only_universe: draft.onlyUniverse,
     dataset_ids: draft.datasetIds,
     field_filter: draft.fieldFilter ?? null,
     vector_operators: vectorOperators,
     neutralizations: offeredOnly(draft.neutralizations, neutralizations),
-    decay: draft.decay,
+    // Unreadable ones go as none, which the plan refuses beside the box's own error.
+    decays: decaysOf(draft.decays) ?? [],
     cores,
   }
 }

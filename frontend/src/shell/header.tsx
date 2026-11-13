@@ -1,11 +1,12 @@
 /**
  * The bar above every screen: the clocks a consultant runs against (session, simulations
- * left, queued with the matrix on hover, quota reset), connection trouble, and ⌘K search.
+ * left, queued with the matrix on hover, quota reset), why sending is paused, connection trouble,
+ * and ⌘K search.
  */
 
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { ClockIcon, SearchIcon, ZapIcon } from 'lucide-react'
+import { ClockIcon, PauseIcon, SearchIcon, ZapIcon } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { simulations, today } from '@/api/core'
 import { cn } from '@/lib/cn'
@@ -18,6 +19,7 @@ import { Button, Kbd, STATUS } from '@/ui/kit'
 import { Tooltip } from '@/ui/overlay'
 import { useCommandMenu } from './command-menu'
 import { inDesktop, MOD, onMac, WindowControls } from './desktop'
+import { pausesOf } from './pause'
 import { SidebarToggle } from './sidebar'
 
 export function Header() {
@@ -39,6 +41,7 @@ export function Header() {
       </div>
       <div className="flex shrink-0 items-center gap-4">
         <Clocks />
+        <PauseChip />
         <ConnectionNotice />
         <Tooltip
           content={
@@ -75,13 +78,15 @@ function HeaderCores() {
   const engine = useQuery({
     queryKey: ['simulations', 'engine'],
     queryFn: () => simulations.engine(),
+    // A pause changes nothing that would push an update, so it is read on a timer as well.
+    refetchInterval: 10_000,
   })
   useRefetchOn('simulations', ['simulations', 'engine'], 2000)
+  useRefetchOn('session', ['simulations', 'engine'])
 
   const slots = engine.data?.slots ?? 8
   const maxBatch = engine.data?.maxBatch ?? 10
-  const dailyLimitHit = Boolean(engine.data?.dailyLimitHit)
-  const sessionLost = Boolean(engine.data?.sessionLost)
+  const paused = pausesOf(engine.data).length > 0
   const { cores } = useCores(live ?? active.data, slots, maxBatch)
 
   const blocks = useMemo(() => coreBlocks(cores, slots), [cores, slots])
@@ -102,7 +107,7 @@ function HeaderCores() {
         {blocks.map((block) => {
           const holder = block.holder
           let state: 'running' | 'queued' | 'warning' | 'idle' = 'idle'
-          if (dailyLimitHit || sessionLost) {
+          if (paused) {
             state = 'warning'
           } else if (holder) {
             state = holder.status === 'RUNNING' ? 'running' : 'queued'
@@ -202,6 +207,32 @@ function HeaderCores() {
   )
 }
 
+/** Why nothing is being sent, for as long as that lasts. Not dismissable; the Matrix explains. */
+function PauseChip() {
+  const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
+  const [pause] = pausesOf(engine.data)
+  if (!pause) return null
+  return (
+    <Tooltip
+      content={
+        <span className="flex max-w-80 flex-col gap-1">
+          <span className="font-medium text-ink">{pause.title}</span>
+          <span className="text-ink-muted">{pause.body}</span>
+        </span>
+      }
+    >
+      <Link
+        to="/matrix"
+        aria-label={`Sending paused: ${pause.title}`}
+        className="flex h-7 items-center gap-1.5 rounded-md border border-status-warning-edge bg-status-warning-tint px-3 text-body-compact whitespace-nowrap text-status-warning"
+      >
+        <PauseIcon className="size-3.5" aria-hidden />
+        <span className="max-sm:sr-only">{pause.chip}</span>
+      </Link>
+    </Tooltip>
+  )
+}
+
 /**
  * Silent while live updates flow. Only after the socket has been down for 2s does it say so,
  * so the normal connect on page load never flashes it.
@@ -247,7 +278,7 @@ function Clocks() {
   const session =
     bar.data.expiresInSeconds == null ? null : Math.max(0, bar.data.expiresInSeconds - elapsed)
   // `exact` flips true once today's first simulation POST returns BRAIN's own quota headers.
-  const { remaining, queued, exact } = bar.data.simulations
+  const { remaining, exact } = bar.data.simulations
 
   return (
     // Below 1024px the two clocks hide; below 640px the quota figures drop their visible labels.
@@ -276,13 +307,6 @@ function Clocks() {
         <span className="num font-medium text-ink">
           {exact ? '' : '~'}
           {fmt.int(remaining)}
-          {/* Already spoken for: what is left after them is what is free to start. */}
-          {queued > 0 && (
-            <span className="hidden font-normal text-ink-subtle sm:inline">
-              {' '}
-              · {fmt.int(queued)} queued
-            </span>
-          )}
         </span>
       </Clock>
       <Clock

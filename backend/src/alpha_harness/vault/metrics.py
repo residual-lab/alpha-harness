@@ -39,11 +39,13 @@ if TYPE_CHECKING:
 
 type Floats = npt.NDArray[np.float64]
 type Bools = npt.NDArray[np.bool_]
+type Days = npt.NDArray[np.datetime64]
 
 #: Days two Alphas must share before their correlation means anything.
 MIN_OVERLAP = 250
 #: Half the last decimal of BRAIN's four-decimal turnover.
 ROUNDING = 0.00005
+EPS = float(np.finfo(np.float64).eps)
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +176,36 @@ def closing_days(
     """
     if is_pnl is None or not days or end <= days[-1][0]:
         return []
-    last = days[-1][0]
+    tested = [t for d, _, t in days if d >= split] if split is not None else None
+    return _closing(days[-1][0], sum(p for _, p, _ in days), tested, end, is_pnl, test_turnover)
+
+
+def closing_of(
+    stored: tuple[Days, Floats, Floats], info: dict[str, Any]
+) -> list[tuple[date, float, float]]:
+    """:func:`with_closing`'s added days for a series held as arrays, as ``AlphaVault.series``
+    holds it: the same sums of the same floats, without a Python row per day."""
+    days, pnl, turnover = stored
+    end, is_pnl, split = info.get("end_date"), info.get("is_pnl"), info.get("test_start")
+    if not isinstance(end, date) or is_pnl is None or not days.size:
+        return []
+    last: date = days[-1].item()
+    if end <= last:
+        return []
+    tested = turnover[days >= np.datetime64(split, "D")].tolist() if split is not None else None
+    return _closing(last, sum(pnl.tolist()), tested, end, is_pnl, info.get("test_turnover"))
+
+
+def _closing(
+    last: date,
+    stored_pnl: float,
+    tested: list[float] | None,
+    end: date,
+    is_pnl: float,
+    test_turnover: float | None,
+) -> list[tuple[date, float, float]]:
+    """:func:`closing_days` from what it needs of the stored days: the last, their PnL in
+    total, and the turnover of each from the split on."""
     between = [
         d
         for d in (last + timedelta(days=k) for k in range(1, (end - last).days + 1))
@@ -186,10 +217,9 @@ def closing_days(
         after += timedelta(days=1)
     stamps = [*between, after if end in between else end]
     count = len(stamps)
-    pnl = (is_pnl - sum(p for _, p, _ in days)) / count
+    pnl = (is_pnl - stored_pnl) / count
     turnover = 0.0
-    if split is not None and test_turnover is not None:
-        tested = [t for d, _, t in days if d >= split]
+    if tested is not None and test_turnover is not None:
         total = test_turnover * (len(tested) + count) - sum(tested)
         turnover = min(2.0, max(0.0, total / count))
     return [(d, pnl, turnover) for d in stamps]
@@ -356,28 +386,140 @@ def correlations(m: Floats, against: Floats | None = None) -> Floats:
     # "did they ever overlap" and quietly retire the whole correlation ceiling.
     have = (~np.isnan(m)).astype(np.float64)
     z = np.nan_to_num(m)
-    zz = z * z
     if against is None:
-        have_r, z_r, zz_r = have, z, zz
+        have_r, z_r = have, z
     else:
         have_r = (~np.isnan(against)).astype(np.float64)
         z_r = np.nan_to_num(against)
-        zz_r = z_r * z_r
 
+    # In place, in the order the plain formulas run, so the figures match them to the bit: at
+    # 2,000 Alphas each Alpha-by-Alpha array is 30 MB, and 20,000 against a pool make each
+    # days-by-Alphas one 150 MB.
     count = have.T @ have_r
+    usable = count >= MIN_OVERLAP
+    safe = np.maximum(count, 1.0, out=count)
     sum_l = z.T @ have_r
     sum_r = sum_l.T if against is None else have.T @ z_r
-    square_l = zz.T @ have_r
-    square_r = square_l.T if against is None else have.T @ zz_r
-    safe = np.maximum(count, 1.0)
+    cov = z.T @ z_r
+    # Squared in place once ``cov`` is taken: one days-by-Alphas copy the fewer.
+    np.square(z, out=z)
+    if against is not None:
+        np.square(z_r, out=z_r)
+    square_l = z.T @ have_r
+    square_r = None if against is None else have.T @ z_r
+    del have, have_r, z, z_r
 
-    cov = (z.T @ z_r) - sum_l * sum_r / safe
-    dev_l = np.sqrt(np.maximum(square_l - sum_l**2 / safe, 0.0))
-    dev_r = np.sqrt(np.maximum(square_r - sum_r**2 / safe, 0.0))
-    usable = (dev_l > 0) & (dev_r > 0) & (count >= MIN_OVERLAP)
+    scratch = np.multiply(sum_l, sum_r)
+    scratch /= safe
+    cov -= scratch
+    # Each sum of squares becomes its spread in place. A flat series' moments cancel only to
+    # rounding, which divided by itself reads as a correlation (two flat at 12.34 gave 1.0):
+    # so a spread within ``count * eps`` of the sum of squares counts as none. Measured, flat
+    # series land within a quarter of that, real PnL a trillion times beyond it.
+    for square, total in ((square_l, sum_l), (square_r, sum_r)):
+        if square is not None:
+            np.square(total, out=scratch)
+            scratch /= safe
+            square -= scratch
+            scratch += square
+            scratch *= safe
+            scratch *= EPS
+            square[square <= scratch] = 0.0
+            np.sqrt(square, out=square)
+    dev_l = square_l
+    # ``count`` is whole numbers, so exactly symmetric, and so is the spread worked out from it.
+    dev_r = dev_l.T if square_r is None else square_r
+    usable &= dev_l > 0
+    usable &= dev_r > 0
+    np.multiply(dev_l, dev_r, out=scratch)
+    np.maximum(scratch, 1e-12, out=scratch)
+    out = np.divide(cov, scratch, out=cov)
+    out[~usable] = np.nan
     # Cancellation in the one-pass moments can land a correlation a few ulps outside [-1, 1],
     # which is harmless arithmetic and an alarming thing to print next to a 0.50 ceiling.
-    out = np.clip(np.where(usable, cov / np.maximum(dev_l * dev_r, 1e-12), np.nan), -1.0, 1.0)
+    np.clip(out, -1.0, 1.0, out=out)
     if against is None:
         np.fill_diagonal(out, 1.0)
     return out
+
+
+if __name__ == "__main__":
+    import sys
+
+    def plain(m: Floats, against: Floats | None = None) -> Floats:
+        """:func:`correlations` as its formulas read, a new array at every step."""
+        have = (~np.isnan(m)).astype(np.float64)
+        z = np.nan_to_num(m)
+        zz = z * z
+        if against is None:
+            have_r, z_r, zz_r = have, z, zz
+        else:
+            have_r = (~np.isnan(against)).astype(np.float64)
+            z_r = np.nan_to_num(against)
+            zz_r = z_r * z_r
+        count = have.T @ have_r
+        sum_l = z.T @ have_r
+        sum_r = sum_l.T if against is None else have.T @ z_r
+        square_l = zz.T @ have_r
+        square_r = square_l.T if against is None else have.T @ zz_r
+        safe = np.maximum(count, 1.0)
+        cov = (z.T @ z_r) - sum_l * sum_r / safe
+
+        def spread(square: Floats, total: Floats) -> Floats:
+            mean_part = total**2 / safe
+            left = square - mean_part
+            return np.sqrt(np.where(left <= (mean_part + left) * safe * EPS, 0.0, left))
+
+        dev_l, dev_r = spread(square_l, sum_l), spread(square_r, sum_r)
+        usable = (dev_l > 0) & (dev_r > 0) & (count >= MIN_OVERLAP)
+        out = np.clip(np.where(usable, cov / np.maximum(dev_l * dev_r, 1e-12), np.nan), -1.0, 1.0)
+        if against is None:
+            np.fill_diagonal(out, 1.0)
+        return out
+
+    rng = np.random.default_rng(7)
+    days, alphas = 700, 40
+    pnl = rng.normal(0.0, 1e4, (days, alphas))
+    starts = rng.integers(0, 500, alphas)
+    pnl[np.arange(days)[:, None] < starts] = np.nan
+    pnl[rng.random(pnl.shape) < 0.03] = np.nan
+    pnl[:, 0] = 5.0  # never moves: no spread to correlate
+    pnl[:, 1] = np.nan
+    pool = rng.normal(0.0, 1e4, (days, 6))
+    alone, against = correlations(pnl), correlations(pnl, pool)
+    # Flat at values whose moments do not cancel exactly, beside one that moves.
+    flat = np.column_stack(
+        [np.full(250, 12.34), np.full(250, 12.34), np.full(250, 1.1), np.full(250, 0.1)]
+    )
+    flats = correlations(np.column_stack([flat, rng.normal(0.0, 1e4, 250)]))
+    kept = (
+        np.arange(np.datetime64("2024-01-01"), np.datetime64("2024-03-01")),
+        rng.normal(0.0, 1e4, 60),
+        rng.uniform(0.0, 0.3, 60),
+    )
+    rows = list(zip(*(column.tolist() for column in kept), strict=True))
+    ends = {"end_date": date(2024, 3, 10), "is_pnl": 5e4}
+    split = {"test_start": date(2024, 2, 1), "test_turnover": 0.2}
+    infos = [{}, ends, ends | split, ends | split | {"is_pnl": None}, ends | {"test_start": None}]
+    infos.append({"end_date": date(2024, 2, 1), "is_pnl": 1.0})
+    checks = {
+        "closing days from arrays as from rows, to the bit": all(
+            closing_of(kept, info) == with_closing(rows, info)[len(rows) :] for info in infos
+        ),
+        "every pair as the formulas give it, to the bit": np.array_equal(
+            alone, plain(pnl), equal_nan=True
+        ),
+        "against a pool, to the bit": np.array_equal(against, plain(pnl, pool), equal_nan=True),
+        "the input left as it was": bool(np.isnan(pnl[:, 1]).all() and (pnl[:, 0] == 5.0).all()),
+        "symmetric": np.array_equal(alone, alone.T, equal_nan=True),
+        "an Alpha that never moves is unmeasured": bool(np.isnan(alone[0, 1:]).all()),
+        "flat at any value is unmeasured, against flat or moving alike": bool(
+            np.isnan(flats[~np.eye(5, dtype=bool)]).all()
+        ),
+        "some pairs measured, none outside [-1, 1]": bool(
+            np.count_nonzero(~np.isnan(against)) > 0 and np.nanmax(np.abs(alone)) <= 1.0
+        ),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"metrics self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

@@ -1,4 +1,5 @@
-"""The alpha pool on BRAIN: summary, the Alpha page, check, correlate, edit properties.
+"""The alpha pool on BRAIN: summary, the Alpha page, check, correlate, edit properties, tag
+several at once, flip one's sign.
 
 **There is no submit endpoint, deliberately.** Submitting an alpha is irreversible, so the
 guard against doing it by accident is that no route, service or client wrapper for it
@@ -6,23 +7,27 @@ exists. Correlations are slow, rate-limited jobs, so their answers are kept in
 ``brain_cache`` until the user refreshes.
 """
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field, RootModel
-from sqlalchemy import delete
+from sqlalchemy import delete, update
 
 from .. import preferences
-from ..brain.errors import BrainError
-from ..brain.platform import PLATFORM_ALPHA_URL
+from ..brain.errors import BrainBusy, BrainError
+from ..brain.platform import MULTI_SIMULATION_SIZE, PLATFORM_ALPHA_URL
+from ..brain.schemas import FULL_MODE
 from ..brain.settings_schema import chosen_labels
-from ..db.models import BrainCache, utcnow
-from ..labs.fastexpr import ParseError, data_fields, parse
+from ..db.models import BrainCache, Study, utcnow
+from ..labs.fastexpr import ParseError, data_fields, negated, parse, render
+from ..labs.launch import AddedTask, add_study
+from ..labs.params import PASTE_ALPHAS, PasteParams
 from ..llm.prompts import POWER_POOL_DESCRIPTION
 from ..schemas import Out
-from ..tools import description
+from ..tools import description, paste_alphas, settings_sampler
 from ..vault.yields import checks_of
 from .deps import State, refuse
 
@@ -38,8 +43,17 @@ RECORDSETS = {"pnl": "pnl", "sharpe": "sharpe", "turnover": "turnover", "yearly-
 Recordset = Literal["pnl", "sharpe", "turnover", "yearly-stats"]
 #: BRAIN adds a submitted Alpha's out-of-sample days as they pass, so its series age.
 GROWING_SERIES_AGE = timedelta(hours=12)
+#: Seconds an Alpha page with a copy to show queues for BRAIN's rate limit before showing it.
+STALE_PAGE_PATIENCE = 0.2
 #: The periods BRAIN reports figures for, each its own block of the Alpha.
 PERIODS = ("train", "test", "is", "os", "prod")
+#: Alphas tagged in one request: a Stored page at its longest.
+MAX_TAGGED = 500
+#: BRAIN requests in flight while tagging.
+TAG_CONCURRENCY = 4
+#: BRAIN's tag for a Power Pool Alpha. An Alpha once tagged stays in the pool's correlation
+#: checks even untagged, so it is added one Alpha at a time, never in bulk.
+POWER_POOL_TAG = "PowerPoolSelected"
 
 
 class BrainPayload(RootModel[dict[str, Any]]):
@@ -106,6 +120,22 @@ class AlphaProperties(BaseModel):
     description: str | None = None
 
 
+class TagRequest(BaseModel):
+    #: BRAIN's id shape: each one goes into a BRAIN path.
+    alpha_ids: list[Annotated[str, Field(pattern=r"^[A-Za-z0-9]{1,64}$")]] = Field(
+        min_length=1, max_length=MAX_TAGGED
+    )
+    #: Added beside each Alpha's own tags.
+    tags: list[str] = Field(min_length=1, max_length=20)
+
+
+class TagResult(Out):
+    #: The Alphas carrying the tags now, those that already did included.
+    tagged: list[str]
+    #: Why each of the rest was not tagged, by Alpha.
+    failed: dict[str, str]
+
+
 # -- cache ---------------------------------------------------------------
 
 
@@ -142,6 +172,11 @@ async def _cached(
 def _copy(row: BrainCache) -> str:
     # Stored in UTC; unlabelled it read as local.
     return f"showing the copy from {row.fetched_at:%b %d, %H:%M} UTC."
+
+
+def _unanswered(exc: BrainError, row: BrainCache) -> str:
+    reason = exc.message if isinstance(exc, BrainBusy) else f"BRAIN did not answer ({exc.message})"
+    return f"{reason}; {_copy(row)}"
 
 
 async def _kept(
@@ -236,22 +271,21 @@ async def page(alpha_id: str, state: State) -> AlphaView:
     """The Alpha as BRAIN's own page shows it; its series come from :func:`recordset`.
 
     Read from BRAIN on every open, since its checks and properties change, falling back to
-    the last copy when BRAIN cannot answer.
+    the last copy when BRAIN cannot answer, or at once when a download holds its rate limit.
     """
     problems: list[str] = []
+    key = f"alpha:{alpha_id}"
+    stale = await _stored(state, key)
     try:
-        body, _ = await _cached(
-            state,
-            f"alpha:{alpha_id}",
-            lambda: state.endpoints.alpha_body(alpha_id),
-            refresh=True,
+        body = await state.endpoints.alpha_body(
+            alpha_id, patience=None if stale is None else STALE_PAGE_PATIENCE
         )
+        await _store(state, key, body)
     except BrainError as exc:
-        stale = await _stored(state, f"alpha:{alpha_id}")
         if stale is None:
             raise
         body = stale.body
-        problems.append(f"BRAIN did not answer ({exc.message}); {_copy(stale)}")
+        problems.append(_unanswered(exc, stale))
     return AlphaView(alpha=await _info(state, alpha_id, body), problems=problems)
 
 
@@ -270,13 +304,13 @@ async def recordset(alpha_id: str, name: Recordset, state: State) -> BrainPayloa
     if kept is not None and not (growing and utcnow() - kept.fetched_at > GROWING_SERIES_AGE):
         return BrainPayload(kept.body)
     try:
-        body = await state.endpoints.recordset_body(alpha_id, name)
+        body = await state.endpoints.recordset_body(
+            alpha_id, name, patience=None if kept is None else STALE_PAGE_PATIENCE
+        )
     except BrainError as exc:
         if kept is None:
             raise
-        return BrainPayload(
-            kept.body | {"problem": f"BRAIN did not answer ({exc.message}); {_copy(kept)}"}
-        )
+        return BrainPayload(kept.body | {"problem": _unanswered(exc, kept)})
     await _store(state, key, body)
     return BrainPayload(body)
 
@@ -302,6 +336,93 @@ async def update_properties(alpha_id: str, body: AlphaProperties, state: State) 
         updated = await state.endpoints.alpha_body(alpha_id)
     await _store(state, f"alpha:{alpha_id}", updated)
     return await _info(state, alpha_id, updated)
+
+
+@router.post("/tags")
+async def add_tags(body: TagRequest, state: State) -> TagResult:
+    """Add tags to each Alpha on BRAIN, beside the ones it has, and change nothing else.
+
+    Each Alpha's tags are read from BRAIN first: saving replaces the whole list, and the
+    vault's copy can be older than an edit made on BRAIN since.
+    """
+    wanted = list(dict.fromkeys(t.strip() for t in body.tags if t.strip()))
+    if not wanted:
+        raise refuse(422, "no_tag", "Write a tag to add.")
+    if any(t.casefold() == POWER_POOL_TAG.casefold() for t in wanted):
+        raise refuse(
+            422,
+            "power_pool_tag",
+            f"{POWER_POOL_TAG} keeps an Alpha in the Power Pool's correlation checks for good, "
+            "even once removed, so add it on each Alpha's own page.",
+        )
+    gate = asyncio.Semaphore(TAG_CONCURRENCY)
+    tagged: dict[str, list[str]] = {}
+    failed: dict[str, str] = {}
+
+    async def one(alpha_id: str) -> None:
+        async with gate:
+            try:
+                current = await state.endpoints.alpha_body(alpha_id)
+                had = [t for t in current.get("tags") or [] if isinstance(t, str)]
+                if missing := [t for t in wanted if t not in had]:
+                    # Only ``tags``: BRAIN's own client patches one property at a time too.
+                    current = await state.endpoints.update_alpha(alpha_id, {"tags": had + missing})
+                    if not current.get("id"):
+                        current = await state.endpoints.alpha_body(alpha_id)
+            except BrainError as exc:
+                failed[alpha_id] = exc.message
+                return
+        await _store(state, f"alpha:{alpha_id}", current)
+        now = [t for t in current.get("tags") or [] if isinstance(t, str)]
+        if any(t not in now for t in wanted):
+            failed[alpha_id] = "BRAIN answered, but did not keep the tag."
+        else:
+            tagged[alpha_id] = now
+
+    await asyncio.gather(*(one(a) for a in dict.fromkeys(body.alpha_ids)))
+    await state.alphas.save_tags(tagged)
+    return TagResult(tagged=list(tagged), failed=failed)
+
+
+@router.post("/{alpha_id}/flip", status_code=201)
+async def flip_sign(alpha_id: str, state: State) -> AddedTask:
+    """Add a task simulating the Alpha's expression with its sign flipped, at its own settings.
+
+    One simulation, in Full mode so a winner needs no second run before it can be submitted.
+    Negated through the parser: only the last statement is the Alpha, so the steps before it
+    keep their sign. Added as every tool adds its task; the screen starts it once confirmed.
+    """
+    body = await state.endpoints.alpha_body(alpha_id)
+    regular, settings = body.get("regular"), body.get("settings")
+    # An older Alpha sends its expression as a bare string.
+    code = regular.get("code") if isinstance(regular, dict) else regular
+    if not isinstance(code, str) or not code.strip() or not isinstance(settings, dict):
+        raise refuse(422, "nothing_to_flip", f"{alpha_id} has no regular expression to flip.")
+    try:
+        flipped = render(negated(parse(code)))
+    except ParseError as exc:
+        raise refuse(
+            422,
+            "unreadable_expression",
+            f"{alpha_id}'s expression could not be read, so it was not flipped: {exc}",
+        ) from exc
+    request = paste_alphas.request_of(flipped, settings | {"simulationMode": FULL_MODE})
+    name = f"Flip Sign · {alpha_id}"
+    added = await add_study(
+        state,
+        now=utcnow(),
+        sampler=PASTE_ALPHAS,
+        params=PasteParams(region=request.settings.region, delay=request.settings.delay, markets=1),
+        simulations=1,
+        batch_size=MULTI_SIMULATION_SIZE,
+        template_source=flipped,
+        template_name=name,
+        seeds=settings_sampler.seed_trials([request]),
+    )
+    # Tasks names a Paste Alphas task by its lab alone, and this one is a flip.
+    async with state.db.session() as session:
+        await session.execute(update(Study).where(Study.id == added.id).values(label=name))
+    return added
 
 
 @router.post("/{alpha_id}/description")

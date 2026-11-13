@@ -6,11 +6,12 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CopyIcon, RefreshCwIcon } from 'lucide-react'
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { tasks } from '@/api/core'
 import { errorMessage } from '@/api/http'
 import { REGION_AGNOSTIC_CLASS } from '@/api/platform'
+import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
 import { CORE_METRICS, CORE_ORDER, DASH, fmt } from '@/lib/format'
 import { useLive } from '@/lib/live'
@@ -53,7 +54,7 @@ import { ChartLegend, PortfolioChart } from './chart'
 import { CorrelationMatrix } from './correlation'
 import { PyramidPicker } from './pyramid-grid'
 import { compile, SelectionError } from './selection'
-import { SelectionInfo } from './selection-info'
+import { EXAMPLE, SelectionInfo } from './selection-info'
 
 /** One block of filter chips. Within a block any match keeps an Alpha; blocks combine with AND. */
 interface Facet {
@@ -225,9 +226,12 @@ export function PortfolioScreen() {
   const included = all.filter(isIncluded).map((m) => m.alphaId)
   const ids = [...included].sort()
   const copy = useMutation({
-    mutationFn: () => portfolio.markdown(included),
-    onSuccess: async ({ text, unsynced }) => {
-      await navigator.clipboard.writeText(text)
+    mutationFn: () =>
+      copyText(
+        () => portfolio.markdown(included),
+        ({ text }) => text,
+      ),
+    onSuccess: ({ unsynced }) => {
       toast.success(`Copied ${included.length} Alpha${included.length === 1 ? '' : 's'}`)
       if (unsynced > 0)
         toast.warning(
@@ -242,6 +246,8 @@ export function PortfolioScreen() {
     queryFn: () => portfolio.compute(ids, cost),
     enabled: ids.length > 0,
     placeholderData: keepPreviousData,
+    // Each selection is its own answer, a correlation grid and years of PnL: old ones go sooner.
+    gcTime: 30_000,
   })
   // A disabled query keeps its last answer, which would outlive deselecting every Alpha.
   const result = ids.length ? computed.data : undefined
@@ -350,9 +356,7 @@ export function PortfolioScreen() {
                   spellCheck={false}
                   aria-label="Selection Expression"
                   aria-invalid={ruleError !== undefined}
-                  placeholder={
-                    'information_ratio >= 0.10;\nreturns / turnover >= 1;\nreturns / drawdown >= 1'
-                  }
+                  placeholder={EXAMPLE}
                   value={selection}
                   onChange={(e) => {
                     setSelection(e.target.value)
@@ -721,7 +725,7 @@ function MembersTable({
   openId: string | null
   loading: boolean
 }) {
-  const shaped = rows.map(fromMember)
+  const shaped = useMemo(() => rows.map(fromMember), [rows])
   return (
     <AlphaTable
       view={VIEW}

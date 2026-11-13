@@ -53,6 +53,13 @@ function looks(lines: { name: string }[], main: string) {
   )
 }
 
+/** Oldest first and one row a day, as the chart requires: it throws on anything else, and the
+ *  records are BRAIN's, not ours to vouch for. */
+function byDay(records: unknown[][], at: number): unknown[][] {
+  const kept = new Map(records.map((r) => [String(r[at]), r]))
+  return [...kept.keys()].sort().map((date) => kept.get(date) ?? [])
+}
+
 const AXIS: Record<string, (value: number) => string> = {
   amount: compact,
   decimal: (value) => value.toFixed(2),
@@ -95,7 +102,10 @@ export function AlphaChart({
     const at = properties.findIndex((p) => p.name === 'date')
     if (!node || at < 0) return
     const cut = testShown ? null : testStart
-    const rows = (set.data?.records ?? []).filter((r) => cut === null || String(r[at]) < cut)
+    const rows = byDay(
+      (set.data?.records ?? []).filter((r) => cut === null || String(r[at]) < cut),
+      at,
+    )
     const main = properties.find((p) => p.name === name)?.type ?? 'amount'
     const chart = baseChart(node)
     chart.applyOptions({ localization: { priceFormatter: AXIS[main] ?? compact } })
@@ -263,7 +273,7 @@ export function PairChart({ set, label }: { set: Recordset; label: string }) {
             lastValueVisible: false,
           })
           .setData(
-            (set.records ?? []).map((r) => {
+            byDay(set.records ?? [], at).map((r) => {
               const value = r[column]
               const time = String(r[at]) as Time
               return isNum(value) ? { time, value } : { time }

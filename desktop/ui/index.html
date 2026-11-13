@@ -40,6 +40,12 @@
         line-height: 1.5;
         opacity: 0.72;
       }
+      #detail {
+        min-height: 1.5em;
+        font-size: 12px;
+        opacity: 0.56;
+        overflow-wrap: anywhere;
+      }
       .bar {
         width: 240px;
         height: 3px;
@@ -125,12 +131,16 @@
       <h1>Alpha Harness</h1>
       <div class="bar" role="progressbar" aria-label="Starting Alpha Harness"></div>
       <p id="status" role="status">Starting…</p>
+      <p id="detail"></p>
     </main>
     <script>
       // The supervisor reports each step: asked once for the one it is on, then told the rest.
       const status = document.getElementById("status");
+      // uv's own progress under the step, so a slow download reads as moving rather than stuck.
+      const detail = document.getElementById("detail");
       const show = (text) => {
         if (text) status.textContent = text;
+        detail.textContent = "";
       };
       const tauri = window.__TAURI__;
       // macOS draws its own window buttons; elsewhere these stand in for the missing title bar.
@@ -149,6 +159,11 @@
             heard = true;
             show(event.payload);
           })
+          .then(() =>
+            tauri.event.listen("startup-detail", (event) => {
+              detail.textContent = event.payload;
+            }),
+          )
           .then(() => tauri.core.invoke("startup_status"))
           .then((text) => heard || show(text));
       }

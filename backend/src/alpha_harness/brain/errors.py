@@ -159,6 +159,11 @@ class BrainRateLimited(BrainError):
         self.retry_after = retry_after
 
 
+class BrainBusy(BrainError):
+    """Never sent: the endpoint's rate limit would have kept it queued longer than its caller
+    agreed to wait."""
+
+
 class BrainDailyLimitReached(BrainRateLimited):
     """429 with ``DAILY_SIMULATION_LIMIT_EXCEEDED``.
 
@@ -198,6 +203,13 @@ class BrainTransportError(BrainError):
     def __init__(self, message: str, *, maybe_delivered: bool) -> None:
         super().__init__(message)
         self.maybe_delivered = maybe_delivered
+
+
+class BrainPaused(BrainError):
+    """Never sent: a background request while BRAIN cannot be asked anything (offline, or the
+    session waits on the person). Retried once the connection is back (``brain.connection``)."""
+
+    retryable = True
 
 
 class BrainPollTimeout(BrainError):

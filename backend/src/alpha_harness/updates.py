@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import random
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -124,6 +125,8 @@ class Release:
     #: The wheel's own download URL, read from the release rather than built from the version.
     #: A constructed name breaks the moment a build tags it anything but ``py3-none-any``.
     wheel_url: str | None = None
+    #: GitHub's ``sha256:<hex>`` for that wheel, which the launcher makes uv check it against.
+    wheel_digest: str | None = None
 
 
 #: Serialises the look at GitHub, so concurrent callers make one call between them.
@@ -327,6 +330,7 @@ def _read(body: Any) -> Release | None:
     parsed = _parse(tag)
     if parsed is None or parsed.is_prerelease:
         return None
+    wheel_url, wheel_digest = _wheel_of(body.get("assets"))
     return Release(
         version=tag.removeprefix("v"),
         notes=str(body.get("body") or "")[:NOTES_LIMIT],
@@ -334,14 +338,16 @@ def _read(body: Any) -> Release | None:
         published_at=body.get("published_at")
         if isinstance(body.get("published_at"), str)
         else None,
-        wheel_url=_wheel_of(body.get("assets")),
+        wheel_url=wheel_url,
+        wheel_digest=wheel_digest,
     )
 
 
-def _wheel_of(assets: Any) -> str | None:
-    """The release's own wheel, by extension rather than by a name we guessed."""
+def _wheel_of(assets: Any) -> tuple[str | None, str | None]:
+    """The release's own wheel, by extension rather than by a name we guessed, and its digest
+    when it is the ``sha256:<hex>`` GitHub publishes."""
     if not isinstance(assets, list):
-        return None
+        return None, None
     for asset in assets:
         if not isinstance(asset, dict):
             continue
@@ -354,11 +360,13 @@ def _wheel_of(assets: Any) -> str | None:
             and name.endswith(".whl")
             and isinstance(url, str)
         ):
-            return url
-    return None
+            digest = asset.get("digest")
+            sound = isinstance(digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+            return url, digest if sound else None
+    return None, None
 
 
-def request(version: str, *, wheel_url: str | None = None) -> Path:
+def request(version: str, *, wheel_url: str | None = None, wheel_digest: str | None = None) -> Path:
     """Record the version the launcher should install, and return the file it wrote.
 
     Raises :class:`RuntimeError` when nothing is supervising this process, because writing a
@@ -380,6 +388,7 @@ def request(version: str, *, wheel_url: str | None = None) -> Path:
             {
                 "version": version,
                 "wheelUrl": wheel_url,
+                "wheelDigest": wheel_digest,
                 "requestedAt": time.time(),
                 "from": current(),
             }
@@ -391,13 +400,15 @@ def request(version: str, *, wheel_url: str | None = None) -> Path:
     return path
 
 
-def served() -> None:
-    """Tell the launcher this version came up, so a later exit is not taken for a bad update."""
+def served(port: int) -> None:
+    """Tell the launcher this version came up, so a later exit is not taken for a bad update,
+    and the port it answers on, which is not 8000 when another program holds that."""
     home = launcher_home()
     if home is None:
         return
+    body = {"version": current(), "port": port}
     try:
-        (home / SERVED_FILE).write_text(json.dumps({"version": current()}), encoding="utf-8")
+        (home / SERVED_FILE).write_text(json.dumps(body), encoding="utf-8")
     except OSError:
         log.warning("update.served_unwritten", exc_info=True)
 

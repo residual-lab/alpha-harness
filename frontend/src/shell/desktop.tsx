@@ -1,14 +1,12 @@
 /**
  * Inside the desktop app only: system notifications for what happens while the window is out of
- * sight — a task ending, BRAIN's daily limit, a lost session, an update to install. Each is raised
- * when its state changes, never for what was already so when the window opened.
+ * sight — a task ending, an update to install (sending pausing is `PauseAlerts`, in either mode).
+ * Each is raised when its state changes, never for what was already so when the window opened.
  */
 
 import { useQuery } from '@tanstack/react-query'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { CopyIcon, MinusIcon, SquareIcon, XIcon } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import { simulations } from '@/api/core'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 import { cn } from '@/lib/cn'
 import { useRefetchOn } from '@/lib/ws'
 import { labTasks } from '@/screens/tasks/api'
@@ -21,8 +19,62 @@ export const onMac = typeof navigator !== 'undefined' && navigator.userAgent.inc
 /** The shortcut modifier as this keyboard writes it: most consultants are on Windows. */
 export const MOD = onMac ? '⌘' : 'Ctrl+'
 
+// Windows' own caption buttons: 46px wide, a 10px glyph drawn in hairline strokes. Icon-set
+// glyphs at 16px with round caps read as app buttons, not as the window's.
+/**
+ * A web page belongs in the default browser, as it does when the app runs in one: the window
+ * shows the app alone, and a link it opened in a popup of its own had no browser behind it.
+ * BRAIN's identity check is the exception: the desktop app opens it in a window of its own (see
+ * `main_window` in `main.rs`), which sign-in watches and closes once BRAIN accepts it.
+ */
+if (inDesktop) {
+  const external = (url: string | URL | undefined) => /^https:\/\//.test(String(url ?? ''))
+  const browse = (url: string) =>
+    void import('@tauri-apps/plugin-opener').then(({ openUrl }) => openUrl(url))
+  const open = window.open.bind(window)
+  window.open = (url, target, features) => {
+    if (target === 'brain-identity-check' && url) {
+      // Should the window still not open, the check is finished in the browser instead: BRAIN
+      // is asked whether it is done either way, so sign-in completes all the same.
+      const opened = open(url, target, features)
+      if (opened) return opened
+      browse(String(url))
+      return { close: () => {} } as Window
+    }
+    if (!external(url)) return open(url, target, features)
+    browse(String(url))
+    return null
+  }
+  document.addEventListener(
+    'click',
+    (event) => {
+      const link = (event.target as Element | null)?.closest?.('a[target="_blank"]')
+      if (!(link instanceof HTMLAnchorElement) || !external(link.href)) return
+      event.preventDefault()
+      browse(link.href)
+    },
+    true,
+  )
+}
+
 const CONTROL =
-  'flex h-12 w-11 items-center justify-center text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink [&_svg]:size-4'
+  'flex h-12 w-[46px] items-center justify-center text-ink-muted transition-colors hover:bg-surface-2 hover:text-ink'
+
+/** A 10px caption glyph, crisp on the pixel grid at 1x. */
+const Glyph = ({ children }: { children: ReactNode }) => (
+  <svg
+    width="10"
+    height="10"
+    viewBox="0 0 10 10"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1"
+    shapeRendering="crispEdges"
+    aria-hidden
+  >
+    {children}
+  </svg>
+)
 
 /** Minimise, maximise and close, for Windows and Linux, where the window has no title bar. */
 export function WindowControls() {
@@ -43,7 +95,9 @@ export function WindowControls() {
         className={CONTROL}
         onClick={() => void appWindow.minimize()}
       >
-        <MinusIcon strokeWidth={1.5} aria-hidden />
+        <Glyph>
+          <path d="M0 5.5h10" />
+        </Glyph>
       </button>
       <button
         type="button"
@@ -51,20 +105,25 @@ export function WindowControls() {
         className={CONTROL}
         onClick={() => void appWindow.toggleMaximize()}
       >
-        {maximized ? (
-          <CopyIcon strokeWidth={1.5} className="-scale-x-100" aria-hidden />
-        ) : (
-          <SquareIcon strokeWidth={1.5} aria-hidden />
-        )}
+        <Glyph>
+          {maximized ? (
+            <path d="M0.5 2.5h7v7h-7zM2.5 2.5v-2h7v7h-2" />
+          ) : (
+            <path d="M0.5 0.5h9v9h-9z" />
+          )}
+        </Glyph>
       </button>
       {/* Closing keeps Alpha Harness in the tray, as the window's own close did. */}
       <button
         type="button"
         aria-label="Close to the tray"
-        className={cn(CONTROL, 'hover:bg-pnl-negative hover:text-ink')}
+        className={cn(CONTROL, 'hover:bg-pnl-negative hover:text-white')}
         onClick={() => void appWindow.close()}
       >
-        <XIcon strokeWidth={1.5} aria-hidden />
+        <Glyph>
+          {/* Diagonals are antialiased, or they stair-step. */}
+          <path d="M0 0l10 10M10 0L0 10" shapeRendering="geometricPrecision" />
+        </Glyph>
       </button>
     </div>
   )
@@ -73,9 +132,14 @@ export function WindowControls() {
 const ENDED: Record<string, string> = { COMPLETE: 'finished', PAUSED: 'paused', FAILED: 'failed' }
 const LIVE = new Set(['QUEUED', 'RUNNING'])
 
-async function notify(title: string, body: string) {
+export async function notify(title: string, body: string) {
   // What is on screen already says it.
   if (document.visibilityState === 'visible' && document.hasFocus()) return
+  if (!inDesktop) {
+    if ('Notification' in window && Notification.permission === 'granted')
+      new Notification(title, { body })
+    return
+  }
   // Asked once, on mount: a prompt raised from the tray is held back or unwelcome.
   const { isPermissionGranted, sendNotification } = await import('@tauri-apps/plugin-notification')
   if (!(await isPermissionGranted())) return
@@ -85,9 +149,8 @@ async function notify(title: string, body: string) {
 export function DesktopNotifications() {
   // The same queries the Tasks page and the header read, so this costs nothing extra on screen.
   const tasks = useQuery({ queryKey: ['lab-tasks'], queryFn: labTasks.list })
-  useRefetchOn('studies', ['lab-tasks'], 2_000)
-  const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
-  useRefetchOn('simulations', ['simulations', 'engine'], 2_000)
+  // The list alone: a task's results nest under the same key and keep their own pace.
+  useRefetchOn('studies', ['lab-tasks'], 2_000, { exact: true })
   const update = useUpdateStatus()
 
   // Asked now, while the window is in front: macOS may hold back a prompt raised from the tray.
@@ -119,25 +182,6 @@ export function DesktopNotifications() {
       void notify(`${ended.length} tasks ended`, `${shown.join(', ')}${more}.`)
     }
   }, [tasks.data])
-
-  const flags = useRef<{ limit: boolean; session: boolean } | null>(null)
-  useEffect(() => {
-    if (!engine.data) return
-    const now = { limit: engine.data.dailyLimitHit, session: engine.data.sessionLost }
-    const before = flags.current
-    flags.current = now
-    if (!before) return
-    if (now.limit && !before.limit)
-      void notify(
-        "BRAIN's daily simulation limit is reached",
-        'Queued simulations wait for the reset at midnight US Eastern.',
-      )
-    if (now.session && !before.session)
-      void notify(
-        'BRAIN is not accepting your session',
-        'Sending is paused until the session is renewed or you sign in again.',
-      )
-  }, [engine.data])
 
   const offered = useRef<string | null | undefined>(undefined)
   useEffect(() => {

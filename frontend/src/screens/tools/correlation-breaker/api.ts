@@ -7,10 +7,18 @@ type Schemas = components['schemas']
 
 export type BreakerPlan = Schemas['BreakerPlan']
 
+/** A re-shape of the user's own, written around `alpha`; chosen as `custom:{id}`. */
+export interface Reshape {
+  id: string
+  name: string
+  code: string
+}
+
 export interface BreakerRequest {
   alphaId: string
   /** Empty runs every recipe the plan offers. */
   recipes: string[]
+  custom: Reshape[]
   cores: number
 }
 

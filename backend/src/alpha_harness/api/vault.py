@@ -1,7 +1,7 @@
 """The alpha vault: every alpha you have run, its checks, and its daily returns."""
 
 import itertools
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query
@@ -49,6 +49,8 @@ class LastSync(Out):
 class VaultOverview(Out):
     counts: VaultCounts
     scopes: list[VaultScope]
+    #: Every tag the stored Alphas carry, for the Stored table's filter.
+    tags: list[str]
     backfilling: bool
     last_sync: LastSync | None
 
@@ -100,6 +102,8 @@ class SubmittableResponse(Out):
     markets: list[SubmittableMarket]
     #: Still being judged by the platform.
     pending: int
+    #: Submittable but left out for an implausible Sharpe (beyond ±10 in any period).
+    implausible_hidden: int = 0
     #: Failing one or two fixable checks.
     near_misses: int
     #: Why submittable Alphas are not on the shortlist.
@@ -138,6 +142,7 @@ class AlphaRow(Out):
     #: BRAIN's names, e.g. "Power Pool Alpha", and pyramids such as "USA/D1/PV".
     classifications: list[str] = Field(default_factory=list)
     pyramids: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     train_sharpe: float | None = None
     test_sharpe: float | None = None
     #: The limit each of BRAIN's figure checks names for this Alpha, by check name.
@@ -160,6 +165,7 @@ class AlphaDetail(Out):
     alpha_id: str
     expression: str | None
     settings: AlphaSettings
+    sharpe: float | None
     checks: list[dict[str, Any]]
     brain_url: str
 
@@ -181,6 +187,7 @@ async def overview(state: State) -> VaultOverview:
         {
             "counts": await state.alphas.counts(),
             "scopes": await state.alphas.scopes(),
+            "tags": await state.alphas.tags(),
             "backfilling": state.backfill.busy,
             "lastSync": state.backfill.last,
         }
@@ -195,8 +202,11 @@ async def submittable(
     universe: str | None = None,
     instrument_type: str = INSTRUMENT_TYPE,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    shortlist: bool = True,
+    implausible: bool = False,
 ) -> SubmittableResponse:
-    """Alphas that passed every submission check, ready to submit on BRAIN.
+    """Alphas that passed every submission check, ready to submit on BRAIN. ``shortlist=false``
+    asks for the counts alone, without the shortlist and the PnL it reads.
 
     Each entry carries the platform's own check results, the numbers behind them, and a
     link to the alpha on BRAIN — which is where it gets submitted. This application never does.
@@ -209,6 +219,8 @@ async def submittable(
         universe=universe,
         instrument_type=instrument_type,
         limit=limit,
+        shortlist=shortlist,
+        show_implausible=implausible,
     )
     # Without a series a candidate cannot be de-correlated against the others.
     state.backfill.schedule_returns(found.pop("pnlMissing"))
@@ -228,6 +240,11 @@ class AlphaPageRequest(BaseModel):
     minimum: dict[str, float] = Field(default_factory=dict)
     maximum: dict[str, float] = Field(default_factory=dict)
     search: str | None = None
+    #: Alphas carrying any of these tags.
+    tags: list[str] | None = None
+    #: Days on BRAIN's clock, both included.
+    created_after: date | None = None
+    created_before: date | None = None
     #: Only Alphas the Evolution Lab can breed from, for when this table is a seed picker.
     evolvable: bool = False
     limit: int = Field(default=100, ge=1, le=500)
@@ -303,6 +320,7 @@ async def alpha_detail(alpha_id: str, state: State) -> AlphaDetail:
         {
             "alphaId": alpha_id,
             "expression": row.get("expression"),
+            "sharpe": row.get("sharpe"),
             "settings": {
                 k: row.get(k)
                 for k in ("region", "universe", "delay", "neutralization", "decay", "truncation")

@@ -48,6 +48,9 @@ export type FieldFilter = Omit<Partial<Schemas['FieldFilter']>, 'sort_by'> & {
 
 const B = '/api/catalog'
 
+/** The Pyramids period that counts every Alpha ever submitted. */
+export const ALL_TIME = 'all'
+
 export const catalog = {
   scopes: () => http.get<CatalogScopeRow[]>(`${B}/scopes`),
   size: () => http.get<CatalogSize>(`${B}/size`),
@@ -76,7 +79,8 @@ export const catalog = {
     http.get<FieldAvailabilityRow[]>(`${B}/fields/${encodeURIComponent(id)}/availability`),
   datasets: (s: Scope) => http.get<DatasetRow[]>(`${B}/datasets${scopeQs(s)}`),
 
-  pyramids: () => http.get<PyramidGridData>(`${B}/pyramids`),
+  /** `period` is a quarter BRAIN names, {@link ALL_TIME}, or `null` for the one in progress. */
+  pyramids: (period: string | null) => http.get<PyramidGridData>(`${B}/pyramids${qs({ period })}`),
   /** The chosen fields as Category › Subcategory › Dataset › Field text, for an LLM. */
   outline: (s: Scope, pick: { field_ids: string[] } | { dataset_ids: string[] }) =>
     http.post<FieldOutline>(`${B}/fields/outline${scopeQs(s)}`, pick),

@@ -28,7 +28,10 @@ async def telemetry(websocket: WebSocket) -> None:
     state: AppState = websocket.app.state.harness
     # Browsers always send Origin on a handshake, and CORS does not cover sockets: without
     # this any page the user visits could open one. Missing and "null" fail the same test.
-    if websocket.headers.get("origin") not in ALLOWED_ORIGINS:
+    # The built UI is this server's own page, on whatever port it got: same origin as the
+    # Host, which TrustedHostMiddleware has already held to localhost and 127.0.0.1.
+    origin = websocket.headers.get("origin")
+    if origin not in ALLOWED_ORIGINS and origin != f"http://{websocket.headers.get('host')}":
         await websocket.close(code=1008)
         return
     await state.hub.connect(websocket)

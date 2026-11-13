@@ -13,6 +13,7 @@ MVCC lets run beside a write, so a long correlation read never stalls a sync.
 import asyncio
 import contextlib
 import re
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -137,6 +138,9 @@ ALTER TABLE alpha ADD COLUMN IF NOT EXISTS simulation_mode VARCHAR;
 -- A submitted Alpha's own Production and Self-Correlation, as BRAIN lists it.
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS prod_correlation DOUBLE;
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS self_correlation DOUBLE;
+-- BRAIN's in-sample block as JSON in its own names: its breakdowns, such as Investability
+-- Constrained, and its checks.
+ALTER TABLE alpha ADD COLUMN IF NOT EXISTS brain VARCHAR;
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS tags VARCHAR;
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS classifications VARCHAR;
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS pyramids VARCHAR;
@@ -273,6 +277,7 @@ ALPHA_COLUMNS = (
     "language",
     "pasteurization",
     "nan_handling",
+    "brain",
 )
 
 #: Written only with an Alpha that has a ``train`` block (see ``AlphaVault.save_alphas``).
@@ -409,8 +414,20 @@ class Catalog:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._conn: duckdb.DuckDBPyConnection | None = None
+        #: Only mints cursors, under :attr:`_mint`. DuckDB's rule is a cursor per thread,
+        #: never one connection object shared between threads.
+        self._root: duckdb.DuckDBPyConnection | None = None
+        self._mint = threading.Lock()
+        #: The one cursor writes run on, under :attr:`_lock`.
+        self._writer: duckdb.DuckDBPyConnection | None = None
         self._lock = asyncio.Lock()
+        #: Clear while the catalog reopens after a fatal error, so no read starts on a
+        #: connection about to close.
+        self._steady = asyncio.Event()
+        self._steady.set()
+        #: Bumped as each write finishes, so what was worked out from a read can tell when it
+        #: has gone stale without reading again.
+        self.revision = 0
         #: Reads in flight. Futures rather than a count: a cancelled caller does not stop
         #: its thread, and ``close`` must wait for the thread, not the caller.
         self._reads: set[asyncio.Future[Any]] = set()
@@ -426,7 +443,7 @@ class Catalog:
 
     def _open_sync(self) -> None:
         try:
-            self._conn = self._connect()
+            root = self._connect()
         except duckdb.Error as exc:
             if WAL_UNREPLAYABLE not in str(exc):
                 raise
@@ -437,29 +454,36 @@ class Catalog:
             aside = wal.with_name(f"{wal.name}.unreplayable-{time.strftime('%Y%m%d%H%M%S')}")
             wal.rename(aside)
             log.warning("catalog.wal_set_aside", path=str(aside), error=str(exc)[:500])
-            self._conn = self._connect()
+            root = self._connect()
         # DuckDB's zone otherwise defaults to the machine's, shifting every stored time by the
         # local offset. GLOBAL, so read cursors get it too. Never as a ``connect`` option: that
         # makes DuckDB download its time zone extension before loading the one built in, and
         # where the download is blocked the catalog does not open at all.
-        self._conn.execute("SET GLOBAL TimeZone = 'UTC'")
+        root.execute("SET GLOBAL TimeZone = 'UTC'")
         # DuckDB keeps what it reads up to 80% of the machine's memory, which on a long run
         # reads as a leak. Scaled from its own figure, in its own unit, so nothing here has to
         # measure the machine; reset first so a reopen does not shrink it twice.
-        self._conn.execute("RESET GLOBAL memory_limit")
-        row = self._conn.execute("SELECT current_setting('memory_limit')").fetchone()
+        root.execute("RESET GLOBAL memory_limit")
+        row = root.execute("SELECT current_setting('memory_limit')").fetchone()
         if row is not None:
             amount, unit = str(row[0]).split()
             share = float(amount) * MEMORY_SHARE / DUCKDB_DEFAULT_SHARE
-            self._conn.execute(f"SET GLOBAL memory_limit = '{share:.1f} {unit}'")
-        self._conn.execute(SCHEMA)
-        for table, column, kind in self._conn.execute(
+            root.execute(f"SET GLOBAL memory_limit = '{share:.1f} {unit}'")
+        # DuckDB's allocator on Linux hands back a thread's freed memory only past a 128 MiB
+        # peak, so sorting 2,000 series left 300 MB behind, measured; at zero it does after
+        # every task, at no cost measured. Windows builds use the system's, which gave it back
+        # unasked. Not ``allocator_background_threads``: any other DuckDB connection opening or
+        # closing switches that off for the whole process.
+        root.execute("SET GLOBAL allocator_flush_threshold = '0 MiB'")
+        root.execute(SCHEMA)
+        for table, column, kind in root.execute(
             "SELECT table_name, column_name, data_type FROM duckdb_columns() "
             "WHERE schema_name = 'main'"
         ).fetchall():
             if kind in _ARROW:
                 self._types.setdefault(table, {})[column] = _ARROW[kind]
-        self.fts = _load_fts(self._conn)
+        self.fts = _load_fts(root)
+        self._root, self._writer = root, root.cursor()
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
         try:
@@ -499,13 +523,19 @@ class Catalog:
         self._closing = True
         async with self._lock:
             await asyncio.gather(*self._reads, return_exceptions=True)
-            if self._conn is not None:
+            if self._root is not None:
                 await asyncio.to_thread(self._close_sync)
 
     def _close_sync(self) -> None:
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            conn.close()
+        root, writer = self._root, self._writer
+        self._root = self._writer = None
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            # Whatever the cursor did: an instance left open is the one a reopen would get back.
+            if root is not None:
+                root.close()
 
     async def _locked[T](self, fn: Callable[..., T], *args: Any) -> T:
         """Run ``fn`` on the one connection, holding the lock until the thread is done.
@@ -524,14 +554,20 @@ class Catalog:
             except duckdb.FatalException as exc:
                 # DuckDB refuses everything after a fatal error until the database is opened
                 # again, so it is reopened here: one failed write must not fail every later one.
-                await asyncio.to_thread(self._reopen_sync)
+                # Reads still running hold cursors of the connection being closed.
+                self._steady.clear()
+                try:
+                    await asyncio.gather(*self._reads, return_exceptions=True)
+                    await asyncio.to_thread(self._reopen_sync)
+                finally:
+                    self._steady.set()
                 raise CatalogUnusableError(str(exc)) from exc
+            finally:
+                self.revision += 1
 
     def _reopen_sync(self) -> None:
-        conn, self._conn = self._conn, None
-        if conn is not None:
-            with contextlib.suppress(Exception):
-                conn.close()
+        with contextlib.suppress(Exception):
+            self._close_sync()
         self._open_sync()
         log.warning("catalog.reopened_after_fatal")
 
@@ -564,9 +600,17 @@ class Catalog:
         conn.execute("CHECKPOINT")
 
     def _require(self) -> duckdb.DuckDBPyConnection:
-        if self._conn is None:
+        """The writer cursor, for work run under :attr:`_lock`."""
+        if self._writer is None:
             raise RuntimeError("Catalog is not open; call await catalog.open() first")
-        return self._conn
+        return self._writer
+
+    def _cursor(self) -> duckdb.DuckDBPyConnection:
+        """A read's own cursor."""
+        with self._mint:
+            if self._root is None:
+                raise RuntimeError("Catalog is not open; call await catalog.open() first")
+            return self._root.cursor()
 
     # -- reads -----------------------------------------------------------
 
@@ -579,7 +623,8 @@ class Catalog:
         return await self._read(self._arrow_sync, sql, params or [])
 
     async def _read[T](self, fn: Callable[[str, list[Any]], T], sql: str, params: list[Any]) -> T:
-        if self._closing or self._conn is None:
+        await self._steady.wait()
+        if self._closing or self._root is None:
             raise RuntimeError("Catalog is closed or shutting down")
         work = asyncio.ensure_future(asyncio.to_thread(fn, sql, params))
         self._reads.add(work)
@@ -587,13 +632,13 @@ class Catalog:
         return await asyncio.shield(work)
 
     def _query_sync(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
-        with self._require().cursor() as cur:
+        with self._cursor() as cur:
             cur.execute(sql, params)
             columns = [d[0] for d in cur.description or []]
             return [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
 
     def _arrow_sync(self, sql: str, params: list[Any]) -> pa.Table:
-        with self._require().cursor() as cur:
+        with self._cursor() as cur:
             return cur.execute(sql, params).to_arrow_table()
 
     async def scalar(self, sql: str, params: list[Any] | None = None) -> Any:
@@ -621,8 +666,8 @@ class Catalog:
         """
         if not rows:
             return 0
-        # Built before the lock, as replace_fields does: no writer waits on the conversion.
-        batch = await asyncio.to_thread(self._to_arrow, table, columns, rows)
+        # Built before the lock: no writer waits on the conversion.
+        batch = await asyncio.to_thread(self.to_arrow, table, columns, rows)
         statement = (_upsert_sql(table, columns, overwrite=overwrite, keep=keep), [])
         try:
             await self._locked(self._load, batch, statement)
@@ -637,7 +682,7 @@ class Catalog:
             await self._locked(self._load, batch, statement)
         return len(rows)
 
-    def _to_arrow(
+    def to_arrow(
         self, table: str, columns: tuple[str, ...], rows: list[tuple[Any, ...]]
     ) -> pa.Table:
         """Transpose row tuples into a typed Arrow table."""
@@ -731,17 +776,16 @@ class Catalog:
                     removed = int(found[0]) if found else 0
         return removed
 
-    async def replace_fields(self, scope: list[Any], rows: list[tuple[Any, ...]]) -> int:
-        """Make one scope's fields exactly ``rows``, in one transaction.
+    async def replace_fields(self, scope: list[Any], table: pa.Table) -> int:
+        """Make one scope's fields exactly ``table``'s rows, in one transaction.
 
         Delete then insert: a field BRAIN has removed would otherwise stay selectable and
-        spend a simulation on an error.
+        spend a simulation on an error. ``table`` comes from :meth:`to_arrow` before the call:
+        pivoting 85k rows into columns is pure CPU, and doing it while holding the single
+        writer stalls every other market's write behind it.
         """
-        if not rows:
+        if not len(table):
             return 0
-        # Built before the lock: pivoting 85k rows into columns is pure CPU, and doing it
-        # while holding the single writer stalls every other market's write behind it.
-        table = await asyncio.to_thread(self._to_arrow, "data_field", FIELD_COLUMNS, rows)
         columns = ", ".join(FIELD_COLUMNS)
         await self._locked(
             self._load,
@@ -753,7 +797,7 @@ class Catalog:
             ),
             (f"INSERT INTO data_field ({columns}) SELECT {columns} FROM {_INCOMING}", []),  # noqa: S608
         )
-        return len(rows)
+        return len(table)
 
     async def replace_pnl(self, alpha_id: str, rows: list[tuple[Any, ...]]) -> int:
         """Make one alpha's daily series exactly ``rows``, in one transaction.
@@ -762,7 +806,7 @@ class Catalog:
         """
         if not rows:
             return 0
-        table = await asyncio.to_thread(self._to_arrow, "alpha_pnl", PNL_COLUMNS, rows)
+        table = await asyncio.to_thread(self.to_arrow, "alpha_pnl", PNL_COLUMNS, rows)
         columns = ", ".join(PNL_COLUMNS)
         await self._locked(
             self._load,

@@ -2,6 +2,7 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
+import { useState } from 'react'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { DEFAULT_TRUNCATION } from '@/api/platform'
@@ -10,6 +11,7 @@ import { useCores } from '@/lib/preferences'
 import { DEFAULT_SCOPE, useScopeOptions } from '@/lib/scope'
 import { followOtherTabs } from '@/lib/tabs'
 import { useProviderLabel } from '@/screens/ai/shared'
+import { OperatorUsageDialog, operatorUsage } from '@/screens/dashboard/operators'
 import type { FieldFilterState } from '@/screens/data/state'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
 import {
@@ -33,12 +35,15 @@ import {
   Chips,
   Disclosure,
   ErrorNotice,
+  Field,
   Fieldset,
+  LINK,
   Metric,
   Notice,
   Page,
   PageHeader,
   Panel,
+  Textarea,
 } from '@/ui/kit'
 import { Select } from '@/ui/overlay'
 
@@ -57,6 +62,10 @@ interface PowerPoolDraft {
   neutralizations: string[]
   /** Empty draws from every downloaded universe of the market. */
   universes: string[]
+  /** The user's own idea for every LLM call to test; empty lets it explore. */
+  hypothesis: string
+  /** Ask the LLM to use this quarter's unused operators where they fit. */
+  favourUnused: boolean
 }
 
 const useDraft = create<PowerPoolDraft>()(
@@ -73,16 +82,20 @@ const useDraft = create<PowerPoolDraft>()(
       onlyModel: false,
       neutralizations: [],
       universes: [],
+      hypothesis: '',
+      favourUnused: false,
     }),
     {
       name: 'alpha-harness-power-pool-lab',
       // Version 1 leaves cores unchosen, so Settings' default for new tasks applies.
       // Version 2 adds universes, none chosen: every downloaded one, as before.
-      version: 2,
+      // Version 3 adds the hypothesis, empty: the LLM explores, as before.
+      version: 3,
       migrate: (stored, version) => ({
         ...(stored as PowerPoolDraft),
         ...(version < 1 ? { cores: null } : {}),
-        universes: [],
+        ...(version < 2 ? { universes: [] } : {}),
+        hypothesis: '',
       }),
     },
   ),
@@ -115,6 +128,19 @@ export function PowerPoolLabScreen() {
     universe: draft.universe,
   })
 
+  // The Dashboard's own read of the quarter, asked for only once the option is on.
+  const usage = useQuery({ ...operatorUsage, enabled: draft.favourUnused })
+  const unused = usage.data?.operators.filter((o) => o.alphas === 0).map((o) => o.name) ?? []
+  const [showUsage, setShowUsage] = useState(false)
+  // Never added without the operators it was asked to favour.
+  const usageBlocked = !draft.favourUnused
+    ? null
+    : usage.isError
+      ? "This quarter's operators could not be read. Untick Favour operators, or try again."
+      : usage.data
+        ? null
+        : "Reading this quarter's operators from BRAIN…"
+
   const cores = useCores(draft.cores)
   const universes = offeredOnly(draft.universes, scopeOptions.universes)
   const body: PowerPoolRequest = {
@@ -129,6 +155,8 @@ export function PowerPoolLabScreen() {
     universes,
     cores,
     simulations: draft.simulations ?? 0,
+    hypothesis: draft.hypothesis,
+    favour_operators: draft.favourUnused ? unused : [],
   }
   const { preview, current } = useLabPreview('power-pool-lab', body, powerPoolLab.preview)
   const plan = preview.data
@@ -138,9 +166,12 @@ export function PowerPoolLabScreen() {
     plan !== undefined &&
     current &&
     plan.problems.length === 0 &&
-    simulationsValid(draft.simulations, maxSimulations)
+    simulationsValid(draft.simulations, maxSimulations) &&
+    usageBlocked === null
   const blocked =
-    plan?.problems[0] ?? (draft.simulations === null ? 'Enter the simulations to run.' : null)
+    usageBlocked ??
+    plan?.problems[0] ??
+    (draft.simulations === null ? 'Enter the simulations to run.' : null)
 
   return (
     <Page>
@@ -208,6 +239,50 @@ export function PowerPoolLabScreen() {
               onChange={(next) => set({ simulations: next })}
             />
           </div>
+          <Field
+            label="Hypothesis · optional"
+            hint="Every LLM call writes its Alphas to test this idea on the chosen datasets. Left empty, the LLM explores on its own."
+          >
+            <Textarea
+              rows={3}
+              maxLength={2000}
+              placeholder="e.g. Stocks whose analysts keep revising estimates up outperform for the next month."
+              value={draft.hypothesis}
+              onChange={(e) => set({ hypothesis: e.target.value })}
+            />
+          </Field>
+          <Fieldset legend="Operators">
+            <div className="flex flex-col gap-1.5">
+              <Checkbox
+                label="Favour operators unused this quarter"
+                checked={draft.favourUnused}
+                onChange={(favourUnused) => set({ favourUnused })}
+              />
+              <p className="text-caption text-pretty text-ink-subtle">
+                {draft.favourUnused && usage.data ? (
+                  <>
+                    <span className="num">{fmt.int(unused.length)}</span> of{' '}
+                    <span className="num">{fmt.int(usage.data.operators.length)}</span> are unused
+                    in {usage.data.label}. Every LLM call asks for them where they fit the idea.{' '}
+                    <button type="button" className={LINK} onClick={() => setShowUsage(true)}>
+                      See all
+                    </button>
+                  </>
+                ) : (
+                  "Total distinct operators over the quarter is one of BRAIN Genius's tiebreakers. On, the LLM is asked to reach for the ones your submitted Alphas have not used yet."
+                )}
+              </p>
+              {draft.favourUnused && usage.isError && (
+                <ErrorNotice
+                  error={usage.error}
+                  title="This quarter's operators could not be read"
+                />
+              )}
+            </div>
+          </Fieldset>
+          {usage.data && (
+            <OperatorUsageDialog usage={usage.data} open={showUsage} onOpenChange={setShowUsage} />
+          )}
           {scopeOptions.universes.length > 0 && (
             <Fieldset legend={universes.length === 0 ? 'Universes · all downloaded' : 'Universes'}>
               <Chips

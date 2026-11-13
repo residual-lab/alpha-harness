@@ -28,6 +28,7 @@ SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {part: {"type": "string"} for part in PARTS},
     "required": list(PARTS),
+    "additionalProperties": False,
 }
 
 #: BRAIN's operator for each symbol Fast Expression writes between its inputs.

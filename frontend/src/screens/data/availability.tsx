@@ -1,7 +1,7 @@
 /** The availability filters: whether a field also exists in other regions. */
 
 import { useQuery } from '@tanstack/react-query'
-import { GlobeIcon, MapPinIcon } from 'lucide-react'
+import { GlobeIcon, MapPinIcon, SunriseIcon } from 'lucide-react'
 import { type ReactNode, useEffect } from 'react'
 import { type CatalogFacets, catalog } from '@/api/catalog'
 import { REGION_AGNOSTIC_REGION } from '@/api/platform'
@@ -67,6 +67,8 @@ export function AvailabilityFilters({
 
   const offersAgnostic = runsRegionAgnostic(scope)
   const offersRegion = !isRegionAgnostic(scope)
+  // BRAIN offers Fast D1 in USA Delay 1 alone.
+  const offersFast = scope.region === 'USA' && scope.delay === 1
   // Region ALL arrives by its own download; without it no field can be found there.
   const allDownloaded = scopes.data
     ? scopes.data.some(
@@ -79,10 +81,19 @@ export function AvailabilityFilters({
     const drop: Record<string, false> = {}
     if (filter.region_agnostic && !offersAgnostic) drop['region_agnostic'] = false
     if (filter.region_exclusive && !offersRegion) drop['region_exclusive'] = false
+    if (filter.fast_d1 && !offersFast) drop['fast_d1'] = false
     if (Object.keys(drop).length) set(drop)
-  }, [filter.region_agnostic, filter.region_exclusive, offersAgnostic, offersRegion, set])
+  }, [
+    filter.region_agnostic,
+    filter.region_exclusive,
+    filter.fast_d1,
+    offersAgnostic,
+    offersRegion,
+    offersFast,
+    set,
+  ])
 
-  if (!offersAgnostic && !offersRegion) return null
+  if (!offersAgnostic && !offersRegion && !offersFast) return null
   const region = regionLabel(scope.region)
   return (
     <div role="group" aria-label="Availability" className="flex flex-wrap items-center gap-2">
@@ -113,6 +124,16 @@ export function AvailabilityFilters({
           onClick={() =>
             set({ region_exclusive: !filter.region_exclusive, region_agnostic: false })
           }
+        />
+      )}
+      {offersFast && (
+        <Toggle
+          on={Boolean(filter.fast_d1)}
+          icon={<SunriseIcon />}
+          label="Fast D1"
+          count={counts?.fast_d1}
+          title="Only Fast D1 Fields: a regular Delay 1 Field's data as of today's open, named …_fast_d1. BRAIN takes a Fast D1 Alpha only if it beats the same Alpha on the regular Fields."
+          onClick={() => set({ fast_d1: !filter.fast_d1 })}
         />
       )}
     </div>

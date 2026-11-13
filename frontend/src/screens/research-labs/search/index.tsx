@@ -5,6 +5,7 @@
  */
 
 import { useQuery } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import { today } from '@/api/core'
 import { useCores } from '@/lib/preferences'
 import { useScopeOptions } from '@/lib/scope'
@@ -20,7 +21,7 @@ import {
 import { type SearchLabRequest, searchLab } from '@/screens/research-labs/search/api'
 import { useSearchLab } from '@/screens/research-labs/search/state'
 import { DatasetsPanel, MarketPanel, SettingsPanel } from '@/screens/research-labs/task-settings'
-import { ErrorNotice, Page, PageHeader } from '@/ui/kit'
+import { Checkbox, ErrorNotice, LINK, Page, PageHeader } from '@/ui/kit'
 
 export function SearchLabScreen() {
   const stored = useSearchLab()
@@ -75,10 +76,26 @@ export function SearchLabScreen() {
       {options.isError && (
         <ErrorNotice error={options.error} title="Could not read your operators" />
       )}
-      <MarketPanel scope={scope} onChange={move} />
+      <MarketPanel scope={scope} onChange={move}>
+        <Checkbox
+          label="Only this universe"
+          checked={draft.onlyUniverse}
+          onChange={(onlyUniverse) => set({ onlyUniverse })}
+        />
+      </MarketPanel>
       <DatasetsPanel
         ids={draft.datasetIds}
         scope={scope}
+        description={
+          <>
+            Each Alpha reads one field. For two fields from two datasets, start from “Two fields,
+            two datasets” in{' '}
+            <Link to="/labs/template" className={LINK}>
+              Template Lab
+            </Link>
+            .
+          </>
+        }
         onApply={(datasetIds, fieldFilter) => set({ datasetIds, fieldFilter })}
         onExplore={choose}
         filter={draft.fieldFilter}

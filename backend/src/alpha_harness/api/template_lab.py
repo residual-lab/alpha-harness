@@ -27,7 +27,7 @@ from ..brain.schemas import region_label
 from ..catalog.queries import FieldFilter, Tuple4
 from ..db.models import Template, utcnow
 from ..labs import search, template
-from ..labs.fastexpr import Node, ParseError, operator_table, walk
+from ..labs.fastexpr import Node, ParseError, operator_table
 from ..labs.launch import (
     NO_NEUTRALIZATION,
     NO_SIMULATIONS,
@@ -157,6 +157,9 @@ class TemplateStats(Out):
     limits: list[int]
     #: Every Alpha it makes reads one dataset: BRAIN's single dataset Alpha.
     single_dataset: bool
+    #: Most dataset categories one of its Alphas reads, grouping fields aside: over 2, BRAIN
+    #: counts it toward no Genius pyramid. Null until every field's dataset is known.
+    pyramids: int | None = None
     #: Operators it calls that the account does not have.
     missing: list[str]
     #: Why it can't be read; the counts are zero then.
@@ -249,8 +252,8 @@ async def options(state: State, refresh: bool = False) -> TemplateLabOptions:
 
 
 def _missing(tree: Node, known: set[str]) -> list[str]:
-    called = {n.value for _, n in walk(tree) if n.kind == "call" and not n.value.startswith("$")}
-    return sorted(called - known - {template.HOLE})
+    named = {n for n in template.called(tree) if not n.startswith("$")}
+    return sorted(named - known - {template.HOLE})
 
 
 def _saved(row: Template) -> TemplateSummary:
@@ -296,7 +299,8 @@ Sized = list[tuple[Node, template.Size] | str]
 
 
 def _sized(items: list[StatsItem]) -> Sized:
-    """Each template parsed and counted, or why it can't be read. Half a millisecond each."""
+    """Each template parsed and counted, or why it can't be read. A quarter of a millisecond
+    each, mostly parsing; one read before is nearly free."""
     read: Sized = []
     for item in items:
         try:
@@ -314,9 +318,14 @@ def _sized(items: list[StatsItem]) -> Sized:
 
 
 def _judged(
-    items: list[StatsItem], read: Sized, datasets: dict[str, str], known: set[str]
+    items: list[StatsItem],
+    read: Sized,
+    datasets: dict[str, str],
+    known: set[str],
+    categories: dict[str, str],
 ) -> list[dict[str, Any]]:
-    """Each counted template's kind of Alpha, its fields' datasets known."""
+    """Each counted template's kind of Alpha, its fields' datasets and their categories known."""
+    by_field = {f: categories[d] for f, d in datasets.items() if d in categories}
     found: list[dict[str, Any]] = []
     for item, entry in zip(items, read, strict=True):
         if isinstance(entry, str):
@@ -341,6 +350,17 @@ def _judged(
             for name, v in item.variables.items()
         }
         free = sized.power_pool
+        typed: dict[str, list[str]] = {}
+        for name, v in item.variables.items():
+            if isinstance(v, ValuesVariable):
+                with contextlib.suppress(ValueError):
+                    typed[name] = template.values(v.values)
+        slot_categories = {
+            name: frozenset(categories[d] for d in ids)
+            if (ids := slots.get(name)) and all(d in categories for d in ids)
+            else None
+            for name in sized.slots
+        }
         found.append(
             {
                 "operators": list(sized.operators),
@@ -349,6 +369,7 @@ def _judged(
                 "powerPool": list(free) if free is not None else None,
                 "limits": LIMITS,
                 "singleDataset": template.single_dataset(tree, sized, datasets, slots),
+                "pyramids": template.most_pyramids(tree, sized, typed, by_field, slot_categories),
                 "missing": _missing(tree, known) if known else [],
                 "problem": None,
             }
@@ -356,8 +377,9 @@ def _judged(
     return found
 
 
-#: Templates counted between turns of the event loop: a millisecond or two of parsing.
-CHUNK = 5
+#: Templates counted between turns of the event loop: about 3 ms for ten seen for the first
+#: time, far less once seen.
+CHUNK = 10
 
 
 async def _stats(
@@ -365,9 +387,10 @@ async def _stats(
 ) -> list[dict[str, Any]]:
     """Each template's size and kind of Alpha, its fields' datasets read in one query.
 
-    Counted a few at a time, yielding between: two thousand templates are a fifth of a second
-    of parsing, and the engine's polling shares this loop. A worker thread would not help, as
-    pure-Python parsing holds the GIL and slowed every other request for the whole count.
+    Counted a few at a time, yielding between: two thousand templates read for the first time
+    are half a second, mostly parsing, and the engine's polling shares this loop. A worker
+    thread would not help, as pure-Python counting holds the GIL and slowed every other request
+    for the whole count.
     """
     known = await _known(state)
     read: Sized = []
@@ -386,10 +409,18 @@ async def _stats(
     )
     # A field this market lacks still has a dataset, as long as every market agrees on it.
     datasets |= await state.queries.sole_datasets([n for n in names if n not in datasets])
+    chosen = {
+        d
+        for item in items
+        for v in item.variables.values()
+        if isinstance(v, FieldsVariable)
+        for d in v.dataset_ids
+    }
+    categories = await state.queries.dataset_categories(sorted({*datasets.values(), *chosen}))
     found: list[dict[str, Any]] = []
     for start in range(0, len(items), CHUNK):
         part = slice(start, start + CHUNK)
-        found.extend(_judged(items[part], read[part], datasets, known))
+        found.extend(_judged(items[part], read[part], datasets, known, categories))
         await asyncio.sleep(0)
     return found
 
@@ -400,50 +431,6 @@ async def stats(body: StatsRequest, state: State) -> TemplateStatsList:
     dataset ones. Free; reads only the catalog."""
     found = await _stats(state, body.templates, body.region, body.delay)
     return TemplateStatsList.model_validate({"stats": found})
-
-
-class TreeOption(Out):
-    name: str
-    value: TreeNode
-
-
-class TreeNode(Out):
-    """One step of a template, as the Blocks view draws it. ``...`` is a name: an empty input."""
-
-    kind: Literal["num", "str", "name", "call", "unary", "binary", "ternary", "assign", "seq"]
-    value: str
-    args: list[TreeNode]
-    kwargs: list[TreeOption]
-
-
-class TreeRequest(BaseModel):
-    text: str = Field(max_length=template.MAX_TEXT)
-
-
-class TemplateTree(Out):
-    tree: TreeNode | None = None
-    #: Why the text has no tree: the Code view is where to fix it.
-    problem: str | None = None
-
-
-def _tree(node: Node) -> TreeNode:
-    return TreeNode.model_validate(
-        {
-            "kind": node.kind,
-            "value": node.value,
-            "args": [_tree(a) for a in node.args],
-            "kwargs": [{"name": k, "value": _tree(v)} for k, v in node.kwargs],
-        }
-    )
-
-
-@router.post("/tree")
-async def tree(body: TreeRequest) -> TemplateTree:
-    """The template as blocks, read with the same grammar every task runs on."""
-    try:
-        return TemplateTree(tree=_tree(template.program(body.text)))
-    except ParseError as exc:
-        return TemplateTree(problem=str(exc))
 
 
 @router.get("/templates")
@@ -676,15 +663,32 @@ async def _plan(body: TemplateTask, state: Any) -> dict[str, Any]:
 
     # -- fixed data fields: each has to exist here, and a universe without one is left out
     held = await _held(state, set(reads), body.region, body.delay) if reads and searched else {}
+
+    def problems_of(reader: str | None) -> list[str]:
+        if reader is None:
+            return template_problems
+        return next(i for i in infos if i["name"] == reader)["problems"]
+
+    operator_names = {str(o.get("name")) for o in operators}
+    #: Operators written where a field goes, by who wrote them: ``$ts_op`` used as an input.
+    misplaced: dict[str | None, list[str]] = {}
     for name, readers in reads.items() if searched else ():
         if held.get(name):
             continue
-        message = f"{name} is not a data field in {market}."
         for reader in readers:
-            if reader is None:
-                template_problems.append(message)
+            if name in operator_names:
+                misplaced.setdefault(reader, []).append(name)
             else:
-                next(i for i in infos if i["name"] == reader)["problems"].append(message)
+                problems_of(reader).append(f"{name} is not a data field in {market}.")
+    for reader, names in misplaced.items():
+        one = len(names) == 1
+        what = f"{', '.join(names)} {'is an operator' if one else 'are operators'}"
+        it = "it" if one else "they"
+        problems_of(reader).append(
+            f"{what}: write ${reader}(…) around what {it} should wrap, e.g. ${reader}(rank(x), 20)."
+            if reader
+            else f"{what}: call {it} on what {it} should wrap, e.g. {names[0]}(rank(x), 20)."
+        )
     kept: list[str] = []
     for universe in universes:
         short = [n for n, there in held.items() if there and universe not in there]

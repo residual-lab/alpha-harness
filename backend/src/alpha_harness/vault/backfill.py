@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ..brain.connection import background
 from ..brain.filters import AlphaQuery, Filter
 from ..brain.platform import ALPHA_LIST_MAX_OFFSET, ALPHA_LIST_PAGE
 from ..brain.schemas import QUICK_MODE, Alpha, RecordSet, SimulationType
@@ -379,19 +380,28 @@ class Backfill:
 
         From the cumulative ``pnl`` recordset rather than ``daily-pnl``, which is rounded
         separately and drifts from the platform's own figures, with turnover scaled to
-        ``yearly-stats`` (see :mod:`.metrics`). A PnL already stored without its turnover is
+        ``yearly-stats`` (see :mod:`.metrics`) where BRAIN made one: it makes none for a Quick
+        Alpha, whose turnover is kept as exported. A PnL already stored without its turnover is
         not asked for again.
         """
+        stored_as = (await self.vault.by_ids([alpha_id])).get(alpha_id) or {}
+        quick = stored_as.get("simulation_mode") == QUICK_MODE
+
+        async def yearly() -> list[dict[str, Any]]:
+            if quick:
+                return []
+            return (await self.endpoints.get_recordset(alpha_id, "yearly-stats")).rows()
+
         if await self.vault.lacking_pnl([alpha_id]):
             pnl = await self.endpoints.get_recordset(alpha_id, "pnl")
             turnover = await self.endpoints.get_recordset(alpha_id, "turnover")
-            yearly = await self.endpoints.get_recordset(alpha_id, "yearly-stats")
-            stored = await self.vault.save_pnl(alpha_id, pnl.rows(), turnover.rows(), yearly.rows())
+            stored = await self.vault.save_pnl(
+                alpha_id, pnl.rows(), turnover.rows(), await yearly()
+            )
             _warn_unreadable(alpha_id, pnl, stored)
             return stored
         turnover = await self.endpoints.get_recordset(alpha_id, "turnover")
-        yearly = await self.endpoints.get_recordset(alpha_id, "yearly-stats")
-        return await self.vault.save_turnover(alpha_id, turnover.rows(), yearly.rows())
+        return await self.vault.save_turnover(alpha_id, turnover.rows(), await yearly())
 
     async def fetch_pnl(self, alpha_id: str) -> int:
         """Fetch and store one alpha's daily PnL alone: one request, all a correlation needs."""
@@ -415,6 +425,7 @@ class Backfill:
         task.add_done_callback(self._background.discard)
 
     async def _fetch_each(self, alpha_ids: list[str]) -> None:
+        background()
         for alpha_id in alpha_ids:
             try:
                 await self.fetch_returns(alpha_id)
@@ -438,6 +449,7 @@ class Backfill:
         await asyncio.shield(future)
 
     async def _drain_landed(self) -> None:
+        background()
         try:
             while self._landed:
                 await asyncio.sleep(CAPTURE_DEBOUNCE_SECONDS)

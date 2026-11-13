@@ -72,9 +72,12 @@ def selections(limit: int) -> list[Recipe]:
 #: Weighting schemes from BRAIN's own combo examples and their risk-aware variants.
 COMBOS = [
     Recipe("Equal weight", "1"),
+    # Rolling IR as mean / std dev: ``ts_ir`` is not offered to every account, and BRAIN
+    # rejects a combo using it ("inaccessible or unknown operator").
     Recipe(
-        "Rolling IR",
-        "stats = generate_stats(alpha);\nmax(ts_ir(stats.returns, 250), 0)",
+        "Rolling Sharpe",
+        "stats = generate_stats(alpha);\n"
+        "max(ts_mean(stats.returns, 250) / (ts_std_dev(stats.returns, 250) + 0.0001), 0)",
     ),
     Recipe(
         "Least crowded",
@@ -110,8 +113,11 @@ def candidates(
     neutralization: str,
     selection_limit: int,
     activations: list[str],
+    chosen_selections: list[Recipe] | None = None,
+    combos: list[Recipe] | None = None,
 ) -> list[Candidate]:
-    """Every selection · combo · decay · activation, as Full SUPER simulations.
+    """Every selection · combo · decay · activation, as Full SUPER simulations. The built-in
+    selections and combos unless others are given.
 
     Full mode always: only a Full simulation can be submitted, and Quick runs none of the
     correlation checks a SuperAlpha must also pass.
@@ -119,8 +125,8 @@ def candidates(
     out: list[Candidate] = []
     for activation in activations:
         for decay in DECAYS:
-            for selection in selections(selection_limit):
-                for combo in COMBOS:
+            for selection in chosen_selections or selections(selection_limit):
+                for combo in combos or COMBOS:
                     settings = SimulationSettings(
                         region=region,
                         delay=delay,

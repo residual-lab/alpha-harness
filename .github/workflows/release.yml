@@ -43,6 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      wheel-sha256: ${{ steps.hash.outputs.wheel-sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -107,6 +108,8 @@ jobs:
       # in git does not depend on it staying happy.
       - run: cd backend && uv sync --frozen
       - run: cd frontend && pnpm install --frozen-lockfile
+      # The Rust crates/fastexpr names: `check` builds the browser's parser with it.
+      - run: cd crates/fastexpr && rustup toolchain install
       - run: uvx lefthook@2.1.14 run check
 
       # Into the package, so one wheel serves the whole app with no Node at runtime.
@@ -117,9 +120,18 @@ jobs:
         run: cd backend && uv version --frozen "$VERSION"
 
       - run: cd backend && uv build --wheel
+      # The launcher installs the wheel by URL with this hash on it, so uv refuses any other:
+      # built into the desktop app for its own version, and in latest.json for every update.
+      - name: Hash the wheel
+        id: hash
+        run: |
+          set -- backend/dist/*.whl
+          [ "$#" -eq 1 ] || { echo "::error::expected one wheel, found: $*"; exit 1; }
+          echo "wheel-sha256=$(sha256sum "$1" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       # With hashes: the launcher installs every dependency through this file, and uv refuses
       # an artefact whose hash does not match one listed here. The project's own wheel is not
-      # in it (`--no-emit-project`) and stays unhashed, so this covers the PyPI leg only.
+      # in it (`--no-emit-project`), since uv ignores a constraint's hash for a wheel given by
+      # URL; the step above hashes that one.
       - run: cd backend && uv export --frozen --no-dev --no-emit-project -o dist/constraints.txt
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -178,6 +190,8 @@ jobs:
       # Built into the app (see build.rs): what it installs on a fresh machine, and what it
       # tells the app it is.
       ALPHA_HARNESS_VERSION: ${{ needs.wheel.outputs.version }}
+      # Also built in: the first install refuses any wheel but the one this run built.
+      ALPHA_HARNESS_WHEEL_SHA256: ${{ needs.wheel.outputs.wheel-sha256 }}
       # The oldest macOS the build may need: see Build, and the check after it.
       MACOS_FLOOR: ${{ matrix.macos }}
       TARGET: ${{ matrix.target }}
@@ -375,16 +389,21 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # Cut to what the app reads, under the API's own field names.
+      # Cut to what the app reads, under the API's own field names. An asset's digest is
+      # GitHub's SHA-256 of it, which an update checks the wheel against; published only if the
+      # wheel on the release is still the one this run built.
       - name: Write latest.json
         env:
           GH_TOKEN: ${{ github.token }}
+          WHEEL_SHA256: ${{ needs.wheel.outputs.wheel-sha256 }}
         run: |
           mkdir site
           gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
             | jq '{tag_name, body, html_url, published_at, draft, prerelease,
-                   assets: [.assets[] | {name, browser_download_url}]}' > site/latest.json
+                   assets: [.assets[] | {name, browser_download_url, digest}]}' > site/latest.json
           jq -e '.tag_name' site/latest.json
+          jq -e --arg digest "sha256:$WHEEL_SHA256" \
+            'any(.assets[]; (.name | endswith(".whl")) and .digest == $digest)' site/latest.json
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: site

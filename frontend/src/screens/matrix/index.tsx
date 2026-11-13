@@ -17,6 +17,7 @@ import { useCores, useLive } from '@/lib/live'
 import { blockLabel, type Cell, type CoreBlock, coreBlocks, EMPTY } from '@/lib/matrix'
 import { useNow } from '@/lib/now'
 import { useRefetchOn } from '@/lib/ws'
+import { pausesOf } from '@/shell/pause'
 import {
   Button,
   ErrorNotice,
@@ -170,18 +171,13 @@ function SimulationMatrix() {
       }
       bodyClassName="flex flex-col gap-4"
     >
-      {status?.dailyLimitHit && (
-        <Notice tone="warn" title="BRAIN's daily simulation limit is reached">
-          Nothing more will be sent until the allowance resets at midnight US Eastern. Queued work
-          stays queued.
-        </Notice>
-      )}
-      {status?.sessionLost && (
-        <Notice tone="warn" title="BRAIN is not accepting your session">
-          Sending is paused and queued work stays queued. It resumes by itself once the session is
-          renewed, or as soon as you sign in again.
-        </Notice>
-      )}
+      {pausesOf(status)
+        .filter((pause) => pause.key !== 'identity')
+        .map((pause) => (
+          <Notice key={pause.key} tone="warn" title={pause.title}>
+            {pause.body}
+          </Notice>
+        ))}
       {engine.isError && (
         <ErrorNotice error={engine.error} title="The engine status could not load" />
       )}

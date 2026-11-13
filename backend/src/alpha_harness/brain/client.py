@@ -25,13 +25,16 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 import httpx2
 import structlog
 
+from .connection import Connection, Link
 from .errors import (
     DAILY_LIMIT_DETAIL,
     BrainAuthError,
+    BrainBusy,
     BrainDailyLimitReached,
     BrainError,
     BrainForbidden,
     BrainNotFound,
+    BrainPaused,
     BrainPollTimeout,
     BrainRateLimited,
     BrainServerError,
@@ -39,6 +42,7 @@ from .errors import (
     BrainTransportError,
     BrainValidationError,
     BrainVerificationRequired,
+    persona_url,
 )
 
 log = structlog.get_logger(__name__)
@@ -66,6 +70,9 @@ EPOCH_SECONDS = 1e9
 #: Longest gap a response is allowed to talk us into. Not a rate limit — a bound on how
 #: badly a misread header may stall a sync.
 MAX_MEASURED_GAP = 60.0
+#: Longest a paced caller sleeps before looking again, so a shorter gap measured meanwhile
+#: takes effect within a second.
+PACE_RECHECK = 1.0
 
 
 def _header_num(headers: httpx2.Headers, name: str) -> float | None:
@@ -141,6 +148,10 @@ def _parse_retry_after(headers: httpx2.Headers) -> float | None:
     return max(seconds, 0.0)
 
 
+def _busy(bucket: str) -> BrainBusy:
+    return BrainBusy(f"BRAIN was not asked: its /{bucket} rate limit is in use by a download")
+
+
 class BrainClient:
     """Cookie-authenticated async client.
 
@@ -154,7 +165,7 @@ class BrainClient:
         #: the next free slot in each. Measured: BRAIN meters each endpoint separately, and
         #: asking faster than it allows buys 429s rather than throughput.
         self._gap: dict[str, float] = {}
-        self._next_send: dict[str, float] = {}
+        self._last_send: dict[str, float] = {}
         #: Set once an endpoint's first response has reported its window, so the callers
         #: behind it pace on measurements rather than on an assumption.
         self._measured: dict[str, asyncio.Event] = {}
@@ -163,6 +174,8 @@ class BrainClient:
         #: its callers back off together instead of each retrying into a server that said
         #: stop. Per endpoint, so a throttled catalog crawl never holds up a simulation poll.
         self._resume_at: dict[str, float] = {}
+        #: Whether BRAIN can be asked anything now, moved by the answers below.
+        self.connection = Connection()
         self._client = httpx2.AsyncClient(
             base_url=self.base_url,
             timeout=httpx2.Timeout(TIMEOUT, connect=10.0),
@@ -220,8 +233,9 @@ class BrainClient:
     def _pause(self, bucket: str, seconds: float) -> None:
         self._resume_at[bucket] = max(self._resume_at.get(bucket, 0.0), time.monotonic() + seconds)
 
-    async def _reserve(self, bucket: str) -> None:
-        """Hold the caller until this endpoint's next free slot.
+    async def _reserve(self, bucket: str, wait: float | None = None) -> None:
+        """Hold the caller until this endpoint's next free slot, or raise :class:`BrainBusy`
+        when that is more than ``wait`` seconds off.
 
         Nothing about the rate is written here. The first caller to reach an unmeasured
         endpoint goes straight through and every other waits for what its headers report,
@@ -231,18 +245,28 @@ class BrainClient:
             measured = self._measured.get(bucket)
             if measured is None:
                 self._measured[bucket] = asyncio.Event()
+                self._last_send[bucket] = time.monotonic()
                 return
         if not measured.is_set():
-            await measured.wait()
+            try:
+                async with asyncio.timeout(wait):
+                    await measured.wait()
+            except TimeoutError:
+                raise _busy(bucket) from None
 
-        async with self._pace_lock:
-            gap = self._gap.get(bucket, 0.0)
-            if gap <= 0:
-                return
-            slot = max(time.monotonic(), self._next_send.get(bucket, 0.0))
-            self._next_send[bucket] = slot + gap
-        if (wait := slot - time.monotonic()) > 0:
-            await asyncio.sleep(wait)
+        # The next send is due a gap after the last, re-read on every wake rather than booked
+        # ahead: a queue booked while a window ran dry would keep its minute-wide spacing long
+        # after the window reset and a fresh response measured a gap of a fraction of a second.
+        while True:
+            async with self._pace_lock:
+                now = time.monotonic()
+                due = self._last_send.get(bucket, 0.0) + self._gap.get(bucket, 0.0)
+                if now >= due:
+                    self._last_send[bucket] = now
+                    return
+            if wait is not None and due - now > wait:
+                raise _busy(bucket)
+            await asyncio.sleep(min(due - now, PACE_RECHECK))
 
     def _measure(self, bucket: str, headers: httpx2.Headers) -> None:
         """Read this endpoint's window off the response: how many, and how long until reset."""
@@ -279,24 +303,31 @@ class BrainClient:
         raise_for_status: bool = True,
         raw: bool = False,
         read_timeout: float | None = None,
+        patience: float | None = None,
     ) -> BrainResponse:
         """Issue one request and translate failures into typed exceptions.
 
         ``raw`` leaves a successful body as undecoded ``bytes``, for payloads whose caller
         has a faster decoder than the standard library's. ``read_timeout`` overrides the client's
         for one call, since a few endpoints legitimately take longer than the rest.
+        ``patience`` caps how long it queues for the rate limit before :class:`BrainBusy`,
+        for a caller with something else to show; once sent, it is never cut short.
 
         ``params`` values that are ``None`` are dropped.
         """
         clean_params = {k: v for k, v in params.items() if v is not None} if params else None
+        if self.connection.holds(path):
+            raise BrainPaused(f"{method} {path}: not sent while {self.connection.state}")
 
         bucket = self._bucket(path)
         # Re-checked after each sleep: another 429 may have pushed the pause further out.
         # Jittered so every waiter does not re-send in the same tick and draw another 429.
-        while (wait := self._resume_at.get(bucket, 0.0) - time.monotonic()) > 0:  # noqa: ASYNC110
+        while (wait := self._resume_at.get(bucket, 0.0) - time.monotonic()) > 0:
+            if patience is not None and wait > patience:
+                raise _busy(bucket)
             await asyncio.sleep(wait + random.uniform(0.05, 0.25))
 
-        await self._reserve(bucket)
+        await self._reserve(bucket, patience)
 
         try:
             response = await self._client.request(
@@ -316,6 +347,9 @@ class BrainClient:
             self._measure(bucket, response.headers)
         # Not connected, or no pooled connection free: the request never left.
         except (httpx2.ConnectError, httpx2.ConnectTimeout, httpx2.PoolTimeout) as exc:
+            if not isinstance(exc, httpx2.PoolTimeout):
+                # DNS or a refused connect: nothing will get through until the network does.
+                self.connection.move(Link.OFFLINE, f"{method} {path} could not connect: {exc}")
             raise BrainTransportError(
                 f"{method} {path} could not connect: {exc}", maybe_delivered=False
             ) from exc
@@ -344,9 +378,30 @@ class BrainClient:
             # would stop finished alphas being read.
             self._pause(bucket, min(result.retry_after, MAX_MEASURED_GAP))
 
+        self._judge(method, bucket, result)
         if raise_for_status and response.status_code >= 400:
             raise self.to_error(method, path, result)
         return result
+
+    def _judge(self, method: str, bucket: str, r: BrainResponse) -> None:
+        """Move :attr:`connection` by what this answer says about the session.
+
+        A success is proof the session works, except signing out. A 401 says it does not: an
+        identity check pending, or no session at all. Anything else says nothing about it.
+        """
+        if 200 <= r.status < 300 and not (method == "DELETE" and bucket == "authentication"):
+            self.connection.move(Link.CONNECTED)
+        elif r.status == 401:
+            inquiry, url = self._persona_challenge(r)
+            if inquiry:
+                self.connection.move(
+                    Link.VERIFYING,
+                    "BRAIN needs to verify your identity.",
+                    url=url or persona_url(self.base_url, inquiry),
+                    inquiry=inquiry,
+                )
+            else:
+                self.connection.move(Link.SIGNED_OUT, "BRAIN no longer accepts this session.")
 
     def _persona_challenge(self, r: BrainResponse) -> tuple[str | None, str | None]:
         """The Persona inquiry in a 401, and the URL to open to complete it.
@@ -476,18 +531,21 @@ class BrainClient:
 
     # -- the asynchronous job protocol -----------------------------------
 
-    async def poll(self, path: str) -> BrainResponse:
+    async def poll(self, path: str, *, patience: float | None = None) -> BrainResponse:
         """Drive an asynchronous ``GET`` job to completion.
 
         Re-issues the request while the response carries ``Retry-After``, waiting what the
-        server asks. Returns the first response *without* that header.
+        server asks. Returns the first response *without* that header. ``patience`` is
+        :meth:`request`'s, for the first send only: a job BRAIN has taken is seen through.
         """
         deadline = time.monotonic() + POLL_TIMEOUT
         attempt = 0
 
         while True:
             # Retrying: a 429 or 503 between polls says nothing about the job.
-            response = await self.request_retrying("GET", path)
+            response = await self.request_retrying(
+                "GET", path, patience=patience if attempt == 0 else None
+            )
             attempt += 1
 
             if not response.pending:

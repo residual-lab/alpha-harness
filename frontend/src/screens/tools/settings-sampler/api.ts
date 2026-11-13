@@ -39,6 +39,10 @@ export type SampleRequest = Source & {
   marketNeutralOnly?: boolean
   /** Truncation set per market by the Truncation Agent instead of held at one value. */
   truncationAgent?: boolean
+  /** Every simulation run at each of these instead of at the held `decay`. */
+  decays?: number[]
+  /** Off unless turned on, whatever the Alpha ran with: it slows every simulation. */
+  visualization?: boolean
 }
 
 const B = '/api/tools/settings-sampler'

@@ -30,7 +30,11 @@ jobs:
           cache-dependency-path: frontend/pnpm-lock.yaml
       - run: cd backend && uv sync --frozen
       - run: cd frontend && pnpm install --frozen-lockfile
-      # `gate` itself calls a bare `lefthook`, which is not on PATH here, so its two stages
+      # The Rust and WebAssembly target crates/fastexpr's rust-toolchain.toml names, which
+      # `check` builds the browser's parser with.
+      - run: cd crates/fastexpr && rustup toolchain install
+      # `gate` itself calls a bare `lefthook`, which is not on PATH here, so its stages
       # run as steps. Pinned to the version the hooks are written against.
       - run: uvx lefthook@2.1.14 run check
+      - run: uvx lefthook@2.1.14 run test
       - run: uvx lefthook@2.1.14 run build

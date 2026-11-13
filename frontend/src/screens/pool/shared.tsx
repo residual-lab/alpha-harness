@@ -6,10 +6,12 @@ import { CheckIcon, CopyIcon, EllipsisIcon, ExternalLinkIcon, RefreshCwIcon } fr
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/cn'
-import { CORE_METRICS, fmt } from '@/lib/format'
+import { CORE_METRICS, fmt, isNum } from '@/lib/format'
+import { alpha } from '@/screens/alpha/api'
 import { BRAIN_ALPHA_URL, pool } from '@/screens/pool/api'
+import { useAddTask } from '@/screens/research-labs/add-task'
 import { Button } from '@/ui/kit'
-import { Menu } from '@/ui/overlay'
+import { Confirm, Menu } from '@/ui/overlay'
 import { type AstKind, tokenizeBrainAst } from './brain-ast'
 
 /** A check's value or limit: turnover as a percentage, the rest as a ratio. */
@@ -72,11 +74,50 @@ export function RecheckButton({
   )
 }
 
+/** At or below this Sharpe an Alpha is strong the other way round, so its flip is offered. */
+const FLIP_AT = -1
+
+/**
+ * Flip Sign for a screen's Alphas: `offer` gives an Alpha's menu the item when its Sharpe is at
+ * or below −1, and `dialog` asks before the one simulation is spent.
+ */
+export function useFlipSign() {
+  const [alphaId, setAlphaId] = useState<string | null>(null)
+  const add = useAddTask(() => alpha.flip(alphaId ?? ''))
+  return {
+    offer: (id: string, sharpe: unknown) =>
+      isNum(sharpe) && sharpe <= FLIP_AT ? { onFlip: () => setAlphaId(id) } : {},
+    dialog: (
+      <Confirm
+        open={alphaId !== null}
+        onOpenChange={(open) => !open && setAlphaId(null)}
+        title="Flip Sign"
+        confirmLabel="Simulate"
+        pending={add.isPending}
+        // Closed either way: a task added but not started must not be added again.
+        onConfirm={() => add.mutate(true, { onSettled: () => setAlphaId(null) })}
+      >
+        Simulates the expression of <span className="num text-ink">{alphaId}</span> with its sign
+        flipped, at the same settings. This uses one simulation.
+      </Confirm>
+    ),
+  }
+}
+
 /**
  * Per-Alpha actions that are not one-click enough to earn a button of their own. `links` adds
  * the full page and BRAIN, for a table row, where nothing else on the row offers them.
  */
-export function AlphaActionsMenu({ alphaId, links = false }: { alphaId: string; links?: boolean }) {
+export function AlphaActionsMenu({
+  alphaId,
+  links = false,
+  onFlip,
+}: {
+  alphaId: string
+  links?: boolean
+  /** Flip Sign, from {@link useFlipSign}: offered only on a strong negative. */
+  onFlip?: () => void
+}) {
   const navigate = useNavigate()
   return (
     <Menu
@@ -112,6 +153,15 @@ export function AlphaActionsMenu({ alphaId, links = false }: { alphaId: string; 
             void navigate({ to: '/tools/settings-sampler', search: { alpha: alphaId } }),
         },
         {
+          // Turnover that came back too high, as a Correlation Breaker result's often does.
+          label: 'Sweep Decay',
+          onClick: () =>
+            void navigate({
+              to: '/tools/settings-sampler',
+              search: { alpha: alphaId, sweep: 'decay' },
+            }),
+        },
+        {
           label: 'Fields Sampler',
           onClick: () => void navigate({ to: '/tools/fields-sampler', search: { alpha: alphaId } }),
         },
@@ -120,6 +170,7 @@ export function AlphaActionsMenu({ alphaId, links = false }: { alphaId: string; 
           onClick: () =>
             void navigate({ to: '/tools/correlation-breaker', search: { alpha: alphaId } }),
         },
+        ...(onFlip ? [{ label: 'Flip Sign', onClick: onFlip }] : []),
       ]}
     />
   )

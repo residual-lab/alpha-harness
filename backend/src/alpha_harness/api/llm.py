@@ -47,6 +47,9 @@ class LLMKey(Out):
     id: int
     label: str
     provider: str
+    #: Why the Key can no longer be used (its provider is gone), or null. It is kept for the
+    #: user to delete.
+    retired: str | None
     hint: str
     enabled: bool
     #: The user's own daily ceiling, or null to use the model's.

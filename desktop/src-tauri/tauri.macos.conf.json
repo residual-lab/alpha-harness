@@ -4,6 +4,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Alpha Harness",
         "url": "index.html",
         "width": 1440,

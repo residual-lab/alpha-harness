@@ -6,7 +6,12 @@ for every tree :func:`parse` returns, which is what makes changing a tree and wr
 back safe.
 
 Precedence, loosest first: ternary, ``||``, ``&&``, comparisons, ``+ -``, ``* /``, ``^``
-(right-associative), unary ``-``/``!``, calls.
+(right-associative), unary ``-``/``!``, calls. A sign binds tighter than ``^``, as BRAIN reads
+it: ``-close ^ 0.5`` is ``(-close) ^ 0.5``, NaN for every stock.
+
+The browser reads Fast Expression with ``crates/fastexpr``, built to WebAssembly: the same
+grammar, word for word down to the messages, checked against this one by
+``python -m alpha_harness.labs.fastexpr_conformance``.
 """
 
 import re
@@ -109,31 +114,35 @@ def _signature_params(definition: str, start: int) -> list[str] | None:
 # -- reading ---------------------------------------------------------------
 
 #: Template Lab writes two names BRAIN never sees: a ``$variable``, and ``...`` where a
-#: template's signal goes.
+#: template's signal goes. Names and numbers are ASCII, as on BRAIN; any space is space.
 _TOKEN = re.compile(
     r"""\s*(?:
-        (?P<num>(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)
+        (?P<num>(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?)
       | (?P<str>"[^"]*"|'[^']*')
-      | (?P<name>\$?[A-Za-z_]\w*|\.\.\.)
+      | (?P<name>\$?[A-Za-z_][A-Za-z0-9_]*|\.\.\.)
       | (?P<op>&&|\|\||==|!=|<=|>=|[-+*/^<>!?:(),=;])
     )""",
     re.VERBOSE,
 )
 
-_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 #: ``//`` is Fast Expression's own line comment and ``#`` is what a model writing one reaches
-#: for; BRAIN accepts both, and Alphas in the vault carry both.
-_LINE_COMMENT = re.compile(r"(?://|#)[^\n]*")
+#: for; BRAIN accepts both, and Alphas in the vault carry both. A string is matched first and
+#: kept, so ``range="0, 1 # 2"`` holds no comment.
+_COMMENT = re.compile(r"""("[^"]*"|'[^']*')|/\*.*?\*/|(?://|#)[^\n]*""", re.DOTALL)
 
 _LEVELS: tuple[tuple[str, ...], ...] = (("||",), ("&&",), COMPARISONS, ("+", "-"), ("*", "/"))
+
+#: How deep an expression may go, each call, bracket, sign, power and chained operator a level:
+#: past it this parser would run out of stack, and a real Alpha goes a dozen deep.
+MAX_DEPTH = 64
 
 
 def tokenize(text: str) -> list[tuple[str, str, int]]:
     tokens: list[tuple[str, str, int]] = []
     # Comments are part of Fast Expression; blanked, not removed, so positions hold and a
     # parse error still points at the character the reader can see.
-    blank = lambda m: " " * len(m.group())  # noqa: E731
-    text = _LINE_COMMENT.sub(blank, _COMMENT.sub(blank, text)).rstrip()
+    blank = lambda m: m.group(1) or " " * len(m.group())  # noqa: E731
+    text = _COMMENT.sub(blank, text).rstrip()
     position = 0
     while position < len(text):
         match = _TOKEN.match(text, position)
@@ -154,6 +163,12 @@ class _Parser:
     def __init__(self, tokens: list[tuple[str, str, int]]) -> None:
         self.tokens = tokens
         self.index = 0
+        self.depth = 0
+
+    def deeper(self) -> None:
+        self.depth += 1
+        if self.depth > MAX_DEPTH:
+            raise ParseError("The expression nests too deeply.")
 
     def peek(self, offset: int = 0) -> tuple[str, str, int] | None:
         at = self.index + offset
@@ -196,36 +211,52 @@ class _Parser:
         return self.expr()
 
     def expr(self) -> Node:
-        condition = self.binary(0)
-        if not self.at("?"):
-            return condition
-        self.take()
-        yes = self.expr()
-        self.expect(":")
-        return Node("ternary", args=(condition, yes, self.expr()))
+        # Inline rather than deeper(): every input passes here, and the call cost 10%.
+        self.depth += 1
+        if self.depth > MAX_DEPTH:
+            raise ParseError("The expression nests too deeply.")
+        node = self.binary(0)
+        if self.at("?"):
+            self.take()
+            yes = self.expr()
+            self.expect(":")
+            node = Node("ternary", args=(node, yes, self.expr()))
+        self.depth -= 1
+        return node
 
     def binary(self, level: int) -> Node:
         if level == len(_LEVELS):
             return self.power()
         left = self.binary(level + 1)
+        chained = 0
         while (
             (token := self.peek()) is not None and token[0] == "op" and token[1] in _LEVELS[level]
         ):
             self.take()
+            chained += 1
+            self.deeper()
             left = Node("binary", token[1], (left, self.binary(level + 1)))
+        self.depth -= chained
         return left
 
     def power(self) -> Node:
         base = self.unary()
-        if self.at("^"):
-            self.take()
-            return Node("binary", "^", (base, self.power()))
-        return base
+        if not self.at("^"):
+            return base
+        self.take()
+        self.deeper()
+        node = Node("binary", "^", (base, self.power()))
+        self.depth -= 1
+        return node
 
     def unary(self) -> Node:
-        if self.at("-") or self.at("!"):
-            return Node("unary", self.take()[1], (self.unary(),))
-        return self.primary()
+        if not (self.at("-") or self.at("!")):
+            return self.primary()
+        symbol = self.take()[1]
+        self.deeper()
+        node = Node("unary", symbol, (self.unary(),))
+        self.depth -= 1
+        return node
 
     def primary(self) -> Node:
         kind, text, position = self.take()
@@ -327,16 +358,23 @@ def render(node: Node) -> str:
 Path = tuple[int, ...]
 
 
-def children(node: Node) -> list[Node]:
-    return [*node.args, *(value for _, value in node.kwargs)]
+def children(node: Node) -> tuple[Node, ...]:
+    if not node.kwargs:
+        return node.args
+    return (*node.args, *(value for _, value in node.kwargs))
 
 
 def walk(node: Node, path: Path = ()) -> list[tuple[Path, Node]]:
     """Every node with the route to it. Keyword values follow positional arguments."""
-    found = [(path, node)]
-    for index, child in enumerate(children(node)):
-        found.extend(walk(child, (*path, index)))
+    found: list[tuple[Path, Node]] = []
+    _descend(node, path, found)
     return found
+
+
+def _descend(node: Node, path: Path, found: list[tuple[Path, Node]]) -> None:
+    found.append((path, node))
+    for index, child in enumerate(children(node)):
+        _descend(child, (*path, index), found)
 
 
 def walk_with_parents(
@@ -344,10 +382,17 @@ def walk_with_parents(
 ) -> list[tuple[Path, Node, Node | None]]:
     """:func:`walk` with each node's parent beside it, ``None`` at the root: found on the way
     down rather than by descending from the root again for every node."""
-    found = [(path, node, parent)]
-    for index, child in enumerate(children(node)):
-        found.extend(walk_with_parents(child, (*path, index), node))
+    found: list[tuple[Path, Node, Node | None]] = []
+    _descend_with_parent(node, path, parent, found)
     return found
+
+
+def _descend_with_parent(
+    node: Node, path: Path, parent: Node | None, found: list[tuple[Path, Node, Node | None]]
+) -> None:
+    found.append((path, node, parent))
+    for index, child in enumerate(children(node)):
+        _descend_with_parent(child, (*path, index), node, found)
 
 
 def node_at(node: Node, path: Path) -> Node:
@@ -450,6 +495,20 @@ def guarded(parent: Node | None, path: Path) -> bool:
 # -- changing --------------------------------------------------------------
 
 
+def negated(tree: Node) -> Node:
+    """The Alpha with its sign flipped. Only the last statement is the Alpha, so the steps
+    before it stay as they are, and one already negated loses its minus rather than gains two.
+    """
+    if tree.kind == "seq":
+        *steps, last = tree.args
+        return replace(tree, args=(*steps, negated(last)))
+    if tree.kind == "assign":
+        raise ParseError("The expression ends in an assignment, so it has no value to flip.")
+    if tree.kind == "unary" and tree.value == "-":
+        return tree.args[0]
+    return Node("unary", "-", (tree,))
+
+
 def crossover(rng: random.Random, left: Node, right: Node) -> Node | None:
     """Graft a call from one parent in place of a call inside the other.
 
@@ -514,3 +573,52 @@ def validate(
         ):
             problems.append(f"{node.value} is not a data field here.")
     return problems
+
+
+if __name__ == "__main__":
+    import sys
+
+    def flip(text: str) -> str:
+        return render(negated(parse(text)))
+
+    def refused(text: str) -> str:
+        try:
+            negated(parse(text))
+        except ParseError as exc:
+            return str(exc)
+        return ""
+
+    flips = {
+        "rank(close)": "-rank(close)",
+        "close - open": "-(close - open)",
+        "x > 0 ? 1 : -1": "-(x > 0 ? 1 : -1)",
+        "a = rank(close);\nb = a * a;\nb - a": "a = rank(close); b = a * a; -(b - a)",
+        "-rank(close)": "rank(close)",
+        "a = rank(close); -a": "a = rank(close); a",
+        # The tokenizer blanks comments out, so a flipped Alpha comes back without them.
+        "rank(close) // momentum": "-rank(close)",
+        "/* note */ a = rank(close); a": "a = rank(close); -a",
+        # A sign binds tighter than ^, so flipping a power brackets it.
+        "close ^ 0.5": "-(close ^ 0.5)",
+        "-close ^ 0.5": "-(-close ^ 0.5)",
+        "-(close ^ 0.5)": "close ^ 0.5",
+        "2 ^ -x": "-(2 ^ -x)",
+        'bucket(rank(cap), range="0, 1 # 2")': '-bucket(rank(cap), range="0, 1 # 2")',
+    }
+    deep = MAX_DEPTH - 1
+    checks = {f"flips {text!r}": flip(text) == want for text, want in flips.items()}
+    checks |= {f"round-trips {text!r}": parse(flip(text)) == negated(parse(text)) for text in flips}
+    checks |= {
+        "twice is the original": negated(negated(parse("ts_rank(close, 5)")))
+        == parse("ts_rank(close, 5)"),
+        "an assignment last has nothing to flip": refused("a = rank(close)") != "",
+        "a sign is read before a power": parse("-x ^ 2").args[0] == parse("-x"),
+        "names are ASCII": refused("closé").startswith("Cannot read 'é'"),
+        "as deep as allowed": parse("rank(" * deep + "x" + ")" * deep).kind == "call",
+        "no deeper": refused("rank(" * MAX_DEPTH + "x" + ")" * MAX_DEPTH)
+        == "The expression nests too deeply.",
+        "a long sum is deep too": refused(" + ".join(["x"] * (MAX_DEPTH + 1))) != "",
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"fastexpr self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

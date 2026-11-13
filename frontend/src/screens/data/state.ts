@@ -6,7 +6,7 @@ import type { Scope } from '@/api/types'
 import { cn } from '@/lib/cn'
 import { DASH, fmt, isNum } from '@/lib/format'
 import { regionLabel } from '@/lib/scope'
-import { type PickFrom, useDatasetPick } from '@/screens/data/dataset-pick'
+import { type PickFrom, useDatasetPick, useFieldPick } from '@/screens/data/dataset-pick'
 import { STATUS } from '@/ui/kit'
 import type { Sort } from '@/ui/table'
 
@@ -93,7 +93,10 @@ export function startDatasetPick(
 ) {
   const { filter: own, sort, chosen } = useFieldFilter.getState()
   browsing ??= { filter: own, sort, chosen }
-  useFieldFilter.getState().replace({ ...(filter ?? {}) })
+  // The lab's own fields come back as ticks, not as a filter that would hide the rest.
+  const { field_ids: fields = [], ...rest } = filter ?? {}
+  useFieldPick.setState({ fields: Object.fromEntries(fields.map((id) => [id, ''])) })
+  useFieldFilter.getState().replace(rest)
   useDatasetPick.getState().start(scope, ids, from)
 }
 
@@ -101,8 +104,15 @@ export function startDatasetPick(
  *  reader's own filter comes back. */
 export function endDatasetPick(done: boolean) {
   const pick = useDatasetPick.getState()
-  if (done) pick.finish(labFilter(useFieldFilter.getState().filter))
-  else pick.cancel()
+  const { fields } = useFieldPick.getState()
+  if (done) {
+    const ticked = Object.keys(fields)
+    useDatasetPick.setState({
+      ids: [...new Set([...pick.ids, ...Object.values(fields).filter(Boolean)])],
+    })
+    pick.finish(labFilter({ ...useFieldFilter.getState().filter, field_ids: ticked }))
+  } else pick.cancel()
+  useFieldPick.setState({ fields: {} })
   useFieldFilter.setState({
     ...(browsing ?? { filter: {}, sort: DEFAULT_SORT, chosen: false }),
     offset: 0,
@@ -167,9 +177,12 @@ export function describeFilter(filter: FieldFilterState, region: string): string
     filter.search && `Search \u201c${filter.search}\u201d`,
     filter.region_agnostic && 'Region Agnostic',
     filter.region_exclusive && `${regionLabel(region)} Exclusive`,
+    filter.fast_d1 && 'Fast D1',
     filter.category_ids?.length &&
       `${fmt.int(filter.category_ids.length)} ${filter.category_ids.length === 1 ? 'Category' : 'Categories'}`,
     filter.field_types?.length && filter.field_types.join(', '),
+    filter.field_ids?.length &&
+      `${fmt.int(filter.field_ids.length)} ${filter.field_ids.length === 1 ? 'Field' : 'Fields'}`,
     range('Instrument Coverage', filter.coverage_min, filter.coverage_max, pct),
     range('Date Coverage', filter.date_coverage_min, filter.date_coverage_max, pct),
     range('Alphas', filter.alpha_count_min, filter.alpha_count_max, fmt.int),

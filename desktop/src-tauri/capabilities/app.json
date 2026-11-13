@@ -1,18 +1,21 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "app",
-  "description": "The app as the backend serves it: it raises system notifications, and its top bar is the window's title bar.",
+  "description": "The app as the backend serves it: it raises system notifications, opens web links in the default browser, and its top bar is the window's title bar.",
   "windows": [
     "main"
   ],
   "remote": {
     "urls": [
-      "http://127.0.0.1:8000",
-      "http://127.0.0.1:8000/*"
+      "http://127.0.0.1:*"
     ]
   },
   "permissions": [
     "notification:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }]
+    },
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-minimize",

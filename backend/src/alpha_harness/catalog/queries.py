@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel, Field
 
-from ..brain.platform import INSTRUMENT_TYPE, REGION_AGNOSTIC_REGION
+from ..brain.platform import FAST_D1_SUFFIX, INSTRUMENT_TYPE, REGION_AGNOSTIC_REGION
 from .search import MATCH, TABLE, query_terms
 from .search import ready as search_ready
 
@@ -97,6 +97,8 @@ class FieldFilter(BaseModel):
 
     search: str | None = None
     dataset_ids: list[str] = Field(default_factory=list)
+    #: Only these fields: the ones ticked one by one, e.g. the promising few of a dataset.
+    field_ids: list[str] = Field(default_factory=list)
     category_ids: list[str] = Field(default_factory=list)
     field_types: list[str] = Field(default_factory=list)
 
@@ -120,6 +122,9 @@ class FieldFilter(BaseModel):
 
     #: Only fields found in no other synced region, region ``ALL`` included.
     region_exclusive: bool = False
+
+    #: Only BRAIN's Fast D1 fields, the ones named ``…_fast_d1``.
+    fast_d1: bool = False
 
     #: ``smart`` (ranked words) or ``text`` (literal substring).
     search_mode: str = SMART
@@ -170,6 +175,7 @@ class FieldFilter(BaseModel):
 
         for column, values in (
             ("dataset_id", self.dataset_ids),
+            ("field_id", self.field_ids),
             ("category_id", self.category_ids),
             ("field_type", self.field_types),
         ):
@@ -212,7 +218,14 @@ class FieldFilter(BaseModel):
             )
             params.extend([scope.instrument_type, scope.region])
 
+        if self.fast_d1:
+            clauses.append(FAST_D1_CLAUSE)
+
         return " AND ".join(clauses), params
+
+
+#: A Fast D1 field, by its name: ``_`` is a wildcard to LIKE, so it is escaped.
+FAST_D1_CLAUSE = "field_id LIKE '%" + FAST_D1_SUFFIX.replace("_", "\\_") + "' ESCAPE '\\'"
 
 
 class CatalogQueries:
@@ -434,6 +447,20 @@ class CatalogQueries:
         )
         return {str(r["dataset_id"]): r for r in rows}
 
+    async def dataset_categories(self, dataset_ids: list[str]) -> dict[str, str]:
+        """Each dataset's category: its Pyramid, with a region and delay."""
+        if not dataset_ids:
+            return {}
+        rows = await self.catalog.query(
+            f"""
+            SELECT dataset_id, any_value(category_id) AS category_id FROM data_set
+            WHERE dataset_id IN ({", ".join("?" for _ in dataset_ids)}) AND category_id IS NOT NULL
+            GROUP BY dataset_id
+            """,  # noqa: S608
+            dataset_ids,
+        )
+        return {str(r["dataset_id"]): str(r["category_id"]) for r in rows}
+
     async def sole_datasets(self, field_ids: list[str]) -> dict[str, str]:
         """Each field's dataset where every market agrees on it. ``revenue`` is fundamental6 in
         USA and fundamental23 elsewhere, so a field like that is left out."""
@@ -591,9 +618,12 @@ class CatalogQueries:
         what pressing it would make it. Region Agnostic and Region Exclusive cannot both hold
         (a field in region ALL is in another region), so pressing one lets go of the other.
         """
-        # Both counted in one pass over the scope, each with its own clause as ``where`` writes
-        # it: the same counts as one query per toggle, measured.
-        base = active.model_copy(update={"region_agnostic": False, "region_exclusive": False})
+        # All counted in one pass over the scope, each with its own clause as ``where`` writes
+        # it: the same counts as one query per toggle, measured. Fast D1 combines with either
+        # region toggle, so each count keeps whichever of the other kind is pressed.
+        base = active.model_copy(
+            update={"region_agnostic": False, "region_exclusive": False, "fast_d1": False}
+        )
         where, params = base.where(scope, search=not ranked)
         if scope.region == REGION_AGNOSTIC_REGION:
             agnostic, agnostic_params = "true", []
@@ -603,20 +633,33 @@ class CatalogQueries:
                 "WHERE instrument_type = ? AND region = ?)"
             )
             agnostic_params = [scope.instrument_type, REGION_AGNOSTIC_REGION]
+        exclusive = (
+            "field_id NOT IN (SELECT field_id FROM data_field "
+            "WHERE instrument_type = ? AND region <> ?)"
+        )
+        exclusive_params = [scope.instrument_type, scope.region]
+        fast = FAST_D1_CLAUSE if active.fast_d1 else "true"
+        regional, regional_params = (
+            (agnostic, agnostic_params)
+            if active.region_agnostic
+            else (exclusive, exclusive_params)
+            if active.region_exclusive
+            else ("true", [])
+        )
         rows = await self.catalog.query(
             f"""
-            SELECT count(*) FILTER (WHERE {agnostic}) AS region_agnostic,
-                   count(*) FILTER (WHERE field_id NOT IN (
-                       SELECT field_id FROM data_field WHERE instrument_type = ? AND region <> ?
-                   )) AS region_exclusive
+            SELECT count(*) FILTER (WHERE {agnostic} AND {fast}) AS region_agnostic,
+                   count(*) FILTER (WHERE {exclusive} AND {fast}) AS region_exclusive,
+                   count(*) FILTER (WHERE {FAST_D1_CLAUSE} AND {regional}) AS fast_d1
             FROM {table} WHERE {where}
             """,  # noqa: S608
-            [*agnostic_params, scope.instrument_type, scope.region, *head, *params],
+            [*agnostic_params, *exclusive_params, *regional_params, *head, *params],
         )
         row = rows[0] if rows else {}
         return {
             "region_agnostic": int(row.get("region_agnostic") or 0),
             "region_exclusive": int(row.get("region_exclusive") or 0),
+            "fast_d1": int(row.get("fast_d1") or 0),
         }
 
     async def stats(self, scope: Tuple4) -> dict[str, Any]:

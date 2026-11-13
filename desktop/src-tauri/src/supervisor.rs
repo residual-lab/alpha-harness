@@ -14,12 +14,13 @@
 //! an install it made carries straight over.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,24 +47,40 @@ const PID_VARIABLE: &str = "ALPHA_HARNESS_LAUNCHER_PID";
 /// Tells the app a window of its own is showing it, so it opens no browser.
 const SHELL_VARIABLE: &str = "ALPHA_HARNESS_SHELL";
 
+/// The wheel's SHA-256 as CI hashed it while building this program, for its own version: the
+/// first install is checked against it, whatever the release's files say by then.
+const BUILT_WHEEL_SHA256: Option<&str> = option_env!("ALPHA_HARNESS_WHEEL_SHA256");
+
 const REQUEST_FILE: &str = "update-request.json";
 const ERROR_FILE: &str = "update-error.json";
-/// Written by the app once it serves, naming its version.
+/// Written by the app once it serves, naming its version and the port it serves on.
 const SERVED_FILE: &str = "served.json";
 /// The version that last installed itself over an older install, so it tries once only.
 const OUTGROWN_FILE: &str = "launcher-upgrade.txt";
 const ACTIVE_FILE: &str = "active-slot.txt";
 const LOCK_FILE: &str = "running.lock";
+/// This program's path, for an app the old launcher started to hand over to.
+const DESKTOP_FILE: &str = "desktop-app.txt";
+/// How long the folder's lock is waited for. An app the old launcher started opens this program
+/// and exits, and the old launcher lets go of the lock only once it sees that.
+const CLAIM_WAIT: Duration = Duration::from_secs(15);
 const LOG_FILE: &str = "launcher.log";
 /// Past this the log starts afresh beside one previous file: the app writes to it as it works.
 const LOG_LIMIT: u64 = 10 * 1024 * 1024;
 /// What a failure box reads from the end of the log: plenty for its last lines.
 const LOG_TAIL: u64 = 64 * 1024;
-/// Where the app serves; kept in step with `alpha_harness.__main__`.
+/// How long the app's last lines are waited for once it has exited: a process it started may
+/// hold its output open for good.
+const DRAIN: Duration = Duration::from_secs(2);
+/// Where the app serves unless another program holds it, and where a release from before
+/// [`SERVED_FILE`] named a port always serves; kept in step with `alpha_harness.__main__`.
 const APP_PORT: u16 = 8000;
 const SLOTS: [&str; 2] = ["a", "b"];
 /// Long enough for a cold `uv` to fetch `CPython` and ~330 MB of wheels on a slow line.
 const INSTALL_TIMEOUT: Duration = Duration::from_mins(30);
+/// Tries at the whole install before giving up: a slow line drops a download now and then, and
+/// uv's cache keeps whatever already arrived.
+const INSTALL_ATTEMPTS: u32 = 3;
 /// How long the app is given to close itself before it is terminated. Worth waiting for: a
 /// clean exit unwinds uvicorn's lifespan, which releases `DuckDB`'s single-writer lock.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -171,12 +188,84 @@ fn stamp() -> String {
 
 /// Append to the log: the window shows the app, so this file is the only account of a run.
 pub fn note(message: &str) {
-    if let Ok(mut log) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root().join(LOG_FILE))
-    {
-        let _ = writeln!(log, "{} {message}", stamp());
+    let line = format!("{} {message}\n", stamp());
+    log()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .append(line.as_bytes());
+}
+
+/// The log's one writer, for this program's notes and the app's output alike: starting afresh is
+/// then a rename between two whole lines, and nothing written meanwhile is lost.
+struct Log {
+    path: PathBuf,
+    file: Option<File>,
+    /// Bytes since it last started afresh, or tried to.
+    written: u64,
+    limit: u64,
+}
+
+impl Log {
+    fn new(path: PathBuf, limit: u64) -> Self {
+        Self {
+            path,
+            file: None,
+            written: 0,
+            limit,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        if self.file.is_none() {
+            self.file = open_log(&self.path);
+            self.written = self
+                .file
+                .as_ref()
+                .and_then(|file| file.metadata().ok())
+                .map_or(0, |meta| meta.len());
+        }
+        if let Some(file) = &mut self.file
+            && file.write_all(bytes).is_ok()
+        {
+            self.written += bytes.len() as u64;
+        }
+        if self.written > self.limit {
+            // Closed first: Windows renames no file that is open.
+            self.file = None;
+            let mut previous = self.path.clone().into_os_string();
+            previous.push(".1");
+            let _ = fs::rename(&self.path, previous);
+            // Counted afresh even if another program holding it kept it from being renamed, so
+            // that is tried again a whole log later rather than on every line.
+            self.file = open_log(&self.path);
+            self.written = 0;
+        }
+    }
+}
+
+fn open_log(path: &Path) -> Option<File> {
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+fn log() -> &'static Mutex<Log> {
+    static LOG: OnceLock<Mutex<Log>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(Log::new(root().join(LOG_FILE), LOG_LIMIT)))
+}
+
+/// Copy one of the app's streams into the log a whole line at a time, so a line of its stdout
+/// never lands inside one of its stderr, nor the log starts afresh in the middle of one.
+fn pump(pipe: impl Read, log: &Mutex<Log>) {
+    let mut pipe = BufReader::new(pipe);
+    let mut line = Vec::new();
+    while pipe.read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
+        // The last one, cut short by the app's exit.
+        if !line.ends_with(b"\n") {
+            line.push(b'\n');
+        }
+        log.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .append(&line);
+        line.clear();
     }
 }
 
@@ -202,18 +291,6 @@ fn recent(lines: usize) -> String {
             all[all.len().saturating_sub(lines)..].join("\n")
         }
         Err(error) => format!("(the log could not be read: {error})"),
-    }
-}
-
-/// Start the log afresh once it passes [`LOG_LIMIT`], keeping the one before. Copied and
-/// emptied rather than renamed: a running app appends to this very file for weeks on end.
-fn rotate_log() {
-    let log = root().join(LOG_FILE);
-    if fs::metadata(&log).is_ok_and(|m| m.len() > LOG_LIMIT)
-        && fs::copy(&log, root().join(format!("{LOG_FILE}.1"))).is_ok()
-        && let Ok(file) = OpenOptions::new().write(true).open(&log)
-    {
-        let _ = file.set_len(0);
     }
 }
 
@@ -363,6 +440,14 @@ fn requested_wheel(version: &str) -> Option<String> {
         .filter(|url| url.starts_with(&release) && !url.contains(".."))
 }
 
+/// The wheel's SHA-256 as the app read it off the release, given as GitHub gives an asset's
+/// digest: `sha256:` and the hash in hex.
+fn requested_digest() -> Option<String> {
+    text_of(&read_json(&root().join(REQUEST_FILE)), "wheelDigest")
+        .and_then(|digest| digest.strip_prefix("sha256:").map(str::to_ascii_lowercase))
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Orders dated releases and their candidates: `2026.10.1rc1 < 2026.10.1rc2 < 2026.10.1 <
 /// 2026.10.1.1`. A candidate is never newer than its release, and the release is newer than it.
 fn release_of(version: &str) -> (Vec<u64>, bool, u64) {
@@ -476,11 +561,17 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Run `uv`, its errors into the log; give up after [`INSTALL_TIMEOUT`].
-fn run_uv(uv: &Path, arguments: &[&str]) -> Result<(), String> {
+/// Run `uv`, its progress on the start-up page and its errors into the log; give up after
+/// [`INSTALL_TIMEOUT`].
+fn run_uv(app: &AppHandle, uv: &Path, arguments: &[&str], downloads: u32) -> Result<(), String> {
     let mut command = Command::new(uv);
     command
         .args(arguments)
+        // uv's 30 s default failed first installs on slow lines; two minutes still bounds a
+        // stalled connection, and fewer downloads at once do not starve each other.
+        .env("UV_HTTP_TIMEOUT", "120")
+        .env("UV_HTTP_RETRIES", "5")
+        .env("UV_CONCURRENT_DOWNLOADS", downloads.to_string())
         // uv keeps its Python builds and cache inside the folder, so uninstalling is deleting
         // one folder and nothing is left behind in the user's profile.
         .env("UV_PYTHON_INSTALL_DIR", root().join("python"))
@@ -501,13 +592,28 @@ fn run_uv(uv: &Path, arguments: &[&str]) -> Result<(), String> {
     if !job::adopt(&child) {
         note("could not tie uv to this program's lifetime");
     }
-    let mut stderr = child.stderr.take();
+    let stderr = child.stderr.take();
+    let page = app.clone();
     let reader = thread::spawn(move || {
         let mut text = String::new();
-        if let Some(stderr) = stderr.as_mut() {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            text = String::from_utf8_lossy(&bytes).into_owned();
+        let Some(stderr) = stderr else { return text };
+        let mut stderr = BufReader::new(stderr);
+        let mut line = Vec::new();
+        while stderr
+            .read_until(b'\n', &mut line)
+            .is_ok_and(|read| read > 0)
+        {
+            let piece = String::from_utf8_lossy(&line);
+            // Shown as it arrives, so nobody closes an install that is still moving.
+            let shown = piece.trim();
+            if ["Download", "Resolved", "Prepared", "Installed"]
+                .iter()
+                .any(|step| shown.starts_with(step))
+            {
+                let _ = page.emit("startup-detail", shown);
+            }
+            text.push_str(&piece);
+            line.clear();
         }
         text
     });
@@ -556,7 +662,18 @@ fn run_uv(uv: &Path, arguments: &[&str]) -> Result<(), String> {
 ///
 /// Rebuilding rather than upgrading in place costs no download — the wheels are in uv's
 /// cache from the last install — and a slot never carries a package left by an old version.
-fn install(uv: &Path, slot: &str, version: &str, wheel: Option<String>) -> Result<(), String> {
+///
+/// With the wheel's SHA-256 known, uv refuses a wheel that does not match it and, under
+/// `--require-hashes`, anything the release's constraints leave unhashed. Every dependency is
+/// checked against those constraints either way.
+fn install(
+    app: &AppHandle,
+    uv: &Path,
+    slot: &str,
+    version: &str,
+    wheel: Option<String>,
+    digest: Option<String>,
+) -> Result<(), String> {
     let base = download();
     // A development build installs a wheel built from this checkout (`uv build` leaves
     // constraints.txt beside it), since no release exists for its 0.0.0.
@@ -574,30 +691,66 @@ fn install(uv: &Path, slot: &str, version: &str, wheel: Option<String>) -> Resul
                 .into_owned()
         },
     );
+    // A local wheel is taken as it is: uv reads a hash only off a URL.
+    let sha256 = BUILT_WHEEL_SHA256
+        .filter(|_| version == BUILD_VERSION)
+        .map(str::to_owned)
+        .or(digest)
+        .filter(|_| local.is_none());
     let wheel = local
         .or(wheel)
         .unwrap_or_else(|| format!("{base}/v{version}/alpha_harness-{version}-py3-none-any.whl"));
+    let wheel = match &sha256 {
+        Some(sha256) => format!("{wheel}#sha256={sha256}"),
+        None => wheel,
+    };
     note(&format!("installing {version} from {wheel}"));
     // The marker goes first: a half-built slot must never read as a working one.
     let _ = fs::remove_file(marker(slot));
     let venv = root().join(format!("venv-{slot}"));
-    let _ = fs::remove_dir_all(&venv);
-    run_uv(uv, &["venv", "--python", "3.14", &venv.to_string_lossy()])?;
+    let python = venv_python(slot);
+    let python = python.to_string_lossy();
     // Constrained to the versions the release was locked against, so a dependency publishing a
     // breaking version cannot break an install that worked yesterday.
-    let python = venv_python(slot);
-    run_uv(
-        uv,
-        &[
-            "pip",
-            "install",
-            "--python",
-            &python.to_string_lossy(),
-            "-c",
-            &constraints,
-            &wheel,
-        ],
-    )?;
+    let mut arguments = vec![
+        "pip",
+        "install",
+        "--python",
+        &python,
+        "-c",
+        &constraints,
+        &wheel,
+    ];
+    if sha256.is_some() {
+        arguments.push("--require-hashes");
+    }
+    let mut attempt = 1;
+    loop {
+        let _ = fs::remove_dir_all(&venv);
+        // One download at a time once a try has failed: on a contended line, two still can.
+        let downloads = if attempt == 1 { 2 } else { 1 };
+        let tried = run_uv(
+            app,
+            uv,
+            &["venv", "--python", "3.14", &venv.to_string_lossy()],
+            downloads,
+        )
+        .and_then(|()| run_uv(app, uv, &arguments, downloads));
+        match tried {
+            Err(error) if attempt < INSTALL_ATTEMPTS && !QUITTING.load(Ordering::SeqCst) => {
+                note(&format!("install attempt {attempt} failed: {error}"));
+                attempt += 1;
+                status(
+                    app,
+                    &format!(
+                        "The download was interrupted. Trying again ({attempt} of \
+                         {INSTALL_ATTEMPTS}), one file at a time…"
+                    ),
+                );
+            }
+            result => break result?,
+        }
+    }
     let body = json!({"version": version, "served": false});
     write_atomic(&marker(slot), body.to_string())
         .map_err(|e| format!("could not record the install: {e}"))?;
@@ -608,7 +761,7 @@ fn install(uv: &Path, slot: &str, version: &str, wheel: Option<String>) -> Resul
 // --- running ----------------------------------------------------------------------------------
 
 /// The app dies with this program however this program dies: on Windows a job object holds it,
-/// so a kill from Task Manager cannot leave it running with `DuckDB`'s lock and port 8000.
+/// so a kill from Task Manager cannot leave it running with `DuckDB`'s lock and its port.
 #[cfg(windows)]
 mod job {
     use std::os::windows::io::AsRawHandle;
@@ -661,6 +814,66 @@ mod job {
     }
 }
 
+/// What blocks until the app has exited, leaving it for [`Child::wait`] to reap: until then its
+/// id is still the app's, so a kill from Quit cannot reach a process that took the id over.
+#[cfg(unix)]
+fn exit_of(child: &Child) -> impl FnOnce() + Send + 'static {
+    let pid = child.id();
+    move || {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        loop {
+            // SAFETY: waitid only writes the siginfo_t it is pointed at, which outlives the call.
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if waited == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn exit_of(child: &Child) -> impl FnOnce() + Send + 'static {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+
+    use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+    // A handle of its own, open for as long as the wait, wherever the `Child` is by then.
+    let process = child.as_handle().try_clone_to_owned();
+    move || {
+        if let Ok(process) = process {
+            // SAFETY: a live process handle, owned by this closure.
+            unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
+        }
+    }
+}
+
+/// A thread of the supervisor's own, named for a debugger or `top -H`.
+fn worker(name: &str, work: impl FnOnce() + Send + 'static) {
+    if let Err(error) = thread::Builder::new().name(name.to_owned()).spawn(work) {
+        note(&format!("could not start {name}: {error}"));
+    }
+}
+
+/// Copy one of the app's streams into the log on a thread of its own, which lets go of `done`
+/// once the stream ends.
+fn copy_to_log(name: &str, pipe: Option<impl Read + Send + 'static>, done: Sender<()>) {
+    if let Some(pipe) = pipe {
+        worker(name, move || {
+            pump(pipe, log());
+            drop(done);
+        });
+    }
+}
+
 fn open(app: &AppHandle, url: Url) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.navigate(url);
@@ -681,32 +894,38 @@ pub fn remember_splash(url: Url) {
     let _ = SPLASH.set(url);
 }
 
-fn navigate(app: &AppHandle) {
-    match Url::parse(&format!("http://127.0.0.1:{APP_PORT}")) {
+fn navigate(app: &AppHandle, port: u16) {
+    match Url::parse(&format!("http://127.0.0.1:{port}")) {
         Ok(url) => open(app, url),
         Err(error) => note(&format!("could not open the app: {error}")),
     }
 }
 
-/// Whether port 8000 is free for the app. Taken by another program, the app could only fail,
-/// and a fresh update would be wrongly rolled back for it.
-fn port_free() -> bool {
-    // A backend that just exited for an update may take a moment to let go of it.
+/// The version the app serves and the port it serves on, once it does.
+fn served_at(body: &Map<String, Value>) -> Option<(String, u16)> {
+    let version = text_of(body, "version")?;
+    let port = body
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0);
+    Some((version, port.unwrap_or(APP_PORT)))
+}
+
+/// Give a backend that just exited a moment to let go of port 8000, so the next one serves at
+/// the same address and its page keeps what it stored there. Held by any other program, the app
+/// serves on a port of its own.
+fn await_port() {
     let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], APP_PORT))).is_ok() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
+    while TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], APP_PORT))).is_err()
+        && Instant::now() < deadline
+    {
         thread::sleep(POLL);
     }
 }
 
 /// Run the app to completion, its output in the log. Returns its exit code.
 fn start(app: &AppHandle, slot: &str) -> i32 {
-    rotate_log();
     note(&format!("starting app from slot {slot}"));
     let served = root().join(SERVED_FILE);
     // Left behind, the last run's would take the app's page to a server not yet listening.
@@ -715,24 +934,6 @@ fn start(app: &AppHandle, slot: &str) -> i32 {
     {
         note(&format!("could not clear {SERVED_FILE}: {error}"));
     }
-    let log = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root().join(LOG_FILE))
-    {
-        Ok(log) => log,
-        Err(error) => {
-            note(&format!("could not open the log for the app: {error}"));
-            return 1;
-        }
-    };
-    let errors = match log.try_clone() {
-        Ok(errors) => errors,
-        Err(error) => {
-            note(&format!("could not open the log for the app: {error}"));
-            return 1;
-        }
-    };
     let mut command = Command::new(venv_pythonw(slot));
     command
         .args(["-m", "alpha_harness"])
@@ -748,9 +949,10 @@ fn start(app: &AppHandle, slot: &str) -> i32 {
         .env_remove("PYTHONHOME")
         .env_remove("PYTHONPATH")
         .stdin(Stdio::null())
-        .stdout(log)
-        .stderr(errors);
-    let child = match quiet(&mut command).spawn() {
+        // Through this program, the log's one writer, so it can start afresh losing nothing.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match quiet(&mut command).spawn() {
         Ok(child) => child,
         // Antivirus holding a freshly installed pythonw.exe, say. A failed exit rather than a
         // panic, so the caller can still roll back and say why.
@@ -763,73 +965,89 @@ fn start(app: &AppHandle, slot: &str) -> i32 {
     if !job::adopt(&child) {
         note("could not tie the app to this program's lifetime");
     }
+    // Every sender is gone once the app has exited and its last lines are in the log.
+    let (exited, events) = mpsc::channel();
+    copy_to_log("app-stdout", child.stdout.take(), exited.clone());
+    copy_to_log("app-stderr", child.stderr.take(), exited.clone());
+    let exit = exit_of(&child);
     if let Ok(mut held) = CHILD.lock() {
         // Quit chosen while it was starting found nothing to close, so it is closed here.
         if QUITTING.load(Ordering::SeqCst) {
             drop(held);
-            let mut child = child;
             let _ = child.kill();
             let _ = child.wait();
             return 0;
         }
         *held = Some(child);
     }
+    worker("app-waiter", move || {
+        exit();
+        let _ = exited.send(());
+    });
+    // Until it serves, served.json is looked for every so often; after, only the app's exit
+    // wakes this thread.
     let mut navigated = false;
-    let mut rotated = Instant::now();
-    let code = loop {
-        let exited = CHILD.lock().ok().and_then(|mut held| {
-            let finished = held.as_mut().map(Child::try_wait);
-            match finished {
-                Some(Ok(Some(status))) => {
-                    *held = None;
-                    Some(status.code().unwrap_or(-1))
-                }
-                Some(Err(error)) => {
-                    note(&format!("lost track of the app: {error}"));
-                    *held = None;
-                    Some(-1)
-                }
-                // Taken by Quit, which waits on it itself.
-                None => Some(0),
-                Some(Ok(None)) => None,
-            }
-        });
-        if let Some(code) = exited {
-            break code;
-        }
+    while let Err(RecvTimeoutError::Timeout) =
+        events.recv_timeout(if navigated { Duration::MAX } else { POLL })
+    {
         // Proven as soon as it serves: a tray app can run for weeks before it ever exits.
-        if !navigated && !QUITTING.load(Ordering::SeqCst) {
-            let version = text_of(&read_json(&served), "version");
-            if version.is_some() {
-                if version == slot_version(slot) {
-                    prove(slot);
-                }
-                navigate(app);
-                navigated = true;
+        if !QUITTING.load(Ordering::SeqCst)
+            && let Some((version, port)) = served_at(&read_json(&served))
+        {
+            if Some(version) == slot_version(slot) {
+                prove(slot);
             }
+            navigate(app, port);
+            navigated = true;
         }
-        if rotated.elapsed() > Duration::from_mins(1) {
-            rotate_log();
-            rotated = Instant::now();
-        }
-        thread::sleep(POLL);
-    };
+    }
+    let code = reap();
+    // Its last lines, a traceback say, belong in the log before anything reads it.
+    let _ = events.recv_timeout(DRAIN);
     // Gone with the run it describes, so nothing later reads it as the next one's.
     let _ = fs::remove_file(&served);
     note(&format!("app exited {code}"));
     code
 }
 
+/// The exit code of the app, which only this thread reaps: Quit merely kills it. A wait that ended
+/// early, as macOS's does for a process that is only stopped, is made up for by looking again
+/// every so often, the app still in [`CHILD`] for Quit to reach.
+fn reap() -> i32 {
+    loop {
+        let Ok(mut held) = CHILD.lock() else {
+            return -1;
+        };
+        let Some(child) = held.as_mut() else {
+            return 0;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                *held = None;
+                return status.code().unwrap_or(-1);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                note(&format!("lost track of the app: {error}"));
+                *held = None;
+                return -1;
+            }
+        }
+        drop(held);
+        thread::sleep(POLL);
+    }
+}
+
 /// One `POST /api/quit`, and whether the app took it. HTTP because a windowed process on Windows
 /// has no graceful signal, and terminating it skips the shutdown that closes `DuckDB`.
-fn ask_to_quit() -> std::io::Result<bool> {
-    let address = SocketAddr::from(([127, 0, 0, 1], APP_PORT));
+fn ask_to_quit(port: u16) -> std::io::Result<bool> {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     // The app refuses a write without X-Harness-Client; this program is a client like any.
     stream.write_all(
         format!(
-            "POST /api/quit HTTP/1.1\r\nHost: 127.0.0.1:{APP_PORT}\r\nX-Harness-Client: 1\r\n\
+            "POST /api/quit HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Harness-Client: 1\r\n\
              Content-Length: 0\r\nConnection: close\r\n\r\n"
         )
         .as_bytes(),
@@ -848,15 +1066,19 @@ fn close_app() {
     let mut deadline = Instant::now() + START_TIMEOUT;
     let mut asked = false;
     loop {
-        // Nothing of ours is running: port 8000, if anyone holds it, is some other program.
+        // Nothing of ours is running: whatever holds its port is some other program.
         if CHILD.lock().map_or(true, |held| held.is_none()) {
             return;
         }
         if Instant::now() >= deadline {
             break;
         }
-        // Only once it serves: before then port 8000 may answer for some other program.
-        if !asked && root().join(SERVED_FILE).exists() && ask_to_quit().is_ok_and(|took| took) {
+        // Only once it serves, at the port it names: before then that port may answer for some
+        // other program.
+        if !asked
+            && let Some((_, port)) = served_at(&read_json(&root().join(SERVED_FILE)))
+            && ask_to_quit(port).is_ok_and(|took| took)
+        {
             note("asked the app to close");
             asked = true;
             deadline = Instant::now() + QUIT_TIMEOUT;
@@ -864,12 +1086,11 @@ fn close_app() {
         thread::sleep(POLL);
     }
     note("the app did not close in time; terminating it");
-    if let Ok(mut held) = CHILD.lock() {
-        if let Some(child) = held.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        *held = None;
+    // Not reaped here: the supervisor, waiting on it, does that once it has gone.
+    if let Ok(mut held) = CHILD.lock()
+        && let Some(child) = held.as_mut()
+    {
+        let _ = child.kill();
     }
 }
 
@@ -897,9 +1118,9 @@ pub fn quit(app: &AppHandle) {
 
 /// Whether this process may run, or another launcher already holds the folder.
 ///
-/// Two of them would run `uv` over one venv, race for port 8000 and open `DuckDB` twice, which is
-/// a corrupted install rather than a slow one. A second copy of this program is stopped by the
-/// single-instance plugin before it gets here; this catches the older Python launcher.
+/// Two of them would run `uv` over one venv and open `DuckDB` twice, which is a corrupted install
+/// rather than a slow one. A second copy of this program is stopped by the single-instance
+/// plugin before it gets here; this catches the older Python launcher.
 fn claim() -> bool {
     let file = match OpenOptions::new()
         .read(true)
@@ -933,6 +1154,7 @@ fn claim() -> bool {
 }
 
 fn supervise(app: &AppHandle, uv: &Path) -> i32 {
+    let mut restarting = false;
     loop {
         let mut slot = active();
         let running = slot_version(slot);
@@ -965,7 +1187,8 @@ fn supervise(app: &AppHandle, uv: &Path) -> i32 {
                     )
                 },
             );
-            match install(uv, target, &wanted, requested_wheel(&wanted)) {
+            let wheel = requested_wheel(&wanted);
+            match install(app, uv, target, &wanted, wheel, requested_digest()) {
                 Ok(()) => {
                     activate(target);
                     slot = target;
@@ -996,18 +1219,12 @@ fn supervise(app: &AppHandle, uv: &Path) -> i32 {
             return 0;
         }
 
-        if !port_free() {
-            fail(
-                app,
-                &format!(
-                    "Another program is using port {APP_PORT}, which Alpha Harness needs. Close \
-                     it, then open Alpha Harness again."
-                ),
-            );
-            return 1;
+        if restarting {
+            await_port();
         }
         status(app, "Starting Alpha Harness…");
         let code = start(app, slot);
+        restarting = true;
         if QUITTING.load(Ordering::SeqCst) {
             note("closed from the tray");
             return 0;
@@ -1057,7 +1274,16 @@ fn run(app: &AppHandle) -> i32 {
         return 1;
     }
     note(&format!("Alpha Harness {BUILD_VERSION} (desktop)"));
-    if !claim() {
+    let deadline = Instant::now() + CLAIM_WAIT;
+    let mut claimed = claim();
+    if !claimed {
+        status(app, "Waiting for the previous launcher to close…");
+    }
+    while !claimed && Instant::now() < deadline {
+        thread::sleep(POLL);
+        claimed = claim();
+    }
+    if !claimed {
         let message = if SLOTS.into_iter().any(|s| slot_version(s).is_some()) {
             "Alpha Harness is already running from its previous launcher, or an install it began is \
              still finishing. Quit it from its tray icon or the account menu, or wait a minute, \
@@ -1068,6 +1294,12 @@ fn run(app: &AppHandle) -> i32 {
         };
         fail(app, message);
         return 0;
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Err(error) =
+            write_atomic(&root().join(DESKTOP_FILE), exe.to_string_lossy().as_bytes())
+    {
+        note(&format!("could not record where this program is: {error}"));
     }
     #[cfg(target_os = "linux")]
     forget_old_launcher();
@@ -1092,5 +1324,179 @@ pub fn spawn(app: AppHandle) {
         });
     if let Err(error) = started {
         note(&format!("could not start the supervisor: {error}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    /// The app, as the tests below run it: this test binary again, writing to the pipes they read.
+    /// Run by itself, it does nothing.
+    #[test]
+    fn child() {
+        let Ok(task) = std::env::var("ALPHA_HARNESS_TEST_CHILD") else {
+            return;
+        };
+        if let Some(lines) = task.strip_prefix("lines ") {
+            // Turn about, so both streams end together and the last lines of each are kept.
+            for number in 0..lines.parse().unwrap() {
+                std::io::stdout()
+                    .write_all(line('o', number).as_bytes())
+                    .unwrap();
+                std::io::stderr()
+                    .write_all(line('e', number).as_bytes())
+                    .unwrap();
+            }
+        } else {
+            thread::sleep(Duration::from_mins(1));
+        }
+        // Gone before the test harness can report into the very pipes being read.
+        std::process::exit(0);
+    }
+
+    fn line(tag: char, number: usize) -> String {
+        format!("{tag} {number:08} {}\n", "x".repeat(number % 97))
+    }
+
+    fn run_child(task: &str) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "supervisor::tests::child", "--quiet"])
+            .env("ALPHA_HARNESS_TEST_CHILD", task)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("alpha-harness-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A child writing as fast as it can to both pipes, this program's notes in between, and a
+    /// log of `limit` bytes: the first and one past the last line kept of each, from the log and
+    /// the one before it, having checked that from the first kept none is missing or cut.
+    fn stress(name: &str, lines: usize, limit: u64) -> HashMap<String, (usize, usize)> {
+        let dir = scratch(name);
+        let path = dir.join(LOG_FILE);
+        let log = Mutex::new(Log::new(path.clone(), limit));
+        let mut child = run_child(&format!("lines {lines}"));
+        let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+        thread::scope(|scope| {
+            scope.spawn(|| pump(stdout, &log));
+            scope.spawn(|| pump(stderr, &log));
+            for number in 0..lines / 10 {
+                log.lock().unwrap().append(line('n', number).as_bytes());
+            }
+        });
+        assert!(child.wait().unwrap().success());
+        let mut kept = fs::read_to_string(dir.join(format!("{LOG_FILE}.1"))).unwrap();
+        kept.push_str(&fs::read_to_string(&path).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+
+        let mut streams = HashMap::<String, (usize, usize)>::new();
+        // The test harness's own, before the child's first line.
+        let harness = |text: &&str| text.is_empty() || *text == "running 1 test";
+        for text in kept.lines().filter(|text| !harness(text)) {
+            let (tag, rest) = text.split_once(' ').expect(text);
+            let number = rest.split_once(' ').and_then(|(n, _)| n.parse().ok());
+            let number = number.expect(text);
+            let tag_char = tag.chars().next().unwrap();
+            assert_eq!(format!("{text}\n"), line(tag_char, number), "cut or mixed");
+            let (_, next) = streams.entry(tag.to_owned()).or_insert((number, number));
+            assert_eq!(number, *next, "lost before {text}");
+            *next += 1;
+        }
+        streams
+    }
+
+    #[test]
+    fn the_log_starts_afresh_losing_nothing() {
+        // Small enough to start afresh once: every line is kept, in the log or the one before.
+        let streams = stress("log-once", 2000, 160 * 1024);
+        assert_eq!(streams["o"], (0, 2000));
+        assert_eq!(streams["e"], (0, 2000));
+        assert_eq!(streams["n"], (0, 200));
+    }
+
+    #[test]
+    fn the_log_starts_afresh_many_times_cutting_no_line() {
+        // Some 5 MB through a log of 256 kB: older lines go with each file before last, by design.
+        let streams = stress("log-many", 40_000, 256 * 1024);
+        assert_eq!(streams["o"].1, 40_000);
+        assert_eq!(streams["e"].1, 40_000);
+        assert!(
+            streams["o"].0 > 0 && streams["e"].0 > 0,
+            "started afresh only once"
+        );
+    }
+
+    #[test]
+    fn exit_is_seen_and_left_to_reap() {
+        let mut child = run_child("sleep");
+        let (seen, exited) = mpsc::channel();
+        let exit = exit_of(&child);
+        thread::spawn(move || {
+            exit();
+            seen.send(()).unwrap();
+        });
+        assert!(exited.recv_timeout(Duration::from_millis(300)).is_err());
+        child.kill().unwrap();
+        exited.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Exited but not reaped, Quit's kill still reaches it, and only `Child::wait` reaps it.
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn served_names_the_port_or_means_8000() {
+        let dir = scratch("served");
+        let served = |text: &str| {
+            fs::write(dir.join(SERVED_FILE), text).unwrap();
+            served_at(&read_json(&dir.join(SERVED_FILE)))
+        };
+        let at = |version: &str, port| Some((version.to_owned(), port));
+        assert_eq!(
+            served(r#"{"version": "2026.11.10", "port": 54321}"#),
+            at("2026.11.10", 54321)
+        );
+        // What every release before the port was named writes.
+        assert_eq!(
+            served(r#"{"version": "2026.10.21"}"#),
+            at("2026.10.21", 8000)
+        );
+        assert_eq!(served(r#"{"version": "1", "port": 0}"#), at("1", 8000));
+        assert_eq!(served(r#"{"version": "1", "port": 65536}"#), at("1", 8000));
+        assert_eq!(served(r#"{"version": "1", "port": "8001"}"#), at("1", 8000));
+        assert_eq!(served(r#"{"port": 8001}"#), None);
+        // Read mid-write.
+        assert_eq!(served(r#"{"version": "2026.11"#), None);
+        assert_eq!(served(""), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_app_may_use_ipc_on_any_local_port() {
+        let capability: Value =
+            serde_json::from_str(include_str!("../capabilities/app.json")).unwrap();
+        let patterns: Vec<tauri::utils::acl::RemoteUrlPattern> = capability["remote"]["urls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|url| url.as_str().unwrap().parse().unwrap())
+            .collect();
+        let allowed = |url: &str| patterns.iter().any(|p| p.test(&url.parse().unwrap()));
+        assert!(allowed("http://127.0.0.1:8000/"));
+        assert!(allowed("http://127.0.0.1:54321/tasks?id=7#top"));
+        assert!(!allowed("https://127.0.0.1:8000/"));
+        assert!(!allowed("http://localhost:8000/"));
+        assert!(!allowed("http://127.0.0.2:8000/"));
+        assert!(!allowed("http://127.0.0.1.example.com:8000/"));
     }
 }

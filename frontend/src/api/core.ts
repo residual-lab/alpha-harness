@@ -49,6 +49,13 @@ export const today = {
   bar: () => http.get<BarStatus>('/api/today/bar'),
 }
 
+/** What a person sends when they ask for help. */
+export const diagnostics = {
+  /** A scrubbed zip of the version, the system and the end of the log, saved in Downloads. */
+  export: () => http.post<Schemas['Exported']>('/api/diagnostics/export'),
+  openLogs: () => http.post<void>('/api/diagnostics/open-logs'),
+}
+
 export const auth = {
   /** Omit both to sign in with the stored credential. */
   login: (email?: string, password?: string) =>
@@ -59,6 +66,7 @@ export const auth = {
   /** Close a paused sign-in's identity check. Answering early is normal: the session comes
    *  back unauthenticated and still carrying the inquiry. */
   verify: (inquiry: string) => http.post<Session>('/api/auth/verify', { inquiry }),
+  newCheck: () => http.post<Session>('/api/auth/new-check'),
   logout: () => http.post<Session>('/api/auth/logout'),
   /** Legal values for every settings field, given what is chosen. Keys use BRAIN's names. */
   settingsOptions: (settings: Record<string, unknown>) =>

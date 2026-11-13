@@ -3,11 +3,10 @@
  */
 
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { ShieldCheckIcon } from 'lucide-react'
+import { RotateCcwIcon, ShieldCheckIcon } from 'lucide-react'
 import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { auth } from '@/api/core'
-import { ApiError } from '@/api/http'
-import { useLive } from '@/lib/live'
+import { ApiError, errorMessage } from '@/api/http'
 import { Button, ErrorNotice, Field, Input, Notice } from '@/ui/kit'
 
 /** How often the app asks BRAIN whether the identity check has been accepted. */
@@ -52,7 +51,6 @@ export function SignIn({ storedEmail }: { storedEmail: string | null }) {
     },
     onSuccess: () => {
       setPassword('')
-      useLive.setState({ verificationUrl: null })
       void queryClient.invalidateQueries()
     },
   })
@@ -65,7 +63,6 @@ export function SignIn({ storedEmail }: { storedEmail: string | null }) {
 
   const done = () => {
     setPassword('')
-    useLive.setState({ verificationUrl: null })
     signIn.reset()
     void queryClient.invalidateQueries()
   }
@@ -176,52 +173,80 @@ export function SignIn({ storedEmail }: { storedEmail: string | null }) {
  * of its own, and this asks BRAIN every couple of seconds whether it has been accepted —
  * which is what lets the sign-in finish by itself rather than asking for the password again.
  */
-function Verification({
+export function Verification({
   url,
   inquiry,
   onVerified,
 }: {
-  url: string
-  inquiry: string
+  /** Both null once the check expired unfinished: the person starts a new one. */
+  url: string | null
+  inquiry: string | null
   onVerified: () => void
 }) {
+  const [check, setCheck] = useState(url && inquiry ? { url, inquiry } : null)
   const [waiting, setWaiting] = useState(false)
   const [problem, setProblem] = useState<string | null>(null)
   const popup = useRef<Window | null>(null)
 
+  // The check the backend waits on wins: one that expired, or one started in another tab.
   useEffect(() => {
-    if (!waiting) return
+    setCheck((held) =>
+      url && inquiry ? (held?.inquiry === inquiry ? held : { url, inquiry }) : null,
+    )
+  }, [url, inquiry])
+
+  const pending = check?.inquiry
+  useEffect(() => {
+    if (!waiting || !pending) return
     let stopped = false
+    const stop = () => {
+      stopped = true
+      clearInterval(timer)
+    }
     const timer = setInterval(async () => {
       try {
-        const session = await auth.verify(inquiry)
+        const session = await auth.verify(pending)
         if (stopped) return
         if (session.authenticated) {
-          stopped = true
-          clearInterval(timer)
+          stop()
           popup.current?.close()
           onVerified()
+        } else if (session.verificationExpired) {
+          // Asking again can never succeed: the person starts a new check instead.
+          stop()
+          setWaiting(false)
+          setCheck(null)
         }
       } catch (error) {
         // Asking early is normal and answers unauthenticated; a real failure stops the wait
         // rather than polling BRAIN forever.
-        stopped = true
-        clearInterval(timer)
+        stop()
         setWaiting(false)
         setProblem(error instanceof ApiError ? error.message : 'The check could not be read.')
       }
     }, VERIFY_EVERY_MS)
-    return () => {
-      stopped = true
-      clearInterval(timer)
-    }
-  }, [waiting, inquiry, onVerified])
+    return stop
+  }, [waiting, pending, onVerified])
+
+  // One sign-in per press: each spends BRAIN's lockout budget. The new check then opens from
+  // its own button, since a window opened after the wait would be blocked as a pop-up.
+  const newCheck = useMutation({
+    mutationFn: auth.newCheck,
+    onSuccess: (session) => {
+      if (session.authenticated) onVerified()
+      else if (session.verificationUrl && session.inquiry)
+        setCheck({ url: session.verificationUrl, inquiry: session.inquiry })
+      else setProblem(session.detail || 'BRAIN did not start a new check. Sign in again.')
+    },
+    onError: (error) => setProblem(errorMessage(error)),
+  })
 
   const open = () => {
+    if (!check) return
     setProblem(null)
     setWaiting(true)
     // Named, so a second click returns to the window already open rather than making another.
-    popup.current = window.open(url, 'brain-identity-check', 'width=520,height=760')
+    popup.current = window.open(check.url, 'brain-identity-check', 'width=520,height=760')
     if (!popup.current) {
       setWaiting(false)
       setProblem(
@@ -230,13 +255,40 @@ function Verification({
     }
   }
 
+  if (!check) {
+    return (
+      <Notice tone="warn" title="BRAIN's identity check expired">
+        <div className="flex flex-col gap-3">
+          <p>
+            It closed before it was finished. A new one opens the same way, with no password to
+            type. Queued work waits until BRAIN accepts it.
+          </p>
+          {problem && <p className="text-status-warning">{problem}</p>}
+          <div>
+            <Button
+              variant="primary"
+              loading={newCheck.isPending}
+              onClick={() => {
+                setProblem(null)
+                newCheck.mutate()
+              }}
+            >
+              <RotateCcwIcon />
+              Start a new check
+            </Button>
+          </div>
+        </div>
+      </Notice>
+    )
+  }
+
   return (
     <Notice tone="warn" title="BRAIN needs to verify your identity">
       <div className="flex flex-col gap-3">
         <p>
           {waiting
-            ? 'Finish the check in the window that opened. This page signs you in as soon as BRAIN accepts it — leave it open.'
-            : 'This happens once. The check opens in its own window; you will not need to type your password again.'}
+            ? 'Finish the check in the window that opened. Alpha Harness carries on as soon as BRAIN accepts it — leave this page open.'
+            : 'The check opens in its own window; you will not need to type your password again. Queued work waits until BRAIN accepts it.'}
         </p>
         {problem && <p className="text-status-warning">{problem}</p>}
         <div className="flex flex-wrap items-center gap-3">

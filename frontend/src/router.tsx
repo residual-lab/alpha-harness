@@ -98,6 +98,7 @@ const settingsSampler = createRoute({
   // is shareable, unlike the multi-item picks that use a handoff store.
   validateSearch: (search: Record<string, unknown>) => ({
     alpha: typeof search['alpha'] === 'string' ? search['alpha'] : undefined,
+    ...(search['sweep'] === 'decay' ? { sweep: 'decay' as const } : {}),
   }),
   component: lazyRouteComponent(
     () => import('@/screens/tools/settings-sampler'),
@@ -127,6 +128,12 @@ const fieldsSampler = createRoute({
     () => import('@/screens/tools/fields-sampler'),
     'FieldsSamplerScreen',
   ),
+})
+
+const pasteAlphas = createRoute({
+  getParentRoute: () => tools,
+  path: 'paste-alphas',
+  component: lazyRouteComponent(() => import('@/screens/tools/paste-alphas'), 'PasteAlphasScreen'),
 })
 
 const tasks = createRoute({ getParentRoute: () => root, path: '/tasks' })
@@ -215,7 +222,7 @@ const routeTree = root.addChildren([
   matrix,
   data,
   labs.addChildren([labsIndex, searchLab, templateLab, evolutionLab, powerPoolLab, superAlphaLab]),
-  tools.addChildren([toolsIndex, settingsSampler, correlationBreaker, fieldsSampler]),
+  tools.addChildren([toolsIndex, settingsSampler, correlationBreaker, fieldsSampler, pasteAlphas]),
   competitionsRoute,
   tasks.addChildren([tasksIndex, taskResults]),
   pool.addChildren([poolIndex, poolTab]),

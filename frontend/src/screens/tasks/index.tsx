@@ -18,6 +18,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
 import { SUPER_ALPHA_SLOTS } from '@/api/platform'
+import { copyFromWorker, copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
 import { DASH, fmt } from '@/lib/format'
 import { useNow } from '@/lib/now'
@@ -28,8 +29,9 @@ import { alphaIds, useDetailSheet } from '@/screens/pool/detail'
 import { MAX_SIMULATIONS } from '@/screens/research-labs/lab-task'
 import { type LabTask, labTasks, type RankedAlpha, TOP_LIMIT } from '@/screens/tasks/api'
 import { TASK_OFFER, taskStatus } from '@/screens/tasks/columns'
-import { resultsMarkdown } from '@/screens/tasks/copy'
+import type { resultsMarkdown } from '@/screens/tasks/copy'
 import { SubmittableAlphas } from '@/screens/tasks/submittable'
+import { pasteAlphas } from '@/screens/tools/paste-alphas/api'
 import {
   Badge,
   Button,
@@ -57,6 +59,12 @@ import { type Column, DataTable } from '@/ui/table'
 
 /** Matches `labs.params.SETTINGS_SAMPLER`. */
 const SETTINGS_SAMPLER = 'settings-sampler'
+const PASTE_ALPHAS = 'paste-alphas'
+/** Reshape one Alpha at its own settings, so they have no search space or fields of their own. */
+const ONE_ALPHA = new Set(['correlation-breaker', 'fields-sampler'])
+/** Ask for another point whenever one is answered from an earlier Alpha, so their target counts
+ *  new simulations only. The labs that write their simulations up front count reused ones too. */
+const REPLACES_REUSED = new Set(['search', 'template', 'ga', 'power-pool'])
 
 /** What a task searches for, where that is not Sharpe, named as the task names it. */
 const objective = (task: LabTask) =>
@@ -85,6 +93,8 @@ const samplerDefaults = (task: LabTask) => [
   'neutralization',
   'investability',
   ...(task.truncationAgent ? ['truncation'] : []),
+  // A Decay sweep is read by what each Decay did to Turnover.
+  ...(task.decays?.length ? ['decay', 'turnover'] : []),
   'sharpe',
   'afterCostSharpe',
 ]
@@ -244,18 +254,47 @@ export function TasksScreen() {
       key: 'simulations',
       header: 'Simulations',
       width: 'minmax(220px,1.5fr)',
-      cell: (t) => (
-        <span className="flex w-full min-w-0 items-center gap-2">
-          <Progress
-            className="flex-1"
-            value={t.target > 0 ? t.simulated / t.target : 0}
-            label="Simulated"
-          />
-          <span className="num shrink-0 text-body-compact">
-            {fmt.int(t.simulated)} / {fmt.int(t.target)}
+      // A lab that writes its simulations up front counts reused Alphas towards the target:
+      // without them, a task that reran settings it had run before read as finished early,
+      // e.g. "28 / 88, Complete". A lab that replaces each reused point counts new ones only,
+      // or it read "507 / 500"; ended short, it says so rather than look like that again.
+      cell: (t) => {
+        const replaces = REPLACES_REUSED.has(t.lab)
+        const done = replaces ? t.simulated : t.simulated + t.cached
+        const ended = t.status === 'COMPLETE' || t.status === 'FAILED'
+        const short = replaces && ended && t.simulated < t.target
+        return (
+          <span className="flex w-full min-w-0 items-center gap-2">
+            <Progress
+              className="flex-1"
+              value={t.target > 0 ? Math.min(1, done / t.target) : 0}
+              label="Simulated"
+            />
+            <span className="num shrink-0 text-body-compact">
+              {fmt.int(done)} / {fmt.int(t.target)}
+              {t.cached > 0 && (
+                <span
+                  className="text-ink-subtle"
+                  title="Simulated before, so read back from BRAIN's earlier result without spending quota or adding a new Alpha on BRAIN"
+                >
+                  {' '}
+                  · {replaces ? '+' : ''}
+                  {fmt.int(t.cached)} reused
+                </span>
+              )}
+              {short && (
+                <span
+                  className="text-ink-subtle"
+                  title={t.message || 'Stopped before reaching its target.'}
+                >
+                  {' '}
+                  · {t.stopping ? 'stopped' : 'ended early'}
+                </span>
+              )}
+            </span>
           </span>
-        </span>
-      ),
+        )
+      },
     },
     {
       key: 'best',
@@ -619,24 +658,58 @@ function TaskDetail({
     task.name,
     task.labName,
     task.templateName,
-    task.lab === SETTINGS_SAMPLER ? task.alphaId : `${task.region} D${task.delay}`,
+    task.lab === SETTINGS_SAMPLER
+      ? task.alphaId
+      : // Each pasted Alpha has its own market, so no one market names the task.
+        task.lab === PASTE_ALPHAS
+        ? null
+        : `${task.region} D${task.delay}`,
   ]
     .filter(Boolean)
     .join(' · ')
   const description =
     task.lab === SETTINGS_SAMPLER
       ? // Held at the source Alpha's values for every simulation in the sweep.
-        `${fmt.int(task.markets)} Markets · Decay ${task.decay ?? DASH} · ${task.truncationAgent ? 'Truncation Agent' : `Truncation ${task.truncation ?? DASH}`} · NaN Handling ${task.nanHandling ?? DASH}`
+        `${fmt.int(task.markets)} Markets · Decay ${task.decays?.length ? task.decays.join(', ') : (task.decay ?? DASH)} · ${task.truncationAgent ? 'Truncation Agent' : `Truncation ${task.truncation ?? DASH}`} · NaN Handling ${task.nanHandling ?? DASH}${task.visualization ? ' · Visualization On' : ''}`
       : task.lab === 'super-alpha'
         ? `${task.universe ?? DASH} · SuperAlphas from your submitted Alphas`
-        : task.seeds > 0
-          ? `${task.universe ?? DASH} · ${fmt.int(task.seeds)} seeds · Population ${fmt.int(task.population)} · Mutation ${fmt.pct(task.mutationRate, 0)}`
-          : `Decay ${task.decay ?? DASH} · ${fmt.int(task.fields)} fields`
+        : task.lab === PASTE_ALPHAS
+          ? `${fmt.int(task.target)} pasted Alphas · ${fmt.int(task.markets)} Markets`
+          : ONE_ALPHA.has(task.lab)
+            ? `${task.alphaId || DASH} · ${task.universe ?? DASH} · Decay ${task.decay ?? DASH}`
+            : task.seeds > 0
+              ? `${task.universe ?? DASH} · ${fmt.int(task.seeds)} seeds · Population ${fmt.int(task.population)} · Mutation ${fmt.pct(task.mutationRate, 0)}`
+              : `Decay ${task.decays?.length ? task.decays.join(', ') : (task.decay ?? DASH)} · ${fmt.int(task.fields)} fields`
   const copyResults = () =>
-    navigator.clipboard.writeText(resultsMarkdown(task, found)).then(
+    copyFromWorker<typeof resultsMarkdown>(
+      new Worker(new URL('./copy.worker.ts', import.meta.url), { type: 'module' }),
+      task,
+      found,
+    ).then(
       () => toast.success(`Copied ${fmt.int(found.length)} results`),
       (e: unknown) => toast.error(errorMessage(e)),
     )
+  // Pasted Alphas go back the way they came: in Copy Alphas' shape, for the next output.
+  const copyAlphas = useMutation({
+    mutationFn: () =>
+      copyText(
+        () => pasteAlphas.copy(task.id),
+        ({ text }) => text,
+      ),
+    onSuccess: ({ alphas, failed, waiting, downloading }) => {
+      toast.success(
+        `Copied ${fmt.int(alphas)} Alpha${alphas === 1 ? '' : 's'}` +
+          (failed ? ` and ${fmt.int(failed)} failed simulation${failed === 1 ? '' : 's'}` : ''),
+      )
+      const notes = [
+        waiting > 0 && `${fmt.int(waiting)} not back from BRAIN yet, so left out.`,
+        downloading > 0 &&
+          `PnL is still downloading for ${fmt.int(downloading)}, so their K-Ratio and correlations read "—".`,
+      ].filter(Boolean)
+      if (notes.length) toast.info(`${notes.join(' ')} Copy again in a few minutes.`)
+    },
+    onError: (e: unknown) => toast.error(errorMessage(e)),
+  })
 
   return (
     <Panel
@@ -644,10 +717,23 @@ function TaskDetail({
       description={description}
       actions={
         <>
-          <Button size="sm" variant="ghost" disabled={!found.length} onClick={copyResults}>
-            <CopyIcon />
-            Copy Results
-          </Button>
+          {task.lab === PASTE_ALPHAS ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={copyAlphas.isPending}
+              disabled={task.simulated + task.cached === 0}
+              onClick={() => copyAlphas.mutate()}
+            >
+              {!copyAlphas.isPending && <CopyIcon />}
+              Copy Alphas
+            </Button>
+          ) : (
+            <Button size="sm" variant="ghost" disabled={!found.length} onClick={copyResults}>
+              <CopyIcon />
+              Copy Results
+            </Button>
+          )}
           <TaskBadge task={task} />
           <Button
             size="icon-sm"
