@@ -2,7 +2,7 @@
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { CopyIcon, SearchIcon } from 'lucide-react'
+import { ChartLineIcon, CopyIcon, SearchIcon } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
@@ -36,6 +36,7 @@ import {
 import { Pager, type Sort } from '@/ui/table'
 import type { alphasMarkdown } from './copy'
 import { alphaIds } from './detail'
+import { BringInTagged, TagAnalysis, TagFilter } from './tag-groups'
 
 /** Bounds as the user types them; `div` converts the display unit to the wire fraction. */
 const BOUNDS: { key: AlphaMetricKey; label: string; div: number }[] = [
@@ -112,6 +113,8 @@ export function Stored({
   const [delays, setDelays] = useState<string[]>([])
   const [universes, setUniverses] = useState<string[]>([])
   const [tags, setTags] = useState<string[]>([])
+  const [tagsAll, setTagsAll] = useState(false)
+  const [analysing, setAnalysing] = useState(false)
   const [createdAfter, setCreatedAfter] = useState('')
   const [createdBefore, setCreatedBefore] = useState('')
   const [bounds, setBounds] = useState<Record<string, { min: string; max: string }>>({})
@@ -147,6 +150,7 @@ export function Stored({
     universes: market ? [market.universe] : universes.length ? universes : null,
     search: quietSearch.trim() || null,
     tags: tags.length ? tags : null,
+    tags_all: tagsAll,
     created_after: createdAfter || null,
     created_before: createdBefore || null,
     minimum: Object.fromEntries(
@@ -230,6 +234,18 @@ export function Stored({
               ]}
             />
           )}
+          {!market && (
+            <Button
+              size="sm"
+              variant={analysing ? 'secondary' : 'ghost'}
+              aria-pressed={analysing}
+              disabled={!page.data?.total}
+              onClick={() => setAnalysing((on) => !on)}
+            >
+              <ChartLineIcon />
+              Analyse as a Portfolio
+            </Button>
+          )}
           {!market && submitted === 'yes' && (
             <Button
               size="sm"
@@ -295,14 +311,21 @@ export function Stored({
                 legend="Tags"
                 className="lg:col-span-2"
                 hint={
-                  overview.data && !tagItems.length
-                    ? 'No tags yet. Tick Alphas in the table to tag them.'
+                  overview.data && !tagItems.length && !tags.length
+                    ? 'No tags yet. Tick Alphas in the table to tag them, or bring tagged Alphas in from BRAIN below.'
                     : undefined
                 }
               >
-                {tagItems.length > 0 && (
-                  <Chips label="Tags" items={tagItems} value={tags} onChange={reset(setTags)} />
-                )}
+                <TagFilter
+                  options={tagItems.map((i) => i.value)}
+                  tags={tags}
+                  every={tagsAll}
+                  onChange={(next, every) => {
+                    setTags(next)
+                    setTagsAll(every)
+                    setOffset(0)
+                  }}
+                />
               </Fieldset>
               <Fieldset legend="Date Created">
                 <div className="flex items-center gap-1.5">
@@ -324,6 +347,11 @@ export function Stored({
                 </div>
               </Fieldset>
             </div>
+            {!market && (
+              <Fieldset legend="Bring In from BRAIN by Tag">
+                <BringInTagged suggested={tags} />
+              </Fieldset>
+            )}
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-4">
               {BOUNDS.map((b) => (
                 <Fieldset key={b.key} legend={b.label}>
@@ -422,6 +450,15 @@ export function Stored({
           <Pager total={page.data?.total ?? 0} offset={offset} limit={limit} onChange={setOffset} />
         </div>
       </Panel>
+      {analysing && !market && (
+        <Panel
+          title="These Alphas as a Portfolio"
+          description="Every Alpha these filters keep, combined at equal weight, as the Portfolio screen combines submitted ones."
+          bodyClassName="flex flex-col gap-4"
+        >
+          <TagAnalysis body={body} onOpen={onOpen} />
+        </Panel>
+      )}
     </>
   )
 }

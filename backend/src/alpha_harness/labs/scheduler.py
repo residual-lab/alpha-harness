@@ -10,7 +10,7 @@ import functools
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import String, func, not_, or_, select, type_coerce, update
+from sqlalchemy import String, and_, func, not_, or_, select, type_coerce, update
 
 from ..brain.platform import MULTI_SIMULATION_SIZE
 from ..brain.schemas import SimulationRequest, SimulationSettings, SimulationType
@@ -152,6 +152,24 @@ def to_start(waiting: list[tuple[int, int]], used: int, slots: int) -> list[int]
     return started
 
 
+def spending() -> Any:
+    """SQL for a trial that has spent, or is spending, a simulation of the task's target.
+
+    Not pruned and not answered for free; a Full run is spent on top of the target, so a tool
+    that wrote its simulations up front still sends every one.
+    """
+    return and_(Trial.state != TrialState.PRUNED, _not_free(), not_(full_run()))
+
+
+async def simulations_used(optimizer: Optimizer, study_id: int) -> int:
+    """How much of its target a task has used: what a new target may not go below."""
+    async with optimizer.db.session() as session:
+        counted = await session.scalar(
+            select(func.count()).where(Trial.study_id == study_id, spending())
+        )
+    return int(counted or 0)
+
+
 def to_ask(batch_size: int, in_flight: int, left: int) -> int:
     """Simulations to queue now: the room the task's cores have, in tens so batches stay full."""
     room = batch_size - in_flight
@@ -171,9 +189,7 @@ async def _still_sending(optimizer: Optimizer, rows: Sequence[Any]) -> set[int]:
                 await session.execute(
                     select(
                         Trial.study_id,
-                        func.count().filter(
-                            Trial.state != TrialState.PRUNED, _not_free(), not_(full_run())
-                        ),
+                        func.count().filter(spending()),
                     )
                     .where(Trial.study_id.in_(ids))
                     .group_by(Trial.study_id)
@@ -369,12 +385,7 @@ async def advance(optimizer: Optimizer, row: Study) -> int:
             await session.execute(
                 select(
                     func.count().filter(Trial.state.in_([TrialState.QUEUED, TrialState.RUNNING])),
-                    # Every trial not pruned or answered for free has spent, or is spending,
-                    # a simulation. A Full run is spent on top of the target, so a tool that
-                    # wrote its simulations up front still sends every one.
-                    func.count().filter(
-                        Trial.state != TrialState.PRUNED, _not_free(), not_(full_run())
-                    ),
+                    func.count().filter(spending()),
                     func.max(Trial.number),
                 ).where(Trial.study_id == study_id)
             )
@@ -536,8 +547,8 @@ def full_run() -> Any:
 def _search_memory(
     rows: Sequence[Any], covers: str
 ) -> tuple[set[Any], dict[tuple[str, str], float | bool], set[refusals.Refusal]]:
-    """The fields tried as ``covers``, every point already scored, and every setting BRAIN
-    refused in a market (:mod:`.refusals`), from unpruned trials.
+    """The fields tried as ``covers``, every point already scored or still out, and every
+    setting BRAIN refused in a market (:mod:`.refusals`), from unpruned trials.
 
     Runs in a worker thread: identity keys validate each trial's settings, which costs
     seconds at the largest task sizes. A task reuses a few settings many times over, so each
@@ -559,6 +570,10 @@ def _search_memory(
         elif state == TrialState.FAIL:
             seen[key] = False
             refused |= refusals.from_message(message, loads(settings or "null"))
+        elif state in (TrialState.QUEUED, TrialState.RUNNING):
+            # Still out on BRAIN: drawing it again would put a second trial on one simulation.
+            # Read afresh each refill, so a point cancelled meanwhile may be drawn again.
+            seen.setdefault(key, True)
     return tried, seen, refused
 
 
@@ -975,6 +990,7 @@ async def pause(optimizer: Optimizer, study_id: int) -> int | None:
 
 
 if __name__ == "__main__":
+    import sqlite3
     import sys
     import tempfile
     from pathlib import Path
@@ -1122,7 +1138,9 @@ if __name__ == "__main__":
                     scores = await session.execute(
                         select(Trial.number, Trial.score).where(Trial.study_id == tally)
                     )
-                    found["a tick's count reads the index alone"] = any(
+                    # Older SQLite, as a system Python may bring, counts right but reads rows.
+                    old_sqlite = sqlite3.sqlite_version_info < (3, 48)
+                    found["a tick's count reads the index alone"] = old_sqlite or any(
                         "COVERING INDEX ix_trial_score" in str(row[3]) for row in plan
                     )
                     # The refused trial and number 1: neither a Full run, a free one nor pruned.

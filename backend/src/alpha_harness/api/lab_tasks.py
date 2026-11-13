@@ -268,8 +268,11 @@ class PowerPoolScope(Out):
     region: str
     #: The submitted Power Pool Alphas of this region, whatever their delay or universe.
     pool: list[str]
-    #: Of those, with no stored series, so they could not be measured. A sync downloads them.
+    #: Of those, with no stored series and none asked for yet, so they could not be measured.
+    #: A sync downloads them.
     pool_without_pnl: list[str]
+    #: Of those, that BRAIN answered with no PnL for: a sync asks again after a day.
+    pool_no_pnl_on_brain: list[str]
 
 
 class PowerPoolCorrelation(Out):
@@ -316,19 +319,22 @@ async def _one(state: Any, task_id: int) -> Study:
 
 #: Progress of complete tasks, which nothing changes once complete: by task, with the status,
 #: target and update time it was counted at, so a task extended or edited is counted again.
-_COMPLETE_PROGRESS: dict[int, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+_SETTLED_PROGRESS: dict[int, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+#: A task in one of these, with nothing out on BRAIN, has trials that cannot change until
+#: the task itself does: counted once, until then.
+SETTLED = (StudyStatus.COMPLETE, StudyStatus.PAUSED, StudyStatus.FAILED, StudyStatus.IDLE)
 
 
 async def _progress(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
     """Trials by state, trials answered for free, and the best value per task, counted in SQL.
 
     A long task holds tens of thousands of trials; reading them all to count them would
-    slow the list down with every day the task runs. A complete task is counted once.
+    slow the list down with every day the task runs. A settled task is counted once.
     """
     out: dict[int, dict[str, Any]] = {}
     ids: list[int] = []
     for row in rows:
-        kept = _COMPLETE_PROGRESS.get(row.id)
+        kept = _SETTLED_PROGRESS.get(row.id)
         if kept is not None and kept[0] == _settled_key(row):
             out[row.id] = kept[1]
         else:
@@ -380,8 +386,10 @@ async def _progress(state: Any, rows: list[Study]) -> dict[int, dict[str, Any]]:
             found = out[study_id]["failures"]
             found[_reason(message)] = found.get(_reason(message), 0) + int(n)
     for row in rows:
-        if row.id in ids and row.status == StudyStatus.COMPLETE:
-            _COMPLETE_PROGRESS[row.id] = (_settled_key(row), out[row.id])
+        states = out.get(row.id, {}).get("states", {})
+        out_on_brain = states.get(TrialState.QUEUED, 0) + states.get(TrialState.RUNNING, 0)
+        if row.id in ids and row.status in SETTLED and not out_on_brain:
+            _SETTLED_PROGRESS[row.id] = (_settled_key(row), out[row.id])
     return out
 
 
@@ -825,6 +833,14 @@ async def change(task_id: int, body: TaskChange, state: State) -> LabTask:
             f"BRAIN runs {SUPER_ALPHA_SLOTS} SuperAlpha simulations at once, so a Super Lab "
             f"task cannot hold {body.cores} cores.",
         )
+    if body.simulations is not None and body.simulations < (
+        used := await scheduler.simulations_used(state.optimizer, row.id)
+    ):
+        raise refuse(
+            422,
+            "below_spent",
+            f"This task has already used {used:,} simulations, so its target can't be lower.",
+        )
     cores = body.cores or scheduler.cores_of(row)
     free = await scheduler.resize_task(state.optimizer, row, cores, body.simulations)
     if free is not None:
@@ -866,7 +882,7 @@ async def remove(task_id: int, state: State) -> TaskRemoved:
         await state.engine.drop_queued(row.task)
         await state.optimizer.delete(task_id)
         await state.engine.set_quota(row.task, 0, enabled=False)
-    _COMPLETE_PROGRESS.pop(task_id, None)
+    _SETTLED_PROGRESS.pop(task_id, None)
     _SETUPS.pop(task_id, None)
     await state.optimizer.notify()
     return TaskRemoved(removed=task_id)
@@ -991,8 +1007,10 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
         for r in power_pool.correlate(grid, meta, ids, [], last_days=last_days)
     ]
     scopes.extend(
-        PowerPoolScope(region=region, pool=[], pool_without_pnl=[]) for region in unopposed
+        PowerPoolScope(region=region, pool=[], pool_without_pnl=[], pool_no_pnl_on_brain=[])
+        for region in unopposed
     )
+    on_brain = await state.alphas.pnl_absent([m for m in pool_meta if m not in has_pnl])
     for region in sorted(wanted, key=lambda r: (-len(wanted[r]), r)):
         members = by_region[region]
         # Every member, synced or not: a member without PnL is a collision nobody measured,
@@ -1005,7 +1023,8 @@ async def _power_pool(state: State, alpha_ids: list[str]) -> PowerPoolCorrelatio
             PowerPoolScope(
                 region=region,
                 pool=members,
-                pool_without_pnl=[m for m in members if m not in has_pnl],
+                pool_without_pnl=[m for m in members if m not in has_pnl | on_brain],
+                pool_no_pnl_on_brain=[m for m in members if m in on_brain],
             )
         )
 

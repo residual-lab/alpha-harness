@@ -156,6 +156,9 @@ ALTER TABLE alpha ADD COLUMN IF NOT EXISTS pnl_version INTEGER;
 -- the series is stored so a table of a thousand Alphas need not read a thousand series to show
 -- it. A new column rather than a rewrite of an earlier form, so startup rebuilds every value.
 ALTER TABLE alpha ADD COLUMN IF NOT EXISTS after_cost_5bps DOUBLE;
+-- When BRAIN last answered that it has no daily PnL for the alpha, so a sync does not ask again
+-- at once (``vault.store.PNL_ABSENT_RETRY``).
+ALTER TABLE alpha ADD COLUMN IF NOT EXISTS pnl_absent_at TIMESTAMP;
 DROP TABLE IF EXISTS k_ratio_2003;
 
 -- One row per alpha per trading day. ~2,500 rows per alpha.

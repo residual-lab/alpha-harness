@@ -44,9 +44,11 @@ const TIME_ZONES = ['UTC', ...Intl.supportedValuesOf('timeZone').filter((z) => z
 const SHOWN = 100
 
 /** A limit as typed: a whole number of at least one, or nothing yet. */
-const requests = (text: string) => {
+const MAX_PER_DAY = 1_000_000
+
+const requests = (text: string, max = Number.POSITIVE_INFINITY) => {
   const n = Number(text)
-  return text.trim() !== '' && Number.isInteger(n) && n >= 1 ? n : null
+  return text.trim() !== '' && Number.isInteger(n) && n >= 1 && n <= max ? n : null
 }
 
 /** Set one model up, or change the limits of one that is. */
@@ -88,7 +90,7 @@ export function ModelSetupForm({
   })
 
   const perMinute = requests(rpm)
-  const perDay = requests(rpd)
+  const perDay = requests(rpd, MAX_PER_DAY)
   // Optional: empty is the default, anything else has to be a real ceiling.
   const promptTokens = maxTokens.trim() === '' ? null : requests(maxTokens)
   const tokensInvalid = maxTokens.trim() !== '' && promptTokens === null
@@ -215,11 +217,16 @@ export function ModelSetupForm({
           </Field>
           <Field
             label="Requests per Day"
-            error={rpd !== '' && perDay === null ? 'A whole number, at least 1.' : null}
+            error={
+              rpd !== '' && perDay === null
+                ? `A whole number from 1 to ${fmt.int(MAX_PER_DAY)}.`
+                : null
+            }
           >
             <Input
               type="number"
               min={1}
+              max={MAX_PER_DAY}
               step={1}
               inputMode="numeric"
               className="num"

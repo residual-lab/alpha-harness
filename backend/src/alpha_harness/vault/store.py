@@ -33,6 +33,9 @@ log = structlog.get_logger(__name__)
 #: 3: turnover calibrated to ``yearly-stats`` where it misses by more than rounding. A series
 #: stored under an older version is fetched again on the next sync.
 SERIES_VERSION = 3
+#: How long a sync leaves alone an Alpha BRAIN has no PnL for: a new submission's may simply not
+#: be computed yet, so it is asked for again the next day.
+PNL_ABSENT_RETRY = timedelta(hours=24)
 #: Alphas holding a current daily PnL, with or without its turnover. A full series written
 #: before ``pnl_version`` existed carries only ``series_version``. One ``?``: the version.
 PNL_STORED = "SELECT alpha_id FROM alpha WHERE coalesce(pnl_version, series_version) = ?"
@@ -701,6 +704,44 @@ class AlphaVault:
         """The newest alpha stored, which is where an incremental sync resumes."""
         return await self.catalog.scalar("SELECT max(date_created) FROM alpha")
 
+    async def matching_ids(
+        self,
+        *,
+        limit: int,
+        submitted: bool = False,
+        regions: list[str] | None = None,
+        delays: list[int] | None = None,
+        universes: list[str] | None = None,
+        minimum: dict[str, float] | None = None,
+        maximum: dict[str, float] | None = None,
+        search: str | None = None,
+        tags: list[str] | None = None,
+        tags_all: bool = False,
+        created_after: date | None = None,
+        created_before: date | None = None,
+    ) -> list[str]:
+        """Every Alpha the Simulations table's filters keep, newest first, up to ``limit``."""
+        clauses, params = _filters(
+            submitted=submitted,
+            regions=regions,
+            delays=delays,
+            universes=universes,
+            minimum=minimum,
+            maximum=maximum,
+            search=search,
+            tags=tags,
+            tags_all=tags_all,
+            created_after=created_after,
+            created_before=created_before,
+            evolvable=False,
+        )
+        rows = await self.catalog.query(
+            f"SELECT a.alpha_id FROM alpha a WHERE {' AND '.join(clauses)} "  # noqa: S608
+            "ORDER BY a.date_created DESC, a.alpha_id LIMIT ?",
+            [*params, limit],
+        )
+        return [str(r["alpha_id"]) for r in rows]
+
     async def page(
         self,
         *,
@@ -714,6 +755,7 @@ class AlphaVault:
         maximum: dict[str, float] | None = None,
         search: str | None = None,
         tags: list[str] | None = None,
+        tags_all: bool = False,
         created_after: date | None = None,
         created_before: date | None = None,
         evolvable: bool = False,
@@ -722,8 +764,9 @@ class AlphaVault:
     ) -> dict[str, Any]:
         """One page of the Simulations table: sorted, filtered, with the total.
 
-        ``tags`` keeps Alphas carrying any of them. ``created_after`` and ``created_before``
-        are days on BRAIN's clock, both included, as its own date filter reads them.
+        ``tags`` keeps Alphas carrying any of them, or all of them with ``tags_all``.
+        ``created_after`` and ``created_before`` are days on BRAIN's clock, both included,
+        as its own date filter reads them.
 
         ``evolvable`` keeps only what the Evolution Lab can breed from. The same predicate
         the lab itself enforces, so the table offering an Alpha and the lab accepting it can
@@ -731,47 +774,20 @@ class AlphaVault:
         and picking one only to be told later that it cannot be a seed is the table's fault,
         not the user's.
         """
-        clauses = ["a.date_created IS NOT NULL", SUBMITTED if submitted else f"NOT {SUBMITTED}"]
-        if evolvable:
-            # Every condition ``ga.seed_problem`` and ``ga.auto_seeds`` apply, not just the
-            # type: an Alpha with no Fitness is refused there too, so offering it here would
-            # be the same lie in a different place.
-            clauses.extend(
-                [
-                    SEEDABLE,
-                    "coalesce(a.instrument_type, 'EQUITY') = 'EQUITY'",
-                    "a.expression IS NOT NULL",
-                ]
-            )
-        params: list[Any] = []
-        for column, values in (("region", regions), ("delay", delays), ("universe", universes)):
-            if values:
-                clauses.append(f"a.{column} IN ({', '.join('?' for _ in values)})")
-                params.extend(values)
-        for bounds, op in ((minimum, ">="), (maximum, "<=")):
-            for key, value in (bounds or {}).items():
-                # Bounds are numbers, and DuckDB refuses to compare a timestamp with one,
-                # failing the whole page: dates have bounds of their own, below.
-                if key in ALPHA_METRICS and not key.startswith("date_"):
-                    clauses.append(f"({ALPHA_METRICS[key]}) {op} ?")
-                    params.append(value)
-        if created_after:
-            clauses.append("a.date_created >= ?")
-            params.append(_day_starts(created_after))
-        if created_before:
-            clauses.append("a.date_created < ?")
-            params.append(_day_starts(created_before + timedelta(days=1)))
-        if tags:
-            clauses.append("""list_has_any(from_json(a.tags, '["VARCHAR"]'), ?::VARCHAR[])""")
-            params.append(tags)
-        if search:
-            needle = f"%{search.lower()}%"
-            clauses.append(
-                "(lower(a.alpha_id) LIKE ? OR lower(coalesce(a.expression, '')) LIKE ? "
-                "OR lower(coalesce(a.name, '')) LIKE ?)"
-            )
-            params.extend([needle, needle, needle])
-
+        clauses, params = _filters(
+            submitted=submitted,
+            regions=regions,
+            delays=delays,
+            universes=universes,
+            minimum=minimum,
+            maximum=maximum,
+            search=search,
+            tags=tags,
+            tags_all=tags_all,
+            created_after=created_after,
+            created_before=created_before,
+            evolvable=evolvable,
+        )
         where = " AND ".join(clauses)
         order = ALPHA_METRICS.get(sort_by, ALPHA_METRICS["date_created"])
         direction = "DESC" if sort_desc else "ASC"
@@ -963,6 +979,30 @@ class AlphaVault:
         stored = {str(r["alpha_id"]) for r in rows}
         return [a for a in alpha_ids if a not in stored]
 
+    async def mark_pnl_absent(self, alpha_id: str) -> None:
+        """Record that BRAIN just answered with no daily PnL for this Alpha."""
+        await self.catalog.execute(
+            "UPDATE alpha SET pnl_absent_at = now() WHERE alpha_id = ?", [alpha_id]
+        )
+
+    async def pnl_absent(
+        self, alpha_ids: list[str], *, within: timedelta | None = None
+    ) -> set[str]:
+        """Those of these Alphas BRAIN has no PnL for, as of its last answer, or as of the
+        last ``within`` of it."""
+        if not alpha_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in alpha_ids)
+        recent = "" if within is None else "AND pnl_absent_at > now() - ?"
+        rows = await self.catalog.query(
+            f"""
+            SELECT alpha_id FROM alpha
+            WHERE alpha_id IN ({placeholders}) AND pnl_absent_at IS NOT NULL {recent}
+            """,  # noqa: S608
+            [*alpha_ids, *([] if within is None else [within])],
+        )
+        return {str(r["alpha_id"]) for r in rows}
+
     async def lacking_pnl(self, alpha_ids: list[str]) -> list[str]:
         """Those of these Alphas with no daily PnL stored, turnover or not, in the order given."""
         if not alpha_ids:
@@ -1095,6 +1135,66 @@ class AlphaVault:
             list(alpha_ids),
         )
         return {str(r["alpha_id"]): r for r in rows}
+
+
+def _filters(
+    *,
+    submitted: bool,
+    regions: list[str] | None,
+    delays: list[int] | None,
+    universes: list[str] | None,
+    minimum: dict[str, float] | None,
+    maximum: dict[str, float] | None,
+    search: str | None,
+    tags: list[str] | None,
+    tags_all: bool,
+    created_after: date | None,
+    created_before: date | None,
+    evolvable: bool,
+) -> tuple[list[str], list[Any]]:
+    """The Simulations table's filters as SQL over ``alpha a``, and their parameters."""
+    clauses = ["a.date_created IS NOT NULL", SUBMITTED if submitted else f"NOT {SUBMITTED}"]
+    if evolvable:
+        # Every condition ``ga.seed_problem`` and ``ga.auto_seeds`` apply, not just the
+        # type: an Alpha with no Fitness is refused there too, so offering it here would
+        # be the same lie in a different place.
+        clauses.extend(
+            [
+                SEEDABLE,
+                "coalesce(a.instrument_type, 'EQUITY') = 'EQUITY'",
+                "a.expression IS NOT NULL",
+            ]
+        )
+    params: list[Any] = []
+    for column, values in (("region", regions), ("delay", delays), ("universe", universes)):
+        if values:
+            clauses.append(f"a.{column} IN ({', '.join('?' for _ in values)})")
+            params.extend(values)
+    for bounds, op in ((minimum, ">="), (maximum, "<=")):
+        for key, value in (bounds or {}).items():
+            # Bounds are numbers, and DuckDB refuses to compare a timestamp with one,
+            # failing the whole page: dates have bounds of their own, below.
+            if key in ALPHA_METRICS and not key.startswith("date_"):
+                clauses.append(f"({ALPHA_METRICS[key]}) {op} ?")
+                params.append(value)
+    if created_after:
+        clauses.append("a.date_created >= ?")
+        params.append(_day_starts(created_after))
+    if created_before:
+        clauses.append("a.date_created < ?")
+        params.append(_day_starts(created_before + timedelta(days=1)))
+    if tags:
+        has = "list_has_all" if tags_all else "list_has_any"
+        clauses.append(f"""{has}(from_json(a.tags, '["VARCHAR"]'), ?::VARCHAR[])""")
+        params.append(tags)
+    if search:
+        needle = f"%{search.lower()}%"
+        clauses.append(
+            "(lower(a.alpha_id) LIKE ? OR lower(coalesce(a.expression, '')) LIKE ? "
+            "OR lower(coalesce(a.name, '')) LIKE ?)"
+        )
+        params.extend([needle, needle, needle])
+    return clauses, params
 
 
 if __name__ == "__main__":

@@ -59,8 +59,10 @@ from .fastexpr import (
     parse,
     relabel,
     render,
+    replace_at,
     validate,
     walk_with_parents,
+    written_out,
 )
 from .objectives import FAILURE
 from .params import EvolutionParams, params_of
@@ -203,7 +205,7 @@ def stalled(values: list[float | None]) -> bool:
 
 def _inputs(info: OperatorInfo, count: int) -> tuple[str, ...]:
     """The names of an operator's first ``count`` inputs, e.g. ``("x", "d")``."""
-    return tuple(p.split("=")[0].strip() for p in info.params[:count])
+    return info.inputs[:count]
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,7 +456,14 @@ def mutate(
         if path in fields:
             swapped.setdefault(fields[path], value)
     values |= {path: swapped[name] for path, name in fields.items() if name in swapped}
-    return relabel(tree, values), settings
+    child = relabel(tree, values)
+    for path, value in values.items():
+        # An operator swapped in gets the options BRAIN will not default; the parent's own
+        # calls are left as BRAIN already accepted them.
+        node = node_at(child, path)
+        if node.kind == "call" and (info := market.table.get(value)) is not None:
+            child = replace_at(child, path, written_out(node, info))
+    return child, settings
 
 
 @dataclass(frozen=True, slots=True)

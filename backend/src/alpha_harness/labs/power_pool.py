@@ -32,6 +32,7 @@ from . import scheduler, search
 from .fastexpr import (
     ParseError,
     data_fields,
+    explicit,
     operator_count,
     operator_table,
     parse,
@@ -218,7 +219,7 @@ def check(text: str, ctx: Context, table: dict[str, Any]) -> tuple[str, frozense
             raise Rejected(
                 f"{node.value} is a VECTOR field: put it straight inside a vec_ operator."
             )
-    return render(tree), used
+    return render(explicit(tree, table)), used
 
 
 def draw(

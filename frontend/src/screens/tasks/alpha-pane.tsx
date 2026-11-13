@@ -239,6 +239,7 @@ export function AlphaPane({
     (pool.found?.withoutPnl.length ?? 0) +
     (pool.found?.rows.filter((r) => r.verdict === 'unmeasured').length ?? 0)
   const unsynced = pool.found?.scopes.flatMap((s) => s.poolWithoutPnl).length ?? 0
+  const noPnlOnBrain = pool.found?.scopes.flatMap((s) => s.poolNoPnlOnBrain).length ?? 0
   const uncosted = survivors.filter((r) => r.afterCostSharpe == null).length
   // Opening on the last step with nothing measured yet would show an empty table over Alphas
   // that are clean: start one step back then, once, and leave the choice to the reader after.
@@ -381,6 +382,13 @@ export function AlphaPane({
           </Link>{' '}
           page, then read these again.
         </Notice>
+      )}
+      {noPnlOnBrain > 0 && (
+        <p className="mb-3 text-caption text-ink-subtle">
+          {fmt.int(noPnlOnBrain)} submitted Power Pool Alpha{noPnlOnBrain === 1 ? ' has' : 's have'}{' '}
+          no PnL on BRAIN, so Power Pool Correlation isn't measured against{' '}
+          {noPnlOnBrain === 1 ? 'it' : 'them'}.
+        </p>
       )}
       {pool.error != null && (
         <ErrorNotice error={pool.error} title="Could not measure Power Pool correlation" />

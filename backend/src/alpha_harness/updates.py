@@ -65,9 +65,9 @@ SHELL_VARIABLE = "ALPHA_HARNESS_SHELL"
 #: The oldest desktop app this release works fully with.
 #:
 #: Raised by hand, and only when a desktop app change actually matters — it is rebuilt every
-#: release, so comparing it to the wheel would nag after every update for nothing. Its first
-#: release is all any needs so far.
-LAUNCHER_NEEDED = "2026.10.21rc1"
+#: release, so comparing it to the wheel would nag after every update for nothing. A Mac
+#: needs the one after 2026.11.13: older ones abort when BRAIN's identity check opens.
+LAUNCHER_NEEDED = "2026.11.13.1" if sys.platform == "darwin" else "2026.10.21rc1"
 
 
 def _launcher_asset() -> str:

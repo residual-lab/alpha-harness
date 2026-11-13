@@ -13,7 +13,7 @@ from ..brain.platform import (
 )
 from ..db.models import utcnow
 from ..labs import super_alpha
-from ..labs.launch import AddedTask, add_study
+from ..labs.launch import AddedTask, account_operators, add_study
 from ..labs.params import SUPER_LAB, SuperParams
 from ..schemas import Out
 from .deps import State, refuse
@@ -41,15 +41,18 @@ class SuperTask(Out):
     selections: list[Recipe] | None = Field(default=None, max_length=50)
     combos: list[Recipe] | None = Field(default=None, max_length=50)
 
-    def chosen(self) -> tuple[list[super_alpha.Recipe], list[super_alpha.Recipe]]:
-        """The selections and combos to cross, as the lab's own recipes."""
+    def chosen(
+        self, combos: list[super_alpha.Recipe]
+    ) -> tuple[list[super_alpha.Recipe], list[super_alpha.Recipe]]:
+        """The selections and combos to cross, as the lab's own recipes; ``combos`` are the
+        built-in ones as this account runs them."""
         picked = [
             [super_alpha.Recipe(r.name.strip(), r.code.strip()) for r in given]
             if given is not None
             else default
             for given, default in (
                 (self.selections, super_alpha.selections(self.selection_limit)),
-                (self.combos, super_alpha.COMBOS),
+                (self.combos, combos),
             )
         ]
         return picked[0], picked[1]
@@ -68,16 +71,17 @@ def _activations(choice: str) -> list[str]:
 
 
 @router.post("/plan")
-async def plan(body: SuperTask) -> SuperPlan:
+async def plan(body: SuperTask, state: State) -> SuperPlan:
     """What a task with these settings would run, without running anything. Lists the
     built-in selections and combos whatever was chosen, so a screen can offer them all."""
     activations = _activations(body.activation)
-    chosen = body.chosen()
+    combos = super_alpha.combos_for(await account_operators(state, refresh=False))
+    chosen = body.chosen(combos)
     return SuperPlan(
         selections=[
             Recipe(name=r.name, code=r.code) for r in super_alpha.selections(body.selection_limit)
         ],
-        combos=[Recipe(name=r.name, code=r.code) for r in super_alpha.COMBOS],
+        combos=[Recipe(name=r.name, code=r.code) for r in combos],
         decays=list(super_alpha.DECAYS),
         truncation=super_alpha.TRUNCATION,
         simulations=len(chosen[0]) * len(chosen[1]) * len(super_alpha.DECAYS) * len(activations),
@@ -89,7 +93,9 @@ async def add_task(body: SuperTask, state: State) -> AddedTask:
     """Write every pairing as a SuperAlpha simulation, and queue the task when ``run``."""
     if body.region == REGION_AGNOSTIC_REGION:
         raise refuse(422, "region_agnostic", "SuperAlphas combine Alphas of one region.")
-    selections, combos = body.chosen()
+    selections, combos = body.chosen(
+        super_alpha.combos_for(await account_operators(state, refresh=False))
+    )
     for kind, chosen in (("selection", selections), ("combo", combos)):
         if not chosen:
             raise refuse(422, f"no_{kind}", f"Tick at least one {kind}.")

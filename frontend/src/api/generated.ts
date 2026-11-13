@@ -1647,6 +1647,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/preferences/tag-groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Tag Groups
+         * @description Null until the screen first saves, which is when it uploads the copy it kept itself.
+         */
+        get: operations["read_tag_groups_api_preferences_tag_groups_get"];
+        /** Write Tag Groups */
+        put: operations["write_tag_groups_api_preferences_tag_groups_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/quarter": {
         parameters: {
             query?: never;
@@ -1852,7 +1873,8 @@ export interface paths {
          * @description Cancel a running simulation.
          *
          *     Uses the stored platform id — the reason that id is written to disk before the
-         *     submission request is even sent.
+         *     submission request is even sent. ``force`` is the second press, after BRAIN refused:
+         *     the row ends here anyway, so its core is freed.
          */
         post: operations["cancel_api_simulations__record_id__cancel_post"];
         delete?: never;
@@ -2345,6 +2367,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/vault/alphas/group": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Alpha Group
+         * @description The Alphas a filter keeps, newest first, ready to be analysed as one portfolio.
+         */
+        post: operations["alpha_group_api_vault_alphas_group_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/vault/alphas/query": {
         parameters: {
             query?: never;
@@ -2400,6 +2442,46 @@ export interface paths {
         get: operations["alpha_pnl_api_vault_alphas__alpha_id__pnl_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/vault/download-pnl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Download Pnl
+         * @description Download the daily PnL and turnover these Alphas lack, so they can be analysed.
+         */
+        post: operations["download_pnl_api_vault_download_pnl_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/vault/import-tagged": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Tagged
+         * @description Bring in every Alpha BRAIN lists under any of these tags, made here or elsewhere.
+         */
+        post: operations["import_tagged_api_vault_import_tagged_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2537,6 +2619,21 @@ export interface components {
             sharpe: number | null;
         };
         /**
+         * AlphaGroup
+         * @description Every Alpha a filter keeps, for analysing them together.
+         */
+        AlphaGroup: {
+            /** Alphaids */
+            alphaIds: string[];
+            /** More */
+            more: boolean;
+        };
+        /** AlphaIdList */
+        AlphaIdList: {
+            /** Alphaids */
+            alphaIds: string[];
+        };
+        /**
          * AlphaIds
          * @description An explicit set of Alphas, for the panes that are not one task's results.
          */
@@ -2666,6 +2763,11 @@ export interface components {
             submitted: boolean;
             /** Tags */
             tags?: string[] | null;
+            /**
+             * Tags All
+             * @default false
+             */
+            tags_all: boolean;
             /** Universes */
             universes?: string[] | null;
         };
@@ -3774,6 +3876,11 @@ export interface components {
             /** Websocketclients */
             websocketClients: number;
         };
+        /** JobStarted */
+        JobStarted: {
+            /** Taskid */
+            taskId: string;
+        };
         /** KeyFailed */
         KeyFailed: {
             /** Error */
@@ -4179,6 +4286,8 @@ export interface components {
             definition: string;
             /** Description */
             description: string;
+            /** Inputs */
+            inputs: string[];
             /** Name */
             name: string;
         };
@@ -4658,6 +4767,8 @@ export interface components {
         PowerPoolScope: {
             /** Pool */
             pool: string[];
+            /** Poolnopnlonbrain */
+            poolNoPnlOnBrain: string[];
             /** Poolwithoutpnl */
             poolWithoutPnl: string[];
             /** Region */
@@ -4665,6 +4776,16 @@ export interface components {
         };
         /** Preferences */
         Preferences: {
+            /**
+             * Autotag
+             * @default false
+             */
+            autoTag: boolean;
+            /**
+             * Autotagname
+             * @default harness
+             */
+            autoTagName: string;
             /**
              * Autoupdate
              * @default true
@@ -5691,6 +5812,28 @@ export interface components {
          * @enum {string}
          */
         SyncStatus: "RUNNING" | "COMPLETE" | "FAILED" | "CANCELLED";
+        /**
+         * TagGroup
+         * @description Tags the Alphas screen filters by together, kept under a name: a list of Alphas.
+         */
+        TagGroup: {
+            /**
+             * Every
+             * @default false
+             */
+            every: boolean;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /** Tags */
+            tags: string[];
+        };
+        /** TagGroups */
+        TagGroups: {
+            /** Groups */
+            groups?: components["schemas"]["TagGroup"][];
+        };
         /** TagRequest */
         TagRequest: {
             /** Alpha Ids */
@@ -5706,6 +5849,11 @@ export interface components {
             };
             /** Tagged */
             tagged: string[];
+        };
+        /** TaggedRequest */
+        TaggedRequest: {
+            /** Tags */
+            tags: string[];
         };
         /**
          * TaskAlpha
@@ -8745,6 +8893,59 @@ export interface operations {
             };
         };
     };
+    read_tag_groups_api_preferences_tag_groups_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TagGroups"] | null;
+                };
+            };
+        };
+    };
+    write_tag_groups_api_preferences_tag_groups_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TagGroups"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TagGroups"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     standing_api_quarter_get: {
         parameters: {
             query?: never;
@@ -8964,7 +9165,9 @@ export interface operations {
     };
     cancel_api_simulations__record_id__cancel_post: {
         parameters: {
-            query?: never;
+            query?: {
+                force?: boolean;
+            };
             header?: never;
             path: {
                 record_id: number;
@@ -9781,6 +9984,39 @@ export interface operations {
             };
         };
     };
+    alpha_group_api_vault_alphas_group_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlphaPageRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlphaGroup"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     query_alphas_api_vault_alphas_query_post: {
         parameters: {
             query?: never;
@@ -9863,6 +10099,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AlphaPnl"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    download_pnl_api_vault_download_pnl_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlphaIdList"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobStarted"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_tagged_api_vault_import_tagged_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaggedRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobStarted"];
                 };
             };
             /** @description Validation Error */

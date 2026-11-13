@@ -134,11 +134,17 @@ function SimulationMatrix() {
   const [target, setTarget] = useState<SimulationRow | null>(null)
   const cancel = useMutation({
     // Always the parent record: a batch child cannot be cancelled on BRAIN.
-    mutationFn: (row: SimulationRow) => simulations.cancel(row.id),
-    onSuccess: (result, row) => {
+    mutationFn: ({ row, force }: { row: SimulationRow; force: boolean }) =>
+      simulations.cancel(row.id, force),
+    onSuccess: (result, { row, force }) => {
       const what = `${row.isBatch ? 'batch' : 'simulation'} ${row.platformId ?? row.id}`
       if (result.acknowledged) toast.success(`BRAIN acknowledged the cancel of ${what}.`)
-      else toast.error(`BRAIN did not acknowledge the cancel of ${what}. It may still be running.`)
+      else if (force) toast.success(`Freed the core held by ${what}.`)
+      // A batch BRAIN has wedged refuses every cancel, so the second press frees it here.
+      else
+        toast.error(`BRAIN did not acknowledge the cancel of ${what}. It may still be running.`, {
+          action: { label: 'Free its core', onClick: () => cancel.mutate({ row, force: true }) },
+        })
       for (const queryKey of [['simulations'], ['bar'], ['today']])
         void queryClient.invalidateQueries({ queryKey })
     },
@@ -234,7 +240,7 @@ function SimulationMatrix() {
         cancelLabel="Keep running"
         danger
         pending={cancel.isPending}
-        onConfirm={() => target && cancel.mutate(target)}
+        onConfirm={() => target && cancel.mutate({ row: target, force: false })}
       >
         {target?.isBatch ? (
           <>

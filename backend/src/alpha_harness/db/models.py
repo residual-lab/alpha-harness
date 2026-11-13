@@ -40,6 +40,26 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+class KnownStatus(TypeDecorator[str]):
+    """A status read back as one this build knows, whatever the row holds.
+
+    A value written by another build or by hand would otherwise fail every screen listing
+    its rows. Read-time only: the row keeps its value until the person acts on it, so a
+    downgrade or a hand edit loses nothing.
+    """
+
+    impl = String(16)
+    cache_ok = True
+
+    def __init__(self, known: type[StrEnum], fallback: StrEnum) -> None:
+        super().__init__()
+        self.known = frozenset(known)
+        self.fallback = str(fallback)
+
+    def process_result_value(self, value: str | None, dialect: Any) -> str | None:  # noqa: ARG002
+        return value if value is None or value in self.known else self.fallback
+
+
 class UtcDateTime(TypeDecorator[datetime]):
     """A timestamp stored as UTC and read back UTC-aware.
 
@@ -198,7 +218,10 @@ class SimulationRecord(Base):
     task: Mapped[str] = mapped_column(String(64), default="manual", index=True)
 
     # Lifecycle
-    status: Mapped[str] = mapped_column(String(16), default=SimStatus.PENDING, index=True)
+    #: An unknown value reads as finished, so nothing polls a row this build cannot place.
+    status: Mapped[str] = mapped_column(
+        KnownStatus(SimStatus, SimStatus.ERROR), default=SimStatus.PENDING, index=True
+    )
     platform_status: Mapped[str | None] = mapped_column(String(16))
     progress: Mapped[float | None] = mapped_column(Float)
     message: Mapped[str | None] = mapped_column(Text)
@@ -442,7 +465,10 @@ class Study(Base):
     #: Slot-quota group, so a study cannot starve manual work.
     task: Mapped[str] = mapped_column(String(64), default="study")
 
-    status: Mapped[str] = mapped_column(String(16), default=StudyStatus.IDLE, index=True)
+    #: An unknown value reads as paused: shown, and still able to resume or be deleted.
+    status: Mapped[str] = mapped_column(
+        KnownStatus(StudyStatus, StudyStatus.PAUSED), default=StudyStatus.IDLE, index=True
+    )
     message: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow, onupdate=utcnow)

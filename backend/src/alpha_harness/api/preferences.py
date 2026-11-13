@@ -3,7 +3,7 @@
 from fastapi import APIRouter
 
 from .. import preferences
-from ..preferences import BreakerReshapes, Preferences, SuperLabRecipes
+from ..preferences import BreakerReshapes, Preferences, SuperLabRecipes, TagGroups
 from .deps import State
 
 router = APIRouter(prefix="/api/preferences", tags=["preferences"])
@@ -43,4 +43,16 @@ async def read_breaker(state: State) -> BreakerReshapes | None:
 @router.put("/correlation-breaker")
 async def write_breaker(body: BreakerReshapes, state: State) -> BreakerReshapes:
     await preferences.keep(state.db, preferences.BREAKER, body)
+    return body
+
+
+@router.get("/tag-groups")
+async def read_tag_groups(state: State) -> TagGroups | None:
+    """Null until the screen first saves, which is when it uploads the copy it kept itself."""
+    return await preferences.kept(state.db, preferences.TAG_GROUPS, TagGroups)
+
+
+@router.put("/tag-groups")
+async def write_tag_groups(body: TagGroups, state: State) -> TagGroups:
+    await preferences.keep(state.db, preferences.TAG_GROUPS, body)
     return body

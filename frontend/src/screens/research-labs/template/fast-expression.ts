@@ -16,6 +16,8 @@ export interface OperatorDoc {
   category: string
   definition: string
   description: string
+  /** The inputs written by position, as the backend reads the definition: `x`, `lookback`. */
+  inputs?: string[]
 }
 
 /** Grouping fields: BRAIN groups stocks by them, and never counts them as data. */
@@ -157,8 +159,12 @@ export function locals(blank: string): Set<string> {
 /** Every bare name, not a `$variable` and not an operator being called. */
 export const NAMES = /(?<![$\w])[A-Za-z_]\w*(?!\w)(?!\s*\()/g
 
-/** The inputs an operator needs, by the names its definition gives them: `x`, `d`. */
+/**
+ * The inputs an operator needs, by the names its definition gives them: `x`, `d`. The
+ * backend's reading comes first: it knows `ts_backfill(x, lookback = d)` needs its lookback.
+ */
 export function inputsOf(op: OperatorDoc): string[] {
+  if (op.inputs) return op.inputs
   const first = op.definition.split(/\r?\n/)[0] ?? ''
   const open = first.indexOf('(')
   const params: string[] = []

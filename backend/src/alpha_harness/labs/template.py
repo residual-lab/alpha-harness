@@ -31,6 +31,7 @@ from .fastexpr import (
     Node,
     OperatorInfo,
     ParseError,
+    arity_problem,
     operator_count,
     parse,
     walk,
@@ -193,7 +194,37 @@ def template_problems(tree: Node, table: dict[str, OperatorInfo]) -> list[str]:
     if holes(tree):
         found.append(f"Replace each {HOLE} with a signal.")
     found.extend(_calls(tree, table))
+    found.extend(_statements(tree))
     return list(dict.fromkeys(found))
+
+
+def _statements(tree: Node) -> Iterator[str]:
+    """BRAIN refuses an Alpha with a statement nothing reads ("Found unused operators")."""
+    if tree.kind != "seq":
+        return
+    steps = tree.args
+    for number, step in enumerate(steps[:-1], start=1):
+        if step.kind != "assign":
+            yield (
+                f"Statement {number} ({_short(step)}) has no name, so BRAIN finds its operators "
+                "unused. Write it as name = …; and use name in a later statement."
+            )
+        elif not any(
+            n.kind in ("name", "call") and n.value == step.value
+            for later in steps[number:]
+            for _, n in walk(later)
+        ):
+            yield (
+                f"{step.value} is never used after it is set, so BRAIN finds its operators "
+                f"unused. Use {step.value} in a later statement, or remove it."
+            )
+    if steps and steps[-1].kind == "assign":
+        yield f"The last statement sets {steps[-1].value}: end with the expression to simulate."
+
+
+def _short(step: Node) -> str:
+    text = write(step)
+    return text if len(text) <= 40 else f"{text[:39]}…"
 
 
 @functools.lru_cache(maxsize=4096)
@@ -209,8 +240,8 @@ def _calls(tree: Node, table: dict[str, OperatorInfo]) -> Iterator[str]:
         info = table.get(node.value)
         if info is None:
             yield f"{node.value} is not one of your operators."
-        elif not _takes(info, len(node.args)):
-            yield f"{node.value} does not take {_inputs(len(node.args))}."
+        elif (problem := arity_problem(node, info)) is not None:
+            yield problem
 
 
 def _inputs(count: int) -> str:

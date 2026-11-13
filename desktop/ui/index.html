@@ -40,6 +40,9 @@
         line-height: 1.5;
         opacity: 0.72;
       }
+      #slow:empty {
+        display: none;
+      }
       #detail {
         min-height: 1.5em;
         font-size: 12px;
@@ -132,6 +135,7 @@
       <div class="bar" role="progressbar" aria-label="Starting Alpha Harness"></div>
       <p id="status" role="status">Starting…</p>
       <p id="detail"></p>
+      <p id="slow" role="status"></p>
     </main>
     <script>
       // The supervisor reports each step: asked once for the one it is on, then told the rest.
@@ -142,6 +146,8 @@
         if (text) status.textContent = text;
         detail.textContent = "";
       };
+      // Said once a start has taken a while, and kept through the steps after it.
+      const slow = document.getElementById("slow");
       const tauri = window.__TAURI__;
       // macOS draws its own window buttons; elsewhere these stand in for the missing title bar.
       if (tauri && !navigator.userAgent.includes("Mac")) {
@@ -162,6 +168,11 @@
           .then(() =>
             tauri.event.listen("startup-detail", (event) => {
               detail.textContent = event.payload;
+            }),
+          )
+          .then(() =>
+            tauri.event.listen("startup-slow", (event) => {
+              slow.textContent = event.payload;
             }),
           )
           .then(() => tauri.core.invoke("startup_status"))

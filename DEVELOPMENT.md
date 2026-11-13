@@ -33,27 +33,18 @@ cd backend && uvx -c dist/constraints.txt --from dist/alpha_harness-*.whl alpha-
 | ----------------------- | --------------------------------------------------------------- |
 | `lefthook run format`   | Fixes and formats everything, and regenerates `frontend/src/api/generated.ts` |
 | `lefthook run check`    | Lint, types (pyrefly, basedpyright, tsc), API contract, wasm, DESIGN.md |
-| `lefthook run test`     | pytest + vitest                                                 |
 | `lefthook run build`    | Vite build + `backend/dist/constraints.txt`                     |
-| `lefthook run gate`     | check → test → build. **Run this before tagging a release.**    |
+| `lefthook run gate`     | check → build. **Run this before tagging a release.**    |
 
 Changed a backend response model? Run `lefthook run format`, or `check` fails on a stale `generated.ts`.
 
-## Tests, one at a time
+## Module self-checks
+
+Many backend modules check themselves when run directly (from `backend/`):
 
 ```bash
-# Backend (from backend/)
-uv run pytest                                  # everything
-uv run pytest tests/test_packer.py             # one file
-uv run pytest -k retired                       # tests whose name matches
-uv run python -m alpha_harness.handover        # one module's built-in self-check
-
-# Frontend (from frontend/)
-TZ=America/Los_Angeles pnpm exec vitest run                          # everything
-TZ=America/Los_Angeles pnpm exec vitest run src/lib/clipboard.test.ts # one file
+uv run python -m alpha_harness.handover
 ```
-
-The `TZ` is deliberate: west of UTC is where a date read in local time shows the day before.
 
 ## Generated files
 

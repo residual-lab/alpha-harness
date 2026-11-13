@@ -49,9 +49,23 @@ class OperatorInfo:
     maximum: int | None
     #: Each parameter as the definition writes it, e.g. ``("x", "d", "constant = 0")``.
     params: tuple[str, ...] = ()
+    #: The names of the inputs written by position, e.g. ``("x", "d")``. Every other
+    #: parameter is an option BRAIN only takes by name.
+    inputs: tuple[str, ...] = ()
+    #: Options BRAIN wants written out even though the definition gives a default, with
+    #: that default: ``(("k", "1"),)``.
+    explicit: tuple[tuple[str, str], ...] = ()
 
 
 _SIGNATURE = re.compile(r"([A-Za-z_]\w*)\s*\(")
+#: How BRAIN describes an operator taking any number of inputs when its signature does not.
+_VARIADIC = re.compile(r"two or more inputs|all inputs|at least 2 inputs", re.IGNORECASE)
+#: Options BRAIN refuses to default ("Required attribute "k" must have a value") although
+#: the definitions give one.
+EXPLICIT = ("k", "target_tvr")
+#: Operators BRAIN has accepted without those options thousands of times: writing them out
+#: would only turn identical Alphas into new text, and spend quota on them again.
+DEFAULTS_ACCEPTED = frozenset({"ts_backfill"})
 _QUOTES = "\"'“”"
 
 
@@ -65,29 +79,91 @@ def operator_table(
     commas inside quotes are not separators; an operator whose definition cannot be read is
     left out, so it never passes validation.
     """
-    table: dict[str, OperatorInfo] = {}
+    read: list[tuple[str, dict[str, Any], list[str]]] = []
     for operator in operators:
         name, definition = operator.get("name"), operator.get("definition")
         if not isinstance(name, str) or not isinstance(definition, str):
-            continue
-        scopes = operator.get("scope")
-        if isinstance(scopes, list) and scopes and scope not in scopes:
             continue
         match = _SIGNATURE.search(definition)
         if match is None or match.group(1) != name:
             continue
         params = _signature_params(definition, match.end())
-        if params is None:
+        if params is not None:
+            read.append((name, operator, params))
+    # A keyword whose "default" is one of these names is an input in disguise:
+    # ``ts_backfill(x, lookback = d, k = 1)`` needs its lookback, given by position.
+    bare = {p for _, _, params in read for p in params if _bare(p) and p.isidentifier()}
+    placeholders = bare - {"true", "false", "nan"}
+    table: dict[str, OperatorInfo] = {}
+    for name, operator, params in read:
+        scopes = operator.get("scope")
+        if isinstance(scopes, list) and scopes and scope not in scopes:
             continue
-        variadic = any(".." in p for p in params)
+        inputs = tuple(
+            _keyword(p)[0]
+            for p in params
+            if _bare(p) or ("=" in p and _keyword(p)[1] in placeholders)
+        )
+        variadic = any(".." in p for p in params) or bool(
+            _VARIADIC.search(str(operator.get("description") or ""))
+        )
         table[name] = OperatorInfo(
             name=name,
             category=str(operator.get("category") or ""),
-            required=sum(1 for p in params if "=" not in p and ".." not in p),
-            maximum=None if variadic else len(params),
+            required=len(inputs),
+            maximum=None if variadic else len(inputs),
             params=tuple(params),
+            inputs=inputs,
+            explicit=()
+            if name in DEFAULTS_ACCEPTED
+            else tuple(kv for p in params if "=" in p and (kv := _keyword(p))[0] in EXPLICIT),
         )
     return table
+
+
+def arity_problem(call: Node, info: OperatorInfo) -> str | None:
+    """Why BRAIN would refuse this call's inputs, or nothing."""
+    count = len(call.args)
+    # A required input may be named rather than placed: kth_element(x, 15, k = 1).
+    given = {*info.inputs[:count], *(key for key, _ in call.kwargs)}
+    if any(name not in given for name in info.inputs):
+        return f"{call.value} does not take {count} input{'' if count == 1 else 's'}."
+    if info.maximum is not None and count > info.maximum:
+        # BRAIN counts only what is written by position: rank(x, 2) is two inputs.
+        options = [_keyword(p)[0] for p in info.params if _keyword(p)[0] not in info.inputs]
+        named = f": write {options[0]}=… by name" if options else ""
+        plural = "" if info.maximum == 1 else "s"
+        return f"{call.value} takes {info.maximum} input{plural}{named}."
+    return None
+
+
+def _bare(param: str) -> bool:
+    return "=" not in param and ".." not in param
+
+
+def _keyword(param: str) -> tuple[str, str]:
+    """``"k = 1"`` as ``("k", "1")``; a bare parameter as its name and nothing."""
+    name, _, default = param.partition("=")
+    return name.strip(), default.strip()
+
+
+def explicit(tree: Node, table: dict[str, OperatorInfo]) -> Node:
+    """``tree`` with every option BRAIN will not default written out, as its default."""
+    node = Node(
+        tree.kind,
+        tree.value,
+        tuple(explicit(a, table) for a in tree.args),
+        tuple((k, explicit(v, table)) for k, v in tree.kwargs),
+    )
+    info = table.get(node.value) if node.kind == "call" else None
+    return node if info is None else written_out(node, info)
+
+
+def written_out(call: Node, info: OperatorInfo) -> Node:
+    """One call with the options BRAIN will not default written out, as their defaults."""
+    given = {k for k, _ in call.kwargs}
+    missing = tuple((key, parse(value)) for key, value in info.explicit if key not in given)
+    return Node(call.kind, call.value, call.args, call.kwargs + missing) if missing else call
 
 
 def _signature_params(definition: str, start: int) -> list[str] | None:
@@ -552,17 +628,8 @@ def validate(
             if info is None:
                 problems.append(f"{node.value} is not an operator on BRAIN.")
                 continue
-            count = len(node.args)
-            supplied = count + len(node.kwargs)
-            # A required input may be named rather than placed: kth_element(x, 15, k = 1).
-            names = [p.split("=")[0].strip() for p in info.params]
-            given = {*names[:count], *(key for key, _ in node.kwargs)}
-            required = [
-                n for p, n in zip(info.params, names, strict=True) if "=" not in p and ".." not in p
-            ]
-            short = any(n not in given for n in required) if info.params else count < info.required
-            if short or (info.maximum is not None and supplied > info.maximum):
-                problems.append(f"{node.value} does not take {supplied} inputs.")
+            if (problem := arity_problem(node, info)) is not None:
+                problems.append(problem)
         elif (
             node.kind == "name"
             # A keyword value names an option (``driver=gaussian``), not a data field.

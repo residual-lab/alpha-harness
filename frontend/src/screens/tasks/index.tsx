@@ -178,7 +178,12 @@ export function TasksScreen() {
     open.filter((t) => t.status === 'RUNNING'),
     (t) => t.cores,
   )
-  const assignedCores = total(open, (t) => t.cores)
+  // Cores a task holds or waits for. A paused or idle one gives its cores back, and summing
+  // those read as 156 cores assigned on an 8-core account.
+  const assignedCores = total(
+    open.filter((t) => t.status === 'RUNNING' || t.status === 'QUEUED'),
+    (t) => t.cores,
+  )
   const waiting = all.filter((t) => t.status === 'QUEUED').length
   const fresh = all.filter((t) => t.status === 'IDLE').length
   const selected = all.find((t) => t.id === selectedId) ?? null

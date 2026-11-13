@@ -78,9 +78,9 @@ export const simulations = {
   active: () => http.get<SimulationRow[]>('/api/simulations/active'),
   engine: () => http.get<EngineStatus>('/api/simulations/engine'),
   /** Cancel by record id. Cancel the batch PARENT: a child cannot be cancelled on BRAIN. */
-  cancel: (recordId: number) =>
+  cancel: (recordId: number, force = false) =>
     http.post<{ acknowledged: boolean; simulation: SimulationRow | null }>(
-      `/api/simulations/${recordId}/cancel`,
+      `/api/simulations/${recordId}/cancel${force ? '?force=true' : ''}`,
     ),
   /** Drop queued work that has not been sent. Omit `task` to drop everything queued. */
   dropQueue: (task?: string) =>

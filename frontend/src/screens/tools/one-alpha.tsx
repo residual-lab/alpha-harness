@@ -47,6 +47,8 @@ export function AlphaPanel({
   error: unknown
   problems: readonly string[] | undefined
 }) {
+  // An expression pasted here reaches BRAIN as an Alpha ID and comes back "not found".
+  const notAnId = draft.trim() !== '' && !/^[A-Za-z0-9]+$/.test(draft.trim())
   return (
     <Panel title="Alpha">
       <form onSubmit={onAnalyse} className="flex flex-wrap items-end gap-3">
@@ -58,10 +60,16 @@ export function AlphaPanel({
             className="num"
           />
         </Field>
-        <Button type="submit" variant="primary" disabled={!draft.trim()}>
+        <Button type="submit" variant="primary" disabled={!draft.trim() || notAnId}>
           Analyse
         </Button>
       </form>
+      {notAnId && (
+        <Notice tone="warn" title="That looks like an expression, not an Alpha ID" className="mt-3">
+          Paste the Alpha&apos;s ID or its BRAIN link. To try an expression at other settings, use
+          the Settings Sampler.
+        </Notice>
+      )}
       {error != null && <ErrorNotice error={error} title="Could not read this Alpha" />}
       {problems?.map((problem) => (
         <Notice key={problem} tone="error" title={problem} className="mt-3" />

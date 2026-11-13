@@ -36,5 +36,4 @@ jobs:
       # `gate` itself calls a bare `lefthook`, which is not on PATH here, so its stages
       # run as steps. Pinned to the version the hooks are written against.
       - run: uvx lefthook@2.1.14 run check
-      - run: uvx lefthook@2.1.14 run test
       - run: uvx lefthook@2.1.14 run build

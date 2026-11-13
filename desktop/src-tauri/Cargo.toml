@@ -31,6 +31,8 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+# Also in the build through Tauri: Python 3.14 needs Windows 10, which the first start checks.
+windows-version = "=0.1.7"
 
 # No LTO and the default codegen units: measured, a release build takes 40% less time for a
 # binary 2 MB bigger, next to the 330 MB the first start downloads anyway.

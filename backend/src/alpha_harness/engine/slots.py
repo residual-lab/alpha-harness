@@ -64,6 +64,8 @@ log = structlog.get_logger(__name__)
 
 #: Added to a batched simulation's outcome when BRAIN named no child, so it was matched by order.
 POSITIONAL_NOTE = "Matched to this request by submission order."
+#: Times one request is sent again after BRAIN failed its whole batch on its own side.
+FAILED_BATCH_RESENDS = 1
 
 #: How often the engine looks for work.
 TICK_SECONDS = 2.0
@@ -378,11 +380,9 @@ class BatchEngine:
         Except a batch it opened that also carries another task's simulations: cancelling
         it would take theirs with it, so it is left to finish.
 
-        Best effort on purpose. A simulation BRAIN has already finished refuses to cancel,
-        and marking it cancelled here would hide an alpha that exists — so the refusal is
-        left to the next poll, which records what really happened. The *task* ends either
-        way: a task is a local scheduling object, and a simulation that outlives it still
-        lands in the vault with the quota it already spent.
+        Only ever the second press of Stop, so a cancel BRAIN refuses still ends the row
+        here: a batch BRAIN has wedged would otherwise keep its core for good. An alpha BRAIN
+        finishes anyway stays on BRAIN, where the vault's capture still finds it.
         """
         async with self.db.session() as session:
             rows = list(
@@ -415,7 +415,7 @@ class BatchEngine:
 
         async def stop(record_id: int) -> None:
             async with gate:
-                await self.tracker.cancel(record_id)
+                await self.tracker.cancel(record_id, force=True)
 
         outcomes = await asyncio.gather(*(stop(r) for r in rows), return_exceptions=True)
         for record_id, outcome in zip(rows, outcomes, strict=True):
@@ -1109,6 +1109,26 @@ class BatchEngine:
                 await self.tracker.notify()
             return
 
+        if not attributed and all(outcomes[c].status == SimStatus.FAILED for c in child_ids):
+            # BRAIN failed every child on its own side ("experiencing some difficulties"),
+            # so who was matched to whom cannot matter: each request is sent once more.
+            again = [r.id for r in open_rows if r.orphan_requeues < FAILED_BATCH_RESENDS]
+            async with self.db.session() as session:
+                await transition(
+                    session,
+                    again,
+                    from_=ACTIVE,
+                    status=SimStatus.QUEUED,
+                    parent_record_id=None,
+                    platform_id=None,
+                    sent_at=None,
+                    submitted_at=None,
+                    finished_at=None,
+                    orphan_requeues=SimulationRecord.orphan_requeues + 1,
+                    message="BRAIN failed this whole batch on its side; sent again.",
+                )
+            log.warning("engine.failed_batch_resent", parent=parent.id, requests=len(again))
+            open_rows = [r for r in open_rows if r.id not in again]
         await self._finish_children(open_rows, resolved, outcomes)
         async with self.db.session() as session:
             # Its children are all in, so it no longer holds a slot on BRAIN either. A

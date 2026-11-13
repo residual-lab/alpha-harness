@@ -240,8 +240,9 @@ class AlphaPageRequest(BaseModel):
     minimum: dict[str, float] = Field(default_factory=dict)
     maximum: dict[str, float] = Field(default_factory=dict)
     search: str | None = None
-    #: Alphas carrying any of these tags.
+    #: Alphas carrying any of these tags, or all of them with ``tags_all``.
     tags: list[str] | None = None
+    tags_all: bool = False
     #: Days on BRAIN's clock, both included.
     created_after: date | None = None
     created_before: date | None = None
@@ -276,6 +277,86 @@ class NetFigures(Out):
 class AfterCost(Out):
     #: By Alpha, only those whose daily PnL and turnover are stored here; nothing is downloaded.
     figures: dict[str, NetFigures]
+
+
+#: The most Alphas one analysis reads, as the Portfolio's own combination takes.
+GROUP_LIMIT = 2000
+#: A tag as BRAIN keeps them: letters, digits, "_" and "-".
+TAG = r"^[A-Za-z0-9_-]{1,40}$"
+
+
+class AlphaGroup(Out):
+    """Every Alpha a filter keeps, for analysing them together."""
+
+    alpha_ids: list[str]
+    #: More matched than one analysis reads; the newest are the ones listed.
+    more: bool
+
+
+class TaggedRequest(BaseModel):
+    tags: list[Annotated[str, Field(pattern=TAG)]] = Field(min_length=1, max_length=20)
+
+
+class AlphaIdList(BaseModel):
+    alpha_ids: list[str] = Field(min_length=1, max_length=GROUP_LIMIT, alias="alphaIds")
+
+    model_config = {"populate_by_name": True}
+
+
+class JobStarted(Out):
+    task_id: str
+
+
+@router.post("/alphas/group")
+async def alpha_group(body: AlphaPageRequest, state: State) -> AlphaGroup:
+    """The Alphas a filter keeps, newest first, ready to be analysed as one portfolio."""
+    found = await state.alphas.matching_ids(
+        limit=GROUP_LIMIT + 1,
+        submitted=body.submitted,
+        regions=body.regions,
+        delays=body.delays,
+        universes=body.universes,
+        minimum=body.minimum,
+        maximum=body.maximum,
+        search=body.search,
+        tags=body.tags,
+        tags_all=body.tags_all,
+        created_after=body.created_after,
+        created_before=body.created_before,
+    )
+    return AlphaGroup(alpha_ids=found[:GROUP_LIMIT], more=len(found) > GROUP_LIMIT)
+
+
+@router.post("/import-tagged")
+async def import_tagged(body: TaggedRequest, state: State) -> JobStarted:
+    """Bring in every Alpha BRAIN lists under any of these tags, made here or elsewhere."""
+    try:
+        task_id = await state.backfill.start_tagged(list(dict.fromkeys(body.tags)))
+    except RuntimeError as exc:
+        raise refuse(409, "already_running", str(exc)) from exc
+    return JobStarted(task_id=task_id)
+
+
+@router.post("/download-pnl")
+async def download_pnl(body: AlphaIdList, state: State) -> JobStarted:
+    """Download the daily PnL and turnover these Alphas lack, so they can be analysed."""
+    alpha_ids = list(dict.fromkeys(body.alpha_ids))
+
+    async def work(task: Any) -> str:
+        lacking = await state.alphas.lacking_series(alpha_ids)
+        failed = await state.backfill.fetch_each(
+            task, lacking, state.backfill.fetch_returns, what="PnL and turnover"
+        )
+        done = len(lacking) - len(failed)
+        return f"Downloaded {done} of {len(lacking)}" + (
+            f"; {len(failed)} could not be read" if failed else ""
+        )
+
+    try:
+        task_id = await state.backfill.start_job("group-pnl", "PnL for an Alpha group", work)
+    except RuntimeError as exc:
+        raise refuse(409, "already_running", str(exc)) from exc
+    return JobStarted(task_id=task_id)
 
 
 @router.post("/alphas/after-cost")

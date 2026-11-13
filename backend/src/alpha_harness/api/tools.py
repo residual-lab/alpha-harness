@@ -7,6 +7,7 @@ simulates on its own: previews only read, and queueing hands work to the schedul
 lab.
 """
 
+import re
 from typing import Annotated, Any, Literal, Self
 
 from fastapi import APIRouter
@@ -42,6 +43,20 @@ from .portfolio import CopiedAlphas, copied_alphas
 from .vault import AlphaSettings
 
 router = APIRouter(prefix="/api/tools", tags=["tools"])
+
+
+def alpha_id_of(text: str) -> str:
+    """An Alpha ID as typed, or a plain refusal: an expression pasted here would reach BRAIN
+    as ``GET /alphas/<expression>`` and come back as "not found"."""
+    alpha_id = text.strip()
+    if not re.fullmatch(r"[A-Za-z0-9]{1,64}", alpha_id):
+        raise refuse(
+            422,
+            "not_an_alpha_id",
+            "That looks like an expression, not an Alpha ID. Paste the Alpha's ID or its BRAIN "
+            "link here; to try an expression at other settings, use the Settings Sampler.",
+        )
+    return alpha_id
 
 
 class Pair(Out):
@@ -114,7 +129,7 @@ class SettingsPlan(Out):
 class PreviewRequest(BaseModel):
     """An Alpha to read, or a bare expression with the decay and truncation to hold it at."""
 
-    alpha_id: str = Field(default="", max_length=64, alias="alphaId")
+    alpha_id: str = Field(default="", max_length=10_000, alias="alphaId")
     expression: str | None = Field(default=None, max_length=20_000)
     #: Each one left out keeps the source Alpha's own value, or the platform default when
     #: there is no Alpha.
@@ -137,7 +152,7 @@ class PreviewRequest(BaseModel):
     async def plan(self, state: Any) -> dict[str, Any]:
         return await settings_sampler.plan(
             state,
-            self.alpha_id.strip(),
+            alpha_id_of(self.alpha_id) if self.alpha_id.strip() else "",
             expression=self.expression.strip() if self.expression else None,
             decay=self.decay,
             truncation=self.truncation,
@@ -340,7 +355,7 @@ class CustomReshape(BaseModel):
 
 
 class BreakerRequest(BaseModel):
-    alpha_id: str = Field(min_length=1, max_length=64, alias="alphaId")
+    alpha_id: str = Field(min_length=1, max_length=10_000, alias="alphaId")
     #: Which recipes to run; empty means every one the plan offers.
     recipes: list[str] = Field(default_factory=list, max_length=100)
     #: Re-shapes of the consultant's own, offered beside the built-in ones.
@@ -351,7 +366,7 @@ class BreakerRequest(BaseModel):
 
     def plan(self, state: Any) -> Any:
         return correlation_breaker.plan(
-            state, self.alpha_id.strip(), [(c.id, c.name.strip(), c.code) for c in self.custom]
+            state, alpha_id_of(self.alpha_id), [(c.id, c.name.strip(), c.code) for c in self.custom]
         )
 
 
@@ -469,7 +484,7 @@ class FieldsPlan(Out):
 
 
 class FieldsRequest(BaseModel):
-    alpha_id: str = Field(min_length=1, max_length=64, alias="alphaId")
+    alpha_id: str = Field(min_length=1, max_length=10_000, alias="alphaId")
     mode: fields_sampler.Mode = "sweep"
     #: Similar: the most fields taken from each tier. Buckets: the picks from each bucket.
     k: int = Field(default=10, ge=1, le=50)
@@ -491,14 +506,14 @@ async def fields_preview(body: FieldsRequest, state: State) -> FieldsPlan:
 
     Free: reads the Alpha and the catalog, simulates nothing.
     """
-    found = await fields_sampler.plan(state, body.alpha_id.strip(), body.mode, body.k)
+    found = await fields_sampler.plan(state, alpha_id_of(body.alpha_id), body.mode, body.k)
     return FieldsPlan.model_validate(found)
 
 
 @router.post("/fields-sampler/tasks")
 async def fields_task(body: FieldsRequest, state: State) -> AddedTask:
     """Queue the chosen fields' swaps, and let every winner be swept the same way after."""
-    found = await fields_sampler.plan(state, body.alpha_id.strip(), body.mode, body.k)
+    found = await fields_sampler.plan(state, alpha_id_of(body.alpha_id), body.mode, body.k)
     if found["problems"]:
         raise refuse(422, "fields_sampler_blocked", found["problems"][0])
     wanted = set(body.fields)

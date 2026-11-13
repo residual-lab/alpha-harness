@@ -47,6 +47,13 @@ class Preferences(Out):
     #: The model that writes Power Pool descriptions, as ``provider:model``; unset, the set-up
     #: model with the largest daily allowance.
     description_model: str | None = None
+    #: Tag every Alpha a lab makes on BRAIN, as ACE's notebooks do, so it can be found there.
+    #: Off by default: each tag is one more request to BRAIN.
+    auto_tag: bool = False
+    #: The tag, written beside "<tag>_<lab>" for the lab that made the Alpha.
+    auto_tag_name: str = Field(
+        default="harness", min_length=1, max_length=40, pattern=r"^[A-Za-z0-9_-]+$"
+    )
 
 
 async def load(db: Database) -> Preferences:
@@ -89,9 +96,24 @@ class BreakerReshapes(Out):
     reshapes: list[OwnRecipe] = Field(default_factory=list[OwnRecipe], max_length=50)
 
 
+class TagGroup(Out):
+    """Tags the Alphas screen filters by together, kept under a name: a list of Alphas."""
+
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=60)
+    tags: list[Annotated[str, Field(max_length=40)]] = Field(min_length=1, max_length=20)
+    #: Alphas carrying every tag rather than any one of them.
+    every: bool = False
+
+
+class TagGroups(Out):
+    groups: list[TagGroup] = Field(default_factory=list[TagGroup], max_length=50)
+
+
 #: Their rows in ``preference``, beside the Settings screen's choices, which never read them.
 SUPER_LAB = "super_lab_recipes"
 BREAKER = "correlation_breaker_reshapes"
+TAG_GROUPS = "alpha_tag_groups"
 
 
 async def kept[M: BaseModel](db: Database, key: str, model: type[M]) -> M | None:
@@ -118,6 +140,7 @@ def apply(state: AppState, preferences: Preferences) -> None:
     )
     updates.check_hours = preferences.update_check_hours
     updates.auto_install = preferences.auto_update
+    state.autotag.name = preferences.auto_tag_name if preferences.auto_tag else None
 
 
 if __name__ == "__main__":

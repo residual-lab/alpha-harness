@@ -31,8 +31,9 @@ export interface AlphaPageRequest {
   minimum?: Partial<Record<AlphaMetricKey, number>>
   maximum?: Partial<Record<AlphaMetricKey, number>>
   search?: string | null
-  /** Alphas carrying any of these tags. */
+  /** Alphas carrying any of these tags, or all of them with `tags_all`. */
   tags?: string[] | null
+  tags_all?: boolean
   /** `YYYY-MM-DD` days on BRAIN's clock, both included. */
   created_after?: string | null
   created_before?: string | null
@@ -87,6 +88,15 @@ export const pool = {
   summary: () => http.get<Record<string, number>>('/api/alphas/summary'),
   sync: () => http.post<Schemas['SyncStarted']>('/api/vault/sync'),
   query: (body: AlphaPageRequest) => http.post<AlphaPage>('/api/vault/alphas/query', body),
+  /** Every Alpha the filters keep, newest first: what a tag group analyses. */
+  group: (body: AlphaPageRequest) =>
+    http.post<Schemas['AlphaGroup']>('/api/vault/alphas/group', body),
+  /** Stores what BRAIN holds under any of these tags. A background job; reads only. */
+  importTagged: (tags: string[]) =>
+    http.post<Schemas['JobStarted']>('/api/vault/import-tagged', { tags }),
+  /** Downloads the PnL these Alphas lack. A background job; reads only. */
+  downloadPnl: (alphaIds: string[]) =>
+    http.post<Schemas['JobStarted']>('/api/vault/download-pnl', { alphaIds }),
   detail: (alphaId: string) =>
     http.get<AlphaDetail>(`/api/vault/alphas/${encodeURIComponent(alphaId)}/detail`),
   /** Downloads the daily PnL from BRAIN the first time, so it can take a while. */

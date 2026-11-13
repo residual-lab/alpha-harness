@@ -71,6 +71,7 @@ async def _plan(body: SearchRequest, state: Any) -> dict[str, Any]:
         "cs": list(cat.cs),
         "ts": list(cat.ts),
         "group": list(cat.group),
+        "keywords": cat.keywords,
         "vector": market["vector"],
         "lookbacks": list(search.LOOKBACKS),
         "groups": list(search.GROUPS),

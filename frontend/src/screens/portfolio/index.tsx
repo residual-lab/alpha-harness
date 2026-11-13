@@ -6,20 +6,19 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { CopyIcon, RefreshCwIcon } from 'lucide-react'
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { tasks } from '@/api/core'
 import { errorMessage } from '@/api/http'
 import { REGION_AGNOSTIC_CLASS } from '@/api/platform'
 import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
-import { CORE_METRICS, CORE_ORDER, DASH, fmt } from '@/lib/format'
+import { CORE_ORDER, DASH, fmt } from '@/lib/format'
 import { useLive } from '@/lib/live'
 import { useDebounced } from '@/lib/use-debounced'
 import {
   AlphaTable,
   type AlphaTableRow,
-  CostInput,
   fromMember,
   useCostBps,
   useNetBps,
@@ -31,28 +30,17 @@ import {
   Chips,
   Disclosure,
   ErrorNotice,
-  figureTone,
   Notice,
   Page,
   PageHeader,
   Panel,
   Progress,
   Skeleton,
-  signTone,
-  TEXT_TONE,
   Textarea,
 } from '@/ui/kit'
-import { type Column, DataTable } from '@/ui/table'
-import {
-  type PortfolioMember,
-  type PortfolioResult,
-  type PortfolioStats,
-  portfolio,
-  type Windows,
-} from './api'
-import { ChartLegend, PortfolioChart } from './chart'
-import { CorrelationMatrix } from './correlation'
+import { type PortfolioMember, portfolio } from './api'
 import { PyramidPicker } from './pyramid-grid'
+import { PortfolioResults } from './results'
 import { compile, SelectionError } from './selection'
 import { EXAMPLE, SelectionInfo } from './selection-info'
 
@@ -80,25 +68,6 @@ const facetOf = (key: string) => FACETS.find((f) => f.key === key) as Facet
 
 /** Where the table's choice of columns and its cost are kept. */
 const VIEW = 'portfolio'
-
-function metricColumns<T>(
-  get: (row: T) => Partial<Record<(typeof CORE_ORDER)[number], number | null>> | null,
-) {
-  return CORE_ORDER.map((key): Column<T> => {
-    const m = CORE_METRICS[key]
-    return {
-      key,
-      header: m.label,
-      align: 'right',
-      // "39.23 bps" is the widest figure; at the shared width it wrapped onto two lines.
-      width: key === 'margin' ? 'minmax(100px,1fr)' : 'minmax(84px,1fr)',
-      cell: (row) => {
-        const value = get(row)?.[key]
-        return <span className={cn('num', TEXT_TONE[figureTone(key, value)])}>{m.show(value)}</span>
-      },
-    }
-  })
-}
 
 /** The latest Portfolio sync, running or just finished. */
 function useLastSync() {
@@ -406,92 +375,7 @@ export function PortfolioScreen() {
           </p>
         </Panel>
       ) : (
-        <div
-          className={cn('flex flex-col gap-4 transition-opacity', combinedStale && 'opacity-50')}
-        >
-          <Panel
-            title="Combined In-Sample Performance"
-            actions={<ChartLegend testStart={result.testStart} />}
-            bodyClassName="flex flex-col gap-4"
-          >
-            <StatsTable result={result} windows={result.stats} />
-            <PortfolioChart
-              dates={result.dates}
-              curve={result.curve}
-              testStart={result.testStart}
-              label="Cumulative PnL and drawdown of the combined Alphas"
-            />
-          </Panel>
-
-          <Panel
-            title="Estimated After-Cost Performance"
-            actions={
-              <span className="flex items-center gap-2 text-body text-ink-muted">
-                Cost
-                <CostInput view={VIEW} />
-                bps
-              </span>
-            }
-            bodyClassName="flex flex-col gap-4"
-          >
-            <StatsTable result={result} windows={result.afterCost} />
-            <PortfolioChart
-              dates={result.dates}
-              curve={result.afterCostCurve}
-              testStart={result.testStart}
-              label="Cumulative after-cost PnL and drawdown of the combined Alphas"
-            />
-          </Panel>
-
-          <Panel title="Yearly">
-            <DataTable
-              label="Yearly stats of the combined Alphas"
-              rows={result.yearly}
-              rowKey={(r) => String(r.year)}
-              columns={YEARLY_COLUMNS}
-              maxHeight="none"
-            />
-          </Panel>
-
-          {result.alphas > 1 && (
-            <Panel
-              title="Correlation"
-              description={
-                <>
-                  Pearson Correlation of Daily PnL over the last 4 years.
-                  <br />
-                  Each square is a pair of Alphas, in submission order: newest at the top left,
-                  oldest at the bottom right. Hover a square for the pair.
-                </>
-              }
-              actions={
-                <div className="grid grid-cols-[auto_auto_auto] items-baseline gap-x-2 gap-y-0.5 text-body text-ink-muted">
-                  {(
-                    [
-                      ['Highest', result.highest],
-                      ['Lowest', result.lowest],
-                    ] as const
-                  ).map(
-                    ([label, pair]) =>
-                      pair && (
-                        <Fragment key={label}>
-                          <span>{label}</span>
-                          <span className="num text-right text-ink">
-                            {fmt.ratio(pair.correlation, 4)}
-                          </span>
-                          <span className="mono-metric text-ink-subtle">
-                            {pair.a} · {pair.b}
-                          </span>
-                        </Fragment>
-                      ),
-                  )}
-                </div>
-              }
-            >
-              <CorrelationMatrix result={result} onOpen={detail.open} />
-            </Panel>
-          )}
-        </div>
+        <PortfolioResults result={result} stale={combinedStale} view={VIEW} onOpen={detail.open} />
       )}
     </Page>
   )
@@ -553,75 +437,6 @@ function FacetBlock({
     </div>
   )
 }
-
-const WINDOWS: { key: keyof Windows; label: string }[] = [
-  { key: 'inSample', label: 'In Sample' },
-  { key: 'train', label: 'Train Period' },
-  { key: 'test', label: 'Test Period' },
-]
-
-interface WindowRow {
-  label: string
-  span: string
-  stats: PortfolioStats | null
-}
-
-const STATS_COLUMNS: Column<WindowRow>[] = [
-  {
-    key: 'period',
-    header: 'Period',
-    width: 'minmax(300px,2fr)',
-    cell: (r) => (
-      <span className="flex min-w-0 items-baseline gap-3">
-        <span className="text-ink">{r.label}</span>
-        <span className="num truncate text-body-compact text-ink-subtle">{r.span}</span>
-      </span>
-    ),
-  },
-  ...metricColumns<WindowRow>((r) => r.stats),
-]
-
-function StatsTable({ result, windows }: { result: PortfolioResult; windows: Windows | null }) {
-  const rows = WINDOWS.flatMap((w): WindowRow[] => {
-    const period = result.periods?.[w.key]
-    if (!period) return []
-    return [
-      {
-        label: w.label,
-        span: `${fmt.date(period.start)} – ${fmt.date(period.end)}`,
-        stats: windows?.[w.key] ?? null,
-      },
-    ]
-  })
-  return (
-    <DataTable
-      label="Performance by period"
-      rows={rows}
-      rowKey={(r) => r.label}
-      columns={STATS_COLUMNS}
-      maxHeight="none"
-    />
-  )
-}
-
-type YearRow = PortfolioResult['yearly'][number]
-
-const YEARLY_COLUMNS: Column<YearRow>[] = [
-  {
-    key: 'year',
-    header: 'Year',
-    width: '80px',
-    cell: (r) => <span className="num">{r.year}</span>,
-  },
-  ...metricColumns<YearRow>((r) => r),
-  {
-    key: 'pnl',
-    header: 'PnL',
-    align: 'right',
-    width: 'minmax(110px,1fr)',
-    cell: (r) => <span className={cn('num', TEXT_TONE[signTone(r.pnl)])}>{fmt.int(r.pnl)}</span>,
-  },
-]
 
 interface FamilyShape {
   parent: string

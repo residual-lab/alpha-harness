@@ -13,11 +13,12 @@ fails past 8,000 operators in all, and drops what does not fit.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..brain.platform import SUPER_ALPHA_MIN_SELECTION, SUPER_ALPHA_OPERATOR_LIMIT
 from ..brain.schemas import FULL_MODE, SimulationRequest, SimulationSettings, SimulationType
 from ..db.models import Trial, TrialState
+from .fastexpr import operator_table
 from .scheduler import PENDING_SEND
 
 if TYPE_CHECKING:
@@ -70,15 +71,16 @@ def selections(limit: int) -> list[Recipe]:
 
 
 #: Weighting schemes from BRAIN's own combo examples and their risk-aware variants.
+ROLLING_IR = "stats = generate_stats(alpha);\nmax(ts_ir(stats.returns, 250), 0)"
+#: The same ratio for an account without ``ts_ir``, which BRAIN refuses there as an
+#: "inaccessible or unknown operator". The guard follows Inverse volatility's.
+ROLLING_IR_PORTABLE = (
+    "stats = generate_stats(alpha);\n"
+    "max(ts_mean(stats.returns, 250) / (ts_std_dev(stats.returns, 250) + 0.0001), 0)"
+)
 COMBOS = [
     Recipe("Equal weight", "1"),
-    # Rolling IR as mean / std dev: ``ts_ir`` is not offered to every account, and BRAIN
-    # rejects a combo using it ("inaccessible or unknown operator").
-    Recipe(
-        "Rolling Sharpe",
-        "stats = generate_stats(alpha);\n"
-        "max(ts_mean(stats.returns, 250) / (ts_std_dev(stats.returns, 250) + 0.0001), 0)",
-    ),
+    Recipe("Rolling IR", ROLLING_IR),
     Recipe(
         "Least crowded",
         "stats = generate_stats(alpha);\n"
@@ -92,6 +94,18 @@ COMBOS = [
         "stats = generate_stats(alpha);\n1 / (ts_std_dev(stats.returns, 120) + 0.0001)",
     ),
 ]
+
+
+def combos_for(operators: list[dict[str, Any]]) -> list[Recipe]:
+    """The built-in combos as this account can run them.
+
+    Rolling IR keeps ``ts_ir`` where the account has it, so its simulations still match
+    the ones already run; elsewhere, and when the operators could not be read, it is
+    written without.
+    """
+    if operators and "ts_ir" in operator_table(operators, "COMBO"):
+        return COMBOS
+    return [Recipe(r.name, ROLLING_IR_PORTABLE) if r.code == ROLLING_IR else r for r in COMBOS]
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,6 +11,7 @@ retry loop that tries each key in turn burns a request from every key on a bad d
 
 import asyncio
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -68,8 +69,28 @@ def _is_rate_limit(exc: Exception) -> tuple[bool, bool]:
     if _out_of_credit(text):
         return False, False
     limited = _status(exc) == 429 or "resource_exhausted" in text or "quota" in text
-    daily = "per day" in text or "perday" in text or "daily" in text or "requests per day" in text
+    daily = (
+        "per day" in text
+        or "perday" in text
+        or "daily" in text
+        or "requests per day" in text
+        or _no_quota(text)
+    )
     return limited, daily
+
+
+def _no_quota(text: str) -> bool:
+    """Google says ``limit: 0`` when a model has no free quota at all on that key."""
+    return re.search(r"limit:\s*0(?![\d.])|quotavalue\W+0(?![\d.])", text) is not None
+
+
+def _rate_limit_reason(exc: Exception, model_id: str, *, daily: bool) -> str:
+    """What to show against a key the provider turned away, instead of its JSON."""
+    if _no_quota(str(exc).lower()):
+        return f"{model_id} has no free quota on this key. Choose another model."
+    if daily:
+        return f"{model_id} has used its daily allowance on this key."
+    return f"{model_id} is over its per-minute limit on this key."
 
 
 def _plain_reason(exc: Exception) -> str | None:
@@ -216,7 +237,14 @@ class LLMService:
         if spec is None:
             gone = get_provider(provider)
             raise LLMError(f"{gone.label} cannot be used. {gone.retired}")
-        return OpenAICompatible(spec.base_url, secret, self._http)
+        # Anthropic's native endpoints (the model list the key check reads) want these two
+        # headers and answer "x-api-key header is required" to Bearer alone.
+        headers = (
+            {"x-api-key": secret, "anthropic-version": "2023-06-01"}
+            if provider == "anthropic"
+            else None
+        )
+        return OpenAICompatible(spec.base_url, secret, self._http, headers)
 
     async def runnable(self) -> list[dict[str, Any]]:
         """Set-up models whose provider has an enabled Key, most requests left today first.
@@ -344,7 +372,12 @@ class LLMService:
                         tried.discard(key_id)
                         continue
                     limited, daily = _is_rate_limit(exc)
-                    await self.keys.mark(key_id, error=str(exc)[:300])
+                    await self.keys.mark(
+                        key_id,
+                        error=_rate_limit_reason(exc, model.id, daily=daily)
+                        if limited
+                        else str(exc)[:300],
+                    )
                     if limited:
                         # Google is the authority: mark this pair spent and rotate rather than
                         # retrying into a limit we evidently mis-tracked.

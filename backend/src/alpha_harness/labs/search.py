@@ -65,6 +65,8 @@ FAMILIES = ("cs", "ts", "group", "cs_ts", "ts_ts", "group_ts")
 POOL_LIMIT = 20_000
 
 #: Cleaning operators, and operators whose inputs do not fit a one-field shape.
+#: The second input a two-input shape writes, by slot: a lookback, or a grouping.
+SECOND_INPUT = {"ts": "d", "group": "group"}
 EXCLUDED = frozenset(
     {
         "ts_backfill",
@@ -99,6 +101,8 @@ class Catalogue:
     ts: tuple[str, ...]
     group: tuple[str, ...]
     vector: tuple[str, ...]
+    #: Options to write after an operator's inputs, by operator: ``{"ts_moment": "k=0"}``.
+    keywords: dict[str, str]
 
 
 def _kind(info: OperatorInfo) -> str | None:
@@ -122,14 +126,24 @@ def catalogue(operators: list[dict[str, Any]]) -> Catalogue:
     Anything else, and the cleaning operators, never fill a slot.
     """
     slots: dict[str, list[str]] = {"cs": [], "ts": [], "group": [], "vector": []}
+    keywords: dict[str, str] = {}
     for name, info in sorted(operator_table(operators, "REGULAR").items()):
         kind = _kind(info)
         if kind is None or name in EXCLUDED:
             continue
         inputs = 2 if kind in ("ts", "group") else 1
-        if info.required == inputs and (info.maximum is None or info.maximum >= inputs):
+        # The shape writes a lookback or a grouping second: an operator wanting another
+        # series there would be handed a number.
+        second = SECOND_INPUT.get(kind)
+        if (
+            info.required == inputs
+            and (info.maximum is None or info.maximum >= inputs)
+            and (second is None or info.inputs[1:2] == (second,))
+        ):
             slots[kind].append(name)
-    return Catalogue(**{kind: tuple(names) for kind, names in slots.items()})
+            if info.explicit:
+                keywords[name] = ", ".join(f"{key}={value}" for key, value in info.explicit)
+    return Catalogue(**{kind: tuple(names) for kind, names in slots.items()}, keywords=keywords)
 
 
 def families(cat: Catalogue) -> tuple[str, ...]:
@@ -155,23 +169,31 @@ def base(field_id: str, vector_op: str | None = None, backfill: int = BACKFILL) 
     return f"ts_backfill({inner}, {backfill})"
 
 
-def render(params: dict[str, Any], backfill: int = BACKFILL) -> str:
+def render(
+    params: dict[str, Any], backfill: int = BACKFILL, keywords: dict[str, str] | None = None
+) -> str:
     """The Fast Expression for one point of the search."""
     b = base(params["field"], params.get("vector_op"), backfill)
+    written = keywords or {}
+
+    def call(op: str, *inputs: object) -> str:
+        options = written.get(op)
+        return f"{op}({', '.join(map(str, inputs))}{', ' + options if options else ''})"
+
     match params["family"]:
         case "cs":
-            return f"{params['cs']}({b})"
+            return call(params["cs"], b)
         case "ts":
-            return f"{params['ts']}({b}, {params['d']})"
+            return call(params["ts"], b, params["d"])
         case "group":
-            return f"{params['group_op']}({b}, {params['group']})"
+            return call(params["group_op"], b, params["group"])
         case "cs_ts":
-            return f"{params['cs']}({params['ts']}({b}, {params['d']}))"
+            return call(params["cs"], call(params["ts"], b, params["d"]))
         case "ts_ts":
-            inner = f"{params['ts']}({b}, {params['d']})"
-            return f"{params['ts_outer']}({inner}, {params['d_outer']})"
+            inner = call(params["ts"], b, params["d"])
+            return call(params["ts_outer"], inner, params["d_outer"])
         case "group_ts":
-            return f"{params['group_op']}({params['ts']}({b}, {params['d']}), {params['group']})"
+            return call(params["group_op"], call(params["ts"], b, params["d"]), params["group"])
         case _:
             raise ValueError(f"Unknown shape {params['family']!r}")
 
@@ -279,7 +301,11 @@ def request_for(params: dict[str, Any], run: SearchParams) -> SimulationRequest:
             truncation=TRUNCATION,
         ),
         # A task added before backfills followed the category carries every field 21 days.
-        regular=render(params, (run.space.get("backfill") or {}).get(params["field"], BACKFILL)),
+        regular=render(
+            params,
+            (run.space.get("backfill") or {}).get(params["field"], BACKFILL),
+            run.space.get("keywords"),
+        ),
     )
 
 

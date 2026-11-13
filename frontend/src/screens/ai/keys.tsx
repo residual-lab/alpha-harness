@@ -54,6 +54,7 @@ export function Keys() {
 
   const { data } = keys
   const retired = data.keys.filter((k) => k.retired)
+  const failing = data.keys.filter((k) => k.lastError && !k.retired)
   if (data.keys.length === 0) {
     return (
       <Panel>
@@ -166,6 +167,17 @@ export function Keys() {
           it again later.
         </Confirm>
       </Panel>
+      {failing.length > 0 && (
+        <Notice tone="warn" title="Some Keys are failing">
+          <ul className="flex flex-col gap-1">
+            {failing.map((k) => (
+              <li key={k.id}>
+                <span className="font-medium">{nameOf(k)}:</span> {k.lastError}
+              </li>
+            ))}
+          </ul>
+        </Notice>
+      )}
     </div>
   )
 }

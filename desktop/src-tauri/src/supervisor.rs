@@ -88,6 +88,11 @@ const QUIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// before terminating it: the request cannot reach it until its port is open.
 const START_TIMEOUT: Duration = Duration::from_mins(1);
 const POLL: Duration = Duration::from_millis(250);
+/// How long a start goes unanswered before the start-up page says it may simply be slow. Only
+/// words: a first start after an update can migrate the database for minutes.
+const SLOW_START: Duration = Duration::from_mins(2);
+const SLOW_START_TEXT: &str = "Still starting. The first start after an update can take a few \
+    minutes. Open Log Folder in the tray menu shows what it is doing.";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -254,7 +259,8 @@ fn log() -> &'static Mutex<Log> {
 
 /// Copy one of the app's streams into the log a whole line at a time, so a line of its stdout
 /// never lands inside one of its stderr, nor the log starts afresh in the middle of one.
-fn pump(pipe: impl Read, log: &Mutex<Log>) {
+/// `seen` is shown each line once it is in the log.
+fn pump(pipe: impl Read, log: &Mutex<Log>, mut seen: impl FnMut(&str)) {
     let mut pipe = BufReader::new(pipe);
     let mut line = Vec::new();
     while pipe.read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
@@ -265,6 +271,7 @@ fn pump(pipe: impl Read, log: &Mutex<Log>) {
         log.lock()
             .unwrap_or_else(PoisonError::into_inner)
             .append(&line);
+        seen(&String::from_utf8_lossy(&line));
         line.clear();
     }
 }
@@ -865,10 +872,30 @@ fn worker(name: &str, work: impl FnOnce() + Send + 'static) {
 
 /// Copy one of the app's streams into the log on a thread of its own, which lets go of `done`
 /// once the stream ends.
-fn copy_to_log(name: &str, pipe: Option<impl Read + Send + 'static>, done: Sender<()>) {
+/// What the app's start-up says it is about to do, in the words of the start-up page. Each event
+/// is logged once its step is done, so the text names the step that follows.
+const START_STEPS: [(&str, &str); 3] = [
+    ("catalog.opened", "Checking your data…"),
+    ("db.snapshot", "Updating your data…"),
+    ("db.migrated", "Opening your Alphas…"),
+];
+
+fn report_progress(app: &AppHandle, line: &str) {
+    if let Some((_, text)) = START_STEPS.iter().find(|(event, _)| line.contains(event)) {
+        status(app, text);
+    }
+}
+
+fn copy_to_log(
+    app: &AppHandle,
+    name: &str,
+    pipe: Option<impl Read + Send + 'static>,
+    done: Sender<()>,
+) {
     if let Some(pipe) = pipe {
+        let app = app.clone();
         worker(name, move || {
-            pump(pipe, log());
+            pump(pipe, log(), |line| report_progress(&app, line));
             drop(done);
         });
     }
@@ -967,8 +994,8 @@ fn start(app: &AppHandle, slot: &str) -> i32 {
     }
     // Every sender is gone once the app has exited and its last lines are in the log.
     let (exited, events) = mpsc::channel();
-    copy_to_log("app-stdout", child.stdout.take(), exited.clone());
-    copy_to_log("app-stderr", child.stderr.take(), exited.clone());
+    copy_to_log(app, "app-stdout", child.stdout.take(), exited.clone());
+    copy_to_log(app, "app-stderr", child.stderr.take(), exited.clone());
     let exit = exit_of(&child);
     if let Ok(mut held) = CHILD.lock() {
         // Quit chosen while it was starting found nothing to close, so it is closed here.
@@ -987,9 +1014,16 @@ fn start(app: &AppHandle, slot: &str) -> i32 {
     // Until it serves, served.json is looked for every so often; after, only the app's exit
     // wakes this thread.
     let mut navigated = false;
+    let mut told_slow = false;
+    let began = Instant::now();
+    let _ = app.emit("startup-slow", "");
     while let Err(RecvTimeoutError::Timeout) =
         events.recv_timeout(if navigated { Duration::MAX } else { POLL })
     {
+        if !navigated && !told_slow && began.elapsed() >= SLOW_START {
+            let _ = app.emit("startup-slow", SLOW_START_TEXT);
+            told_slow = true;
+        }
         // Proven as soon as it serves: a tray app can run for weeks before it ever exits.
         if !QUITTING.load(Ordering::SeqCst)
             && let Some((version, port)) = served_at(&read_json(&served))
@@ -1001,6 +1035,7 @@ fn start(app: &AppHandle, slot: &str) -> i32 {
             navigated = true;
         }
     }
+    let _ = app.emit("startup-slow", "");
     let code = reap();
     // Its last lines, a traceback say, belong in the log before anything reads it.
     let _ = events.recv_timeout(DRAIN);
@@ -1265,6 +1300,22 @@ fn supervise(app: &AppHandle, uv: &Path) -> i32 {
     }
 }
 
+/// This PC's Windows, when it is older than the Python the app runs on supports: that fails deep
+/// inside `NumPy` with a DLL error nobody can act on.
+#[cfg(windows)]
+fn windows_too_old() -> Option<String> {
+    let version = windows_version::OsVersion::current();
+    if version.major >= 10 {
+        return None;
+    }
+    Some(match (version.major, version.minor) {
+        (6, 3) => "8.1".to_owned(),
+        (6, 2) => "8".to_owned(),
+        (6, 1) => "7".to_owned(),
+        (major, minor) => format!("{major}.{minor}"),
+    })
+}
+
 fn run(app: &AppHandle) -> i32 {
     if let Err(error) = fs::create_dir_all(root()) {
         fail(
@@ -1274,6 +1325,14 @@ fn run(app: &AppHandle) -> i32 {
         return 1;
     }
     note(&format!("Alpha Harness {BUILD_VERSION} (desktop)"));
+    #[cfg(windows)]
+    if let Some(version) = windows_too_old() {
+        fail(
+            app,
+            &format!("Alpha Harness needs Windows 10 or later. This PC runs Windows {version}."),
+        );
+        return 1;
+    }
     let deadline = Instant::now() + CLAIM_WAIT;
     let mut claimed = claim();
     if !claimed {
@@ -1389,8 +1448,8 @@ mod tests {
         let mut child = run_child(&format!("lines {lines}"));
         let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
         thread::scope(|scope| {
-            scope.spawn(|| pump(stdout, &log));
-            scope.spawn(|| pump(stderr, &log));
+            scope.spawn(|| pump(stdout, &log, |_| {}));
+            scope.spawn(|| pump(stderr, &log, |_| {}));
             for number in 0..lines / 10 {
                 log.lock().unwrap().append(line('n', number).as_bytes());
             }

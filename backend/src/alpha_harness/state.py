@@ -43,6 +43,7 @@ from .realtime import (
 )
 from .sealing import Sealer
 from .tasks import TaskRegistry, cancel_background, spawn
+from .vault.autotag import AutoTagger
 from .vault.backfill import Backfill
 from .vault.store import AlphaVault
 
@@ -89,12 +90,13 @@ class AppState:
             self.tasks,
             on_stored=lambda payload: self.hub.broadcast(TOPIC_SIMULATIONS, payload, replay=False),
         )
+        self.autotag = AutoTagger(self.db, self.alphas, self.endpoints)
         self.tracker = SimulationTracker(
             self.db,
             self.endpoints,
             on_change=lambda payload: self.hub.broadcast(TOPIC_SIMULATIONS, payload),
             on_unauthorized=self.renew_session,
-            on_alpha=self.backfill.capture,
+            on_alpha=self.alpha_landed,
         )
         self.engine = BatchEngine(
             self.db, self.endpoints, self.tracker, on_unauthorized=self.renew_session
@@ -290,6 +292,11 @@ class AppState:
             if targets:
                 log.info("sync.first_started", markets=len(targets))
                 await self.sync.start_all(targets, first=STARTER)
+
+    async def alpha_landed(self, alpha_id: str) -> None:
+        """Store an Alpha a simulation made, then tag it on BRAIN if Settings asks to."""
+        await self.backfill.capture(alpha_id)
+        await self.autotag.landed(alpha_id)
 
     async def renew_session(self, *, expiring: bool = False) -> bool:
         """Whether BRAIN will take requests now, signing in again if it will not.

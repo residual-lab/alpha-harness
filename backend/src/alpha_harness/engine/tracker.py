@@ -74,6 +74,17 @@ LOST = (
     "BRAIN answered every read of this simulation with a server error for 30 minutes while "
     "answering everything else, so it is no longer waited on."
 )
+#: How long a simulation may report itself running with its progress standing still. BRAIN
+#: has left batches at one percentage for half a day, holding a core all the while.
+STALLED_AFTER_SECONDS = 3 * 60 * 60
+STALLED = (
+    "BRAIN showed no progress on this simulation for 3 hours, so it was cancelled and its "
+    "core freed."
+)
+FORCED = (
+    "Force-stopped: BRAIN did not confirm the cancel, so its core was freed here. Anything "
+    "BRAIN still finishes stays on BRAIN."
+)
 
 
 class SimulationTracker:
@@ -106,6 +117,9 @@ class SimulationTracker:
         self._failing_since: dict[str, float] = {}
         #: Server errors in a row per simulation, which space its next read out.
         self._errors: dict[str, int] = {}
+        #: Platform id -> the progress it last reported and when that last changed. In memory
+        #: only, so a restart gives every simulation its full time again.
+        self._progress_since: dict[str, tuple[float | None, float]] = {}
         #: Adopted rows this process is sending right now. Their ``created_at`` is when
         #: they were queued, so without this the stale-send check could orphan one
         #: mid-request.
@@ -257,11 +271,12 @@ class SimulationTracker:
 
     # -- cancellation ----------------------------------------------------
 
-    async def cancel(self, record_id: int) -> bool:
+    async def cancel(self, record_id: int, *, force: bool = False) -> bool:
         """Cancel a simulation and mark it locally.
 
-        Returns ``False`` when nothing was cancelled: the row had already ended, or BRAIN did
-        not confirm stopping it.
+        Returns ``False`` when BRAIN did not confirm stopping it, or the row had already
+        ended. With ``force``, a refused cancel still ends the row here: the person asked
+        twice, and a batch BRAIN has wedged would otherwise hold its core for good.
         """
         record = await self.get(record_id)
         if record is None:
@@ -289,16 +304,18 @@ class SimulationTracker:
                 return False
 
         platform_id = record.platform_id
-        ok = await self.endpoints.cancel_simulation(platform_id)
-        log.info("sim.cancelled", record_id=record_id, platform_id=platform_id, ok=ok)
-        if not ok:
+        try:
+            ok = await self.endpoints.cancel_simulation(platform_id)
+        except BrainError:
+            ok = False
+        log.info("sim.cancelled", record_id=record_id, platform_id=platform_id, ok=ok, force=force)
+        if not ok and not force:
             # Refused: it already finished, or BRAIN lost it. Marking it CANCELLED would
             # hide a result that exists, so the next poll records what really happened.
             self.watch(platform_id)
             return False
-        await self._mark(record_id, SimStatus.CANCELLED, finished=True)
-        self._next_poll.pop(platform_id, None)
-        self._failing_since.pop(platform_id, None)
+        await self._mark(record_id, SimStatus.CANCELLED, message=None if ok else FORCED)
+        self._forget(platform_id)
         return ok
 
     # -- reads -----------------------------------------------------------
@@ -537,6 +554,11 @@ class SimulationTracker:
         elif await self._lost(platform_id):
             log.warning("sim.lost", platform_id=platform_id)
             outcome, body = Outcome("gone", SimStatus.ERROR, message=LOST), {}
+        if outcome.kind == "pending" and self._stalled(platform_id, outcome.progress):
+            log.warning("sim.stalled", platform_id=platform_id, progress=outcome.progress)
+            with contextlib.suppress(BrainError):
+                await self.endpoints.cancel_simulation(platform_id)
+            outcome, body = Outcome("gone", SimStatus.TIMEOUT, message=STALLED), {}
 
         now = time.monotonic()
         match outcome.kind:
@@ -554,10 +576,22 @@ class SimulationTracker:
             case "unauthorized":
                 self._next_poll[platform_id] = now + 10.0
             case "fanout" | "gone" | "finished":
-                self._next_poll.pop(platform_id, None)
-                self._failing_since.pop(platform_id, None)
-                self._errors.pop(platform_id, None)
+                self._forget(platform_id)
         return outcome, body
+
+    def _forget(self, platform_id: str) -> None:
+        """Drop what is kept about a simulation that will not be read again."""
+        for kept in (self._next_poll, self._failing_since, self._errors, self._progress_since):
+            kept.pop(platform_id, None)
+
+    def _stalled(self, platform_id: str, progress: float | None) -> bool:
+        """Whether a running simulation's progress has stood still for too long."""
+        now = time.monotonic()
+        last = self._progress_since.get(platform_id)
+        if last is None or last[0] != progress:
+            self._progress_since[platform_id] = (progress, now)
+            return False
+        return now - last[1] >= STALLED_AFTER_SECONDS
 
     async def _lost(self, platform_id: str) -> bool:
         """Whether BRAIN has lost this simulation rather than being down altogether.

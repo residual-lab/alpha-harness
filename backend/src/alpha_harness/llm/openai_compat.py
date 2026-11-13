@@ -37,10 +37,22 @@ class ProviderError(RuntimeError):
 class OpenAICompatible:
     """A chat-completions client for one key, on a connection pool it shares."""
 
-    def __init__(self, base_url: str, api_key: str, http: httpx2.AsyncClient) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        http: httpx2.AsyncClient,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         # No SDK retries: a 429 means this key is spent for now, which rotation answers by
         # moving to the next key, and sending it again only burns the day's requests.
-        self._sdk = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http, max_retries=0)
+        self._sdk = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=http,
+            max_retries=0,
+            default_headers=headers,
+        )
 
     async def generate(
         self,

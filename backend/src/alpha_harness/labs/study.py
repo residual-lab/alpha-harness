@@ -20,15 +20,30 @@ separately, so trials stay joinable to the simulations that produced them.
 
 import asyncio
 import contextlib
+import sqlite3
+import time
 import warnings
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+import duckdb
 import structlog
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 
 from ..brain.connection import background
-from ..brain.errors import BrainAuthError, BrainError
+from ..brain.errors import (
+    BrainAuthError,
+    BrainBusy,
+    BrainDailyLimitReached,
+    BrainError,
+    BrainPaused,
+    BrainPollTimeout,
+    BrainRateLimited,
+    BrainServerError,
+    BrainServiceUnavailable,
+    BrainTransportError,
+)
 from ..brain.platform import IGNORED_CHECKS, QUOTA_CHECKS
 from ..brain.schemas import FULL_MODE, QUICK_MODE
 from ..db.models import (
@@ -71,6 +86,36 @@ log = structlog.get_logger(__name__)
 
 #: How often a running study looks for finished trials.
 POLL_SECONDS = 5.0
+#: How long a study may keep failing for a reason that passes by itself before it is failed.
+TRANSIENT_FOR_SECONDS = 30 * 60
+#: Ticks in a row a study may fail for any other reason: one glitch is not a broken task.
+FAULTS_ALLOWED = 3
+
+
+def _failure_kind(exc: BaseException) -> str:
+    """``wait`` when BRAIN cannot be asked at all, which the connection banner already says;
+    ``transient`` when it passes by itself; ``fault`` for anything that may not."""
+    if isinstance(exc, BrainPaused | BrainAuthError | BrainDailyLimitReached):
+        return "wait"
+    if isinstance(
+        exc,
+        BrainRateLimited
+        | BrainBusy
+        | BrainServiceUnavailable
+        | BrainServerError
+        | BrainTransportError
+        | BrainPollTimeout
+        | TimeoutError
+        | duckdb.TransactionException,
+    ):
+        return "transient"
+    # Only a lock: the same class also carries a missing table or a full disk.
+    if isinstance(exc, OperationalError) and isinstance(exc.orig, sqlite3.OperationalError):
+        reason = str(exc.orig).lower()
+        if "locked" in reason or "busy" in reason:
+            return "transient"
+    return "fault"
+
 
 #: Statistics the local Alpha store keeps, so objectives on them need no second BRAIN read.
 VAULT_STATS = frozenset(
@@ -117,6 +162,8 @@ class Optimizer:
         #: Cores no running task holds, while Settings lends them; 0 otherwise. Set each
         #: tick by :func:`scheduler.start_waiting`, read by :func:`scheduler.advance`.
         self.lendable_cores = 0
+        #: Study id -> ticks in a row it failed, and when the first of them did.
+        self._failing: dict[int, tuple[int, float]] = {}
         self._task: asyncio.Task[None] | None = None
 
     # -- lifecycle -------------------------------------------------------
@@ -168,10 +215,35 @@ class Optimizer:
         for study_id in ids:
             try:
                 results[study_id] = await self.advance(study_id)
-            except Exception as exc:
-                log.exception("optimize.study_failed", study_id=study_id)
-                await scheduler.finish(self, study_id, StudyStatus.FAILED, str(exc))
+            except Exception as exc:  # noqa: BLE001 - _give_up sorts and logs every error
+                reason = self._give_up(study_id, exc)
+                if reason is not None:
+                    await scheduler.finish(self, study_id, StudyStatus.FAILED, reason)
+            else:
+                self._failing.pop(study_id, None)
         return results
+
+    def _give_up(self, study_id: int, exc: Exception) -> str | None:
+        """Why ``study_id`` should fail now, or ``None`` to try it again next tick."""
+        kind = _failure_kind(exc)
+        if kind == "wait":
+            log.info("optimize.study_waiting", study_id=study_id, error=str(exc))
+            return None
+        now = time.monotonic()
+        count, since = self._failing.get(study_id, (0, now))
+        self._failing[study_id] = (count + 1, since)
+        if count == 0:
+            log.exception("optimize.study_error", study_id=study_id, kind=kind)
+        else:
+            log.warning("optimize.study_error", study_id=study_id, kind=kind, error=str(exc))
+        if kind == "transient" and now - since < TRANSIENT_FOR_SECONDS:
+            return None
+        if kind == "fault" and count + 1 < FAULTS_ALLOWED:
+            return None
+        del self._failing[study_id]
+        log.error("optimize.study_failed", study_id=study_id, kind=kind)
+        reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        return reason if kind == "fault" else f"Kept failing for 30 minutes. {reason}"
 
     def lock(self, study_id: int) -> asyncio.Lock:
         return self._locks.setdefault(study_id, asyncio.Lock())

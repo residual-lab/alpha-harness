@@ -27,7 +27,7 @@ from ..brain.schemas import region_label
 from ..catalog.queries import FieldFilter, Tuple4
 from ..db.models import Template, utcnow
 from ..labs import search, template
-from ..labs.fastexpr import Node, ParseError, operator_table
+from ..labs.fastexpr import Node, OperatorInfo, ParseError, operator_table
 from ..labs.launch import (
     NO_NEUTRALIZATION,
     NO_SIMULATIONS,
@@ -118,6 +118,8 @@ class OperatorDoc(Out):
     #: Its signature as BRAIN publishes it, e.g. ``ts_rank(x, d, constant = 0)``.
     definition: str
     description: str
+    #: The inputs written by position, e.g. ``["x", "lookback"]`` for ``ts_backfill``.
+    inputs: list[str]
 
 
 class TemplateLabOptions(Out):
@@ -240,6 +242,7 @@ async def options(state: State, refresh: bool = False) -> TemplateLabOptions:
                     "category": str(o.get("category") or ""),
                     "definition": str(o.get("definition") or ""),
                     "description": str(o.get("description") or ""),
+                    "inputs": list(regular[o["name"]].inputs),
                 }
                 for o in operators
                 if o.get("name") in regular
@@ -249,6 +252,16 @@ async def options(state: State, refresh: bool = False) -> TemplateLabOptions:
             "maxSimulations": search.MAX_SIMULATIONS,
         }
     )
+
+
+#: What an example writes for each input an operator names.
+_EXAMPLE_INPUTS = {"x": "rank(x)", "d": "20", "lookback": "20", "group": "industry"}
+
+
+def _example(call: str, info: OperatorInfo | None) -> str:
+    """A call written the way the operator takes it: ``$group_op(rank(x), industry)``."""
+    inputs = info.inputs if info is not None else ("x", "d")
+    return f"{call}({', '.join(_EXAMPLE_INPUTS.get(name, name) for name in inputs)})"
 
 
 def _missing(tree: Node, known: set[str]) -> list[str]:
@@ -684,10 +697,11 @@ async def _plan(body: TemplateTask, state: Any) -> dict[str, Any]:
         one = len(names) == 1
         what = f"{', '.join(names)} {'is an operator' if one else 'are operators'}"
         it = "it" if one else "they"
+        example = _example(f"${reader}" if reader else names[0], table.get(names[0]))
         problems_of(reader).append(
-            f"{what}: write ${reader}(…) around what {it} should wrap, e.g. ${reader}(rank(x), 20)."
+            f"{what}: write ${reader}(…) around what {it} should wrap, e.g. {example}."
             if reader
-            else f"{what}: call {it} on what {it} should wrap, e.g. {names[0]}(rank(x), 20)."
+            else f"{what}: call {it} on what {it} should wrap, e.g. {example}."
         )
     kept: list[str] = []
     for universe in universes:
