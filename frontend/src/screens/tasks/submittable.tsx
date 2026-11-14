@@ -20,6 +20,9 @@ import { Button, Chips, Disclosure, ErrorNotice, Field, Input, Panel } from '@/u
 import { type Column, DataTable, type Sort } from '@/ui/table'
 
 type SubmissionPick = components['schemas']['SubmissionPick']
+type Blocked = components['schemas']['Blocked']
+/** A blocked Alpha that passes if submitted first, beside the pick it would go ahead of. */
+type PassesFirst = Blocked & { turn: number; bySharpe: number | null | undefined }
 
 /** A task's columns, minus Checks Failed — every row here has none — plus the task. */
 const OFFER = [...TASK_OFFER.filter((k) => k !== 'failedChecks'), 'taskName']
@@ -311,6 +314,36 @@ const PICK_COLUMNS: Column<SubmissionPick & { turn: number }>[] = [
   },
 ]
 
+const FIRST_COLUMNS: Column<PassesFirst>[] = [
+  {
+    key: 'alphaId',
+    header: 'Alpha',
+    width: '120px',
+    cell: (r) => <span className="num">{r.alphaId}</span>,
+  },
+  {
+    key: 'sharpe',
+    header: 'Sharpe',
+    align: 'right',
+    cell: (r) => <span className="num">{fmt.ratio(r.sharpe)}</span>,
+  },
+  {
+    key: 'by',
+    header: 'Submit Before',
+    cell: (r) => (
+      <span className="num">
+        #{fmt.int(r.turn)} · {r.by}
+      </span>
+    ),
+  },
+  {
+    key: 'bySharpe',
+    header: 'Its Sharpe',
+    align: 'right',
+    cell: (r) => <span className="num">{fmt.ratio(r.bySharpe)}</span>,
+  },
+]
+
 /**
  * Submits greedily without submitting: best After-Cost Sharpe first, each pick joining its
  * region's Power Pool before the rest are judged again, as they would be after a real
@@ -328,6 +361,15 @@ function SubmissionOrder({
   const order = useMutation({ mutationFn: () => labTasks.powerPoolOrder(alphaIds) })
   const found = order.data
   const picks = useMemo(() => (found?.picks ?? []).map((p, i) => ({ ...p, turn: i + 1 })), [found])
+  const first = useMemo(() => {
+    const byId = new Map(picks.map((p) => [p.alphaId, p]))
+    return (found?.blocked ?? []).flatMap((b): PassesFirst[] => {
+      const blocker = byId.get(b.by)
+      return b.passesFirst && blocker
+        ? [{ ...b, turn: blocker.turn, bySharpe: blocker.sharpe }]
+        : []
+    })
+  }, [found, picks])
 
   return (
     <Panel
@@ -356,6 +398,8 @@ function SubmissionOrder({
             {fmt.int(found.picks.length + found.blocked.length + found.unmeasured.length)} Pass
             Power Pool Correlation today → {fmt.int(found.picks.length)} can be submitted one after
             another · {fmt.int(found.blocked.length)} blocked by an earlier pick
+            {first.length > 0 &&
+              ` · ${fmt.int(first.length)} would pass if submitted before their blocker`}
             {found.unmeasured.length > 0 &&
               ` · ${fmt.int(found.unmeasured.length)} not measured: no daily PnL stored`}
           </p>
@@ -374,6 +418,29 @@ function SubmissionOrder({
             empty="Nothing here passes Power Pool Correlation today."
             maxHeight="50vh"
           />
+          {first.length > 0 && (
+            <>
+              <p className="mt-4 mb-3 text-body-compact text-ink-muted">
+                Blocked, but each would still pass if submitted before its blocker, whose Sharpe
+                clears 1.10× its own. That keeps both of the pair; a later pick it collides with is
+                not judged again.
+              </p>
+              <DataTable
+                label="Would pass if submitted first"
+                rows={first}
+                columns={FIRST_COLUMNS}
+                rowKey={(r) => r.alphaId}
+                activeKey={openAlpha}
+                onRowClick={(r, _event, shown) =>
+                  onOpenAlpha(
+                    r.alphaId,
+                    shown.map((p) => p.alphaId),
+                  )
+                }
+                maxHeight="30vh"
+              />
+            </>
+          )}
         </>
       )}
     </Panel>

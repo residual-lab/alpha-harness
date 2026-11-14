@@ -2111,6 +2111,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/today/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run Today
+         * @description Run some of today's unclaimed simulations now, with nothing to choose.
+         *
+         *     Half goes to a Fields Sampler swapping the fields of the best Top pick, which builds on
+         *     what already held up; half to Search Lab over the pyramids not yet formulated this
+         *     quarter, so the day does not only clone what exists. Either takes the whole run when the
+         *     other has nothing to do. Every task is planned before any is added.
+         */
+        post: operations["run_today_api_today_run_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tools/correlation-breaker/preview": {
         parameters: {
             query?: never;
@@ -3016,6 +3041,10 @@ export interface components {
             alphaId: string;
             /** By */
             by: string;
+            /** Passesfirst */
+            passesFirst: boolean;
+            /** Sharpe */
+            sharpe: number | null;
         };
         /**
          * BrainPayload
@@ -5512,7 +5541,8 @@ export interface components {
         };
         /**
          * SubmissionOrder
-         * @description Greedy submission, best After-Cost Sharpe first, worked out without submitting.
+         * @description Greedy submission, best After-Cost Sharpe first, worked out without submitting. A
+         *     blocked Alpha says when submitting it before its blocker would keep both.
          */
         SubmissionOrder: {
             /** Blocked */
@@ -5610,6 +5640,8 @@ export interface components {
             implausibleHidden: number;
             /** Markets */
             markets: components["schemas"]["SubmittableMarket"][];
+            /** Nearmissalphas */
+            nearMissAlphas: components["schemas"]["SubmittableAlpha"][];
             /** Nearmisses */
             nearMisses: number;
             /** Pending */
@@ -6159,6 +6191,23 @@ export interface components {
              */
             step: "sign-in" | "add-key" | "ready";
             you: components["schemas"]["You"];
+        };
+        /** TodayRun */
+        TodayRun: {
+            /** Notes */
+            notes: string[];
+            /** Simulations */
+            simulations: number;
+            /** Tasks */
+            tasks: components["schemas"]["AddedTask"][];
+        };
+        /** TodayRunRequest */
+        TodayRunRequest: {
+            /**
+             * Simulations
+             * @default 500
+             */
+            simulations: number;
         };
         /** TodaySimulations */
         TodaySimulations: {
@@ -9581,6 +9630,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Bar"];
+                };
+            };
+        };
+    };
+    run_today_api_today_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TodayRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TodayRun"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

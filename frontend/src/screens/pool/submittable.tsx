@@ -49,6 +49,7 @@ const hiddenReasons = (data: SubmittableResponse) =>
 export function Submittable({ onOpen }: { onOpen: (alphaId: string) => void }) {
   const [scope, setScope] = useScope('pool-submittable')
   const [implausible, setImplausible] = useState(false)
+  const [showNear, setShowNear] = useState(false)
   const q = useQuery({
     queryKey: ['pool', 'submittable', scope, implausible],
     queryFn: () => pool.submittable(scope, 200, implausible),
@@ -71,14 +72,43 @@ export function Submittable({ onOpen }: { onOpen: (alphaId: string) => void }) {
             value={fmt.int(data.total)}
             tone={data.total > 0 ? 'profit' : 'neutral'}
           />
-          <Metric
-            boxed
-            label="Near Misses"
-            value={fmt.int(data.nearMisses)}
-            hint="Refused by only one or two fixable checks, such as Turnover or Fitness"
-            tone={data.nearMisses > 0 ? 'warn' : 'neutral'}
-          />
+          <button
+            type="button"
+            className="text-left enabled:hover:[&>div]:border-ink-subtle"
+            aria-expanded={showNear}
+            aria-controls="near-misses"
+            disabled={data.nearMisses === 0}
+            onClick={() => setShowNear((open) => !open)}
+          >
+            <Metric
+              boxed
+              label="Near Misses"
+              value={fmt.int(data.nearMisses)}
+              hint={
+                data.nearMisses > 0
+                  ? `Refused by only one or two fixable checks, such as Turnover or Fitness · ${showNear ? 'Hide them' : 'Show them'}`
+                  : 'Refused by only one or two fixable checks, such as Turnover or Fitness'
+              }
+              tone={data.nearMisses > 0 ? 'warn' : 'neutral'}
+            />
+          </button>
         </div>
+      )}
+      {data && showNear && data.nearMisses > 0 && (
+        <section id="near-misses" aria-label="Near Misses" className="flex flex-col gap-2">
+          <h3 className="font-semibold text-body text-ink">Near Misses</h3>
+          <p className="text-body-compact text-ink-subtle">
+            Each was refused only by checks a re-run can often fix: try Sweep Decay for Turnover or
+            Fitness, and Correlation Breaker for Self-Correlation, from its menu.
+            {data.nearMissAlphas.length < data.nearMisses &&
+              ` The first ${fmt.int(data.nearMissAlphas.length)} of ${fmt.int(data.nearMisses)}, by Sharpe.`}
+          </p>
+          <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+            {data.nearMissAlphas.map((a) => (
+              <Card key={a.alphaId} alpha={a} onOpen={onOpen} />
+            ))}
+          </div>
+        </section>
       )}
       {q.isError && <ErrorNotice error={q.error} title="Could not read submittable Alphas" />}
       {(implausible || (data?.implausibleHidden ?? 0) > 0) && (
@@ -193,7 +223,11 @@ function Card({
   )
   const [sharpeBar, fitnessBar] = [limits['LOW_SHARPE'], limits['LOW_FITNESS']]
   const [turnoverLow, turnoverHigh] = [limits['LOW_TURNOVER'], limits['HIGH_TURNOVER']]
-  const passed = a.checks.filter((c) => c.result === 'PASS')
+  // Failures first: on a near miss they are why it is shown.
+  const shown = [
+    ...a.checks.filter((c) => c.result === 'FAIL'),
+    ...a.checks.filter((c) => c.result === 'PASS'),
+  ]
 
   const copy = () =>
     navigator.clipboard.writeText(a.expression ?? '').then(
@@ -270,9 +304,9 @@ function Card({
           <Sparkline values={a.pnl} label={`Cumulative PnL of ${a.alphaId}`} />
         </div>
       )}
-      {passed.length > 0 && (
+      {shown.length > 0 && (
         <div className="flex flex-wrap gap-1">
-          {passed.map((c, i) => (
+          {shown.map((c, i) => (
             <CheckBadge key={`${c.name}-${i}`} check={c} />
           ))}
         </div>

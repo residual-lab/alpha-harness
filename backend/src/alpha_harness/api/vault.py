@@ -104,8 +104,10 @@ class SubmittableResponse(Out):
     pending: int
     #: Submittable but left out for an implausible Sharpe (beyond ±10 in any period).
     implausible_hidden: int = 0
-    #: Failing one or two fixable checks.
+    #: Failing one or two fixable checks; an implausible Sharpe is left out, as above.
     near_misses: int
+    #: The first of them by Sharpe, as many as ``limit``; none when only counts were asked.
+    near_miss_alphas: list[SubmittableAlpha]
     #: Why submittable Alphas are not on the shortlist.
     held_out_failed: int
     unvalidated: int

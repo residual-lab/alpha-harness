@@ -515,7 +515,7 @@ async def list_tasks(state: State) -> LabTasks:
     )
 
 
-async def _queue(state: Any, ids: list[int]) -> None:
+async def queue_tasks(state: Any, ids: list[int]) -> None:
     """Hand tasks to the scheduler. Each starts as soon as its cores fit."""
     queued_at = utcnow().isoformat()
     # The same lock ``remove`` holds, so a task cannot be queued while it is being deleted.
@@ -526,7 +526,8 @@ async def _queue(state: Any, ids: list[int]) -> None:
             for task_id in ids:
                 row = await session.get(Study, task_id)
                 if row is not None and row.status in RUNNABLE:
-                    if row.status == StudyStatus.FAILED:
+                    # Why it stopped by itself no longer holds once it is asked to run again.
+                    if row.status in (StudyStatus.FAILED, StudyStatus.PAUSED):
                         row.message = None
                         row.finished_at = None
                     row.status = StudyStatus.QUEUED
@@ -542,7 +543,7 @@ async def _queue(state: Any, ids: list[int]) -> None:
 async def run_all(state: State) -> LabTasks:
     """Run every task not started yet, oldest first. What does not fit waits its turn."""
     fresh = sorted(r.id for r in await _rows(state) if r.status == StudyStatus.IDLE)
-    await _queue(state, fresh)
+    await queue_tasks(state, fresh)
     return await list_tasks(state)
 
 
@@ -731,10 +732,14 @@ class Blocked(Out):
     alpha_id: str
     #: The pick whose submission blocks it.
     by: str
+    sharpe: float | None
+    #: It would still pass if submitted before ``by``, whose Sharpe clears 1.10x its own.
+    passes_first: bool
 
 
 class SubmissionOrder(Out):
-    """Greedy submission, best After-Cost Sharpe first, worked out without submitting."""
+    """Greedy submission, best After-Cost Sharpe first, worked out without submitting. A
+    blocked Alpha says when submitting it before its blocker would keep both."""
 
     candidates: int
     picks: list[SubmissionPick]
@@ -780,7 +785,15 @@ async def power_pool_order(body: AlphaIds, state: State) -> SubmissionOrder:
             )
             for row in picks
         ],
-        blocked=[Blocked(alpha_id=a, by=by) for a, by in blocked.items()],
+        blocked=[
+            Blocked(
+                alpha_id=a,
+                by=by,
+                sharpe=meta[a].get("sharpe"),
+                passes_first=power_pool.passes_first(meta, a, by),
+            )
+            for a, by in blocked.items()
+        ],
         unmeasured=unmeasured,
     )
 
@@ -791,7 +804,7 @@ async def run(task_id: int, state: State) -> LabTask:
     row = await _one(state, task_id)
     if row.status not in RUNNABLE:
         raise refuse(409, "not_runnable", "Only a task not started, paused or failed can run.")
-    await _queue(state, [task_id])
+    await queue_tasks(state, [task_id])
     return await _payload(state, task_id)
 
 

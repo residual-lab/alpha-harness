@@ -513,6 +513,12 @@ async def fields_preview(body: FieldsRequest, state: State) -> FieldsPlan:
 @router.post("/fields-sampler/tasks")
 async def fields_task(body: FieldsRequest, state: State) -> AddedTask:
     """Queue the chosen fields' swaps, and let every winner be swept the same way after."""
+    return await add_study(state, now=utcnow(), **await fields_task_args(body, state))
+
+
+async def fields_task_args(body: FieldsRequest, state: Any) -> dict[str, Any]:
+    """What :func:`add_study` stores for these swaps, refused as adding them would be. Nothing
+    is written, so a caller can plan several tasks before adding any."""
     found = await fields_sampler.plan(state, alpha_id_of(body.alpha_id), body.mode, body.k)
     if found["problems"]:
         raise refuse(422, "fields_sampler_blocked", found["problems"][0])
@@ -540,17 +546,17 @@ async def fields_task(body: FieldsRequest, state: State) -> AddedTask:
         raise refuse(422, "no_simulations", "Nothing to run: no chosen field has a swap.")
     # None set runs until no passing swap leads anywhere new. A Sweep of one field leads
     # nowhere: a winner's sweep is the same dataset again, so the first sweep is the task.
-    # Buckets grows no tree, so its grid is the task too.
+    # Buckets grows no tree, so its grid is the task too, whatever budget was asked for.
     one_sweep = body.mode == fields_sampler.SWEEP and len(found["slots"]) == 1
-    budget = body.budget or (len(chosen) if one_sweep or bucketed else MAX_SIMULATIONS)
+    budget = min(
+        body.budget or MAX_SIMULATIONS, len(chosen) if one_sweep or bucketed else MAX_SIMULATIONS
+    )
     # A budget under the first sweep runs its best-covered swaps, every field taking turns.
     chosen = chosen[:budget]
     settings = found["settings"]
-    return await add_study(
-        state,
-        now=utcnow(),
-        sampler=FIELDS_SAMPLER,
-        params=FieldsSamplerParams(
+    return {
+        "sampler": FIELDS_SAMPLER,
+        "params": FieldsSamplerParams(
             region=str(settings["region"] or ""),
             delay=int(settings["delay"] or 0),
             alpha_id=body.alpha_id,
@@ -568,13 +574,13 @@ async def fields_task(body: FieldsRequest, state: State) -> AddedTask:
             alphas=[o["alphaId"] for o in found["others"] if o["alphaId"] in include],
             cores=body.cores,
         ),
-        simulations=budget,
-        batch_size=(body.cores + 1) * MULTI_SIMULATION_SIZE,
-        template_source=found["expression"],
-        template_name=f"Fields Sampler · {body.alpha_id}"
+        "simulations": budget,
+        "batch_size": (body.cores + 1) * MULTI_SIMULATION_SIZE,
+        "template_source": found["expression"],
+        "template_name": f"Fields Sampler · {body.alpha_id}"
         + (f" +{len(sources) - 1}" if len(sources) > 1 else ""),
-        seeds=fields_sampler.seed_trials(chosen),
-    )
+        "seeds": fields_sampler.seed_trials(chosen),
+    }
 
 
 # -- Paste Alphas --------------------------------------------------------------

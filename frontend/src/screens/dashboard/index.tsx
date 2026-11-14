@@ -1,6 +1,7 @@
 /**
- * Dashboard (spec §4.1): the day in one sentence, the Submittable Alphas counter, today's
- * allowance and queue, and the work in flight. The live matrix has its own screen.
+ * Dashboard (spec §4.1): the day in one sentence, the one-click run, the Submittable Alphas
+ * counter, today's allowance and queue, and the work in flight. The live matrix has its own
+ * screen.
  */
 
 import { useQuery } from '@tanstack/react-query'
@@ -20,6 +21,7 @@ import { useRefetchOn } from '@/lib/ws'
 import { ErrorNotice, LINK, Page, Panel, Progress, Skeleton, TEXT_TONE, type Tone } from '@/ui/kit'
 import { GettingStarted } from './getting-started'
 import { OperatorUsageDialog, operatorUsage } from './operators'
+import { RunToday } from './run-today'
 import { WorkInFlight } from './work'
 
 const DAY_SECONDS = 24 * 60 * 60
@@ -52,6 +54,7 @@ export function DashboardScreen() {
         )
       )}
       <GettingStarted today={day.data} />
+      <RunToday today={day.data} />
       {day.isError && <ErrorNotice error={day.error} title="Today's figures could not load" />}
 
       {/* Five across only where every label still fits on one line. */}

@@ -67,6 +67,7 @@ from .params import (
     TEMPLATE_SAMPLER,
     SearchParams,
     params_of,
+    task_params,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -284,7 +285,16 @@ class Optimizer:
 
             # Evolution Lab breeds its own children: there is no sampler to tell.
             told = await self._harvest(row, tell=row.sampler in (SEARCH_SAMPLER, TEMPLATE_SAMPLER))
-            asked = await scheduler.advance(self, row)
+            reason = (
+                await scheduler.doomed(self, study_id)
+                if told and not task_params(row).stopping
+                else None
+            )
+            if reason is None:
+                asked = await scheduler.advance(self, row)
+            else:
+                await scheduler.finish(self, study_id, StudyStatus.PAUSED, reason)
+                asked = 0
         if told or asked:
             await self.notify()
         return {"told": told, "asked": asked}

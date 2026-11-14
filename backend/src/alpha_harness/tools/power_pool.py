@@ -293,6 +293,18 @@ def submission_order(
     return picks, blocked, unmeasured
 
 
+def passes_first(meta: dict[str, dict[str, Any]], alpha_id: str, blocker: str) -> bool:
+    """Whether ``alpha_id``, blocked once ``blocker`` joined the pool, passes if submitted
+    before it instead.
+
+    It was passing until then, so only the blocker's turn changes: the blocker must then clear
+    :data:`POWER_POOL_ESCAPE` times this Alpha's Sharpe, rounded as :func:`_verdict` rounds
+    every bar. Said of the pair alone: a later pick it collides with is not judged again.
+    """
+    own, theirs = _sharpe(meta.get(alpha_id)), _sharpe(meta.get(blocker))
+    return own is not None and theirs is not None and theirs >= round(own * POWER_POOL_ESCAPE, 4)
+
+
 def self_pools(members: Sequence[dict[str, Any]]) -> dict[str, list[str]]:
     """By region, the submitted Alphas BRAIN's SELF_CORRELATION compares an Alpha with: all but
     those classed Power Pool alone, whether or not the Alpha compared is a Power Pool one.
@@ -422,3 +434,26 @@ def _row(alpha_id: str, meta: dict[str, dict[str, Any]], sharpe: float | None) -
 def _sharpe(row: dict[str, Any] | None) -> float | None:
     value = (row or {}).get("sharpe")
     return float(value) if value is not None else None
+
+
+if __name__ == "__main__":
+    import sys
+
+    def sharpes(**by_id: float) -> dict[str, dict[str, Any]]:
+        return {alpha_id: {"sharpe": sharpe} for alpha_id, sharpe in by_id.items()}
+
+    checks = {
+        "the weaker first keeps both when the stronger clears 1.10x": passes_first(
+            sharpes(weak=1.95, strong=2.20), "weak", "strong"
+        ),
+        "1.65 clears 1.10 x 1.50 once rounded": passes_first(
+            sharpes(weak=1.50, strong=1.65), "weak", "strong"
+        ),
+        "within 10% of each other, either one blocks the other": not passes_first(
+            sharpes(weak=1.95, strong=2.10), "weak", "strong"
+        ),
+        "no Sharpe, no promise": not passes_first(sharpes(strong=2.20), "weak", "strong"),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"power pool self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

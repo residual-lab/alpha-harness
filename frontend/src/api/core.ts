@@ -47,6 +47,8 @@ export const today = {
   get: (scope?: Partial<Scope>) => http.get<Today>(`/api/today${scopeQs(scope)}`),
   /** The header clocks. Cheap. */
   bar: () => http.get<BarStatus>('/api/today/bar'),
+  /** The Dashboard's one click: the tasks it started, and why any of the run fell short. */
+  run: (simulations: number) => http.post<Schemas['TodayRun']>('/api/today/run', { simulations }),
 }
 
 /** What a person sends when they ask for help. */

@@ -110,21 +110,18 @@ async def preview(body: SearchRequest, state: State) -> Preview:
     return Preview.model_validate(await _plan(body, state))
 
 
-@router.post("/tasks", status_code=201)
-async def add_task(body: SearchRequest, state: State) -> AddedTask:
-    """Add the search to Tasks, not started. Running it is the Tasks route's job."""
+async def search_task_args(body: SearchRequest, state: Any) -> dict[str, Any]:
+    """What :func:`add_study` stores for this search, refused as adding it would be. Nothing
+    is written, so a caller can plan several tasks before adding any."""
     if body.simulations < 1:
         raise refuse(422, "no_simulations", NO_SIMULATIONS)
     plan = await _plan(body, state)
     if plan["problems"]:
         raise refuse(422, "search_blocked", plan["problems"][0])
-    now = utcnow()
     per_round, size = plan["round"], body.simulations
-    return await add_study(
-        state,
-        now=now,
-        sampler=SEARCH_SAMPLER,
-        params=SearchParams(
+    return {
+        "sampler": SEARCH_SAMPLER,
+        "params": SearchParams(
             space=plan["space"],
             region=body.region,
             delay=body.delay,
@@ -133,7 +130,13 @@ async def add_task(body: SearchRequest, state: State) -> AddedTask:
             dataset_ids=body.dataset_ids,
             n_startup_trials=startup_trials(len(plan["space"]["fields"]), size, per_round),
         ),
-        simulations=size,
-        batch_size=per_round,
-        template_source="# Search Lab writes its own expressions; there is no template.",
-    )
+        "simulations": size,
+        "batch_size": per_round,
+        "template_source": "# Search Lab writes its own expressions; there is no template.",
+    }
+
+
+@router.post("/tasks", status_code=201)
+async def add_task(body: SearchRequest, state: State) -> AddedTask:
+    """Add the search to Tasks, not started. Running it is the Tasks route's job."""
+    return await add_study(state, now=utcnow(), **await search_task_args(body, state))

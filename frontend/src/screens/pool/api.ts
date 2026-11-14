@@ -55,9 +55,13 @@ export type AlphaPnl = Schemas['AlphaPnl']
 export type SubmittableAlpha = Omit<Schemas['SubmittableAlpha'], 'checks'> & {
   checks: AlphaCheck[]
 }
-export type SubmittableResponse = Omit<Schemas['SubmittableResponse'], 'alphas' | 'shortlist'> & {
+export type SubmittableResponse = Omit<
+  Schemas['SubmittableResponse'],
+  'alphas' | 'shortlist' | 'nearMissAlphas'
+> & {
   alphas: SubmittableAlpha[]
   shortlist: SubmittableAlpha[]
+  nearMissAlphas: SubmittableAlpha[]
 }
 
 export interface BrainCorrelation {

@@ -882,17 +882,62 @@ async def close_refused(optimizer: Optimizer, study_id: int, parked_as: str) -> 
     return closed
 
 
+async def _scored(session: Any, study_id: int) -> int:
+    """How many trials the task scored. Evolution's seeds were scored before the task began,
+    so they do not count."""
+    return int(
+        await session.scalar(
+            select(func.count()).where(
+                Trial.study_id == study_id,
+                Trial.state == TrialState.COMPLETE,
+                or_(Trial.generation.is_(None), Trial.generation != 0),
+            )
+        )
+        or 0
+    )
+
+
+#: Simulations BRAIN fails, with nothing scored, before a task stops spending: one expression
+#: it refuses everywhere would otherwise fail its whole sweep, one batch after another.
+DOOMED_AFTER = 10
+
+
+async def doomed(optimizer: Optimizer, study_id: int) -> str | None:
+    """Why a task should pause now, or ``None``: :data:`DOOMED_AFTER` of its simulations came
+    back failed from BRAIN and none scored.
+
+    Only failures BRAIN returned count. A refusal held back before sending has no simulation
+    row, and one the engine held back ends ``REJECTED``: neither spent anything.
+    """
+    async with optimizer.db.session() as session:
+        if await _scored(session, study_id):
+            return None
+        reasons = (
+            await session.execute(
+                select(Trial.message, func.count())
+                .join(SimulationRecord, SimulationRecord.id == Trial.simulation_record_id)
+                .where(
+                    Trial.study_id == study_id,
+                    Trial.state == TrialState.FAIL,
+                    SimulationRecord.status.in_([SimStatus.ERROR, SimStatus.FAILED]),
+                )
+                .group_by(Trial.message)
+            )
+        ).all()
+    total = sum(n for _, n in reasons)
+    if total < DOOMED_AFTER:
+        return None
+    message, _ = max(reasons, key=lambda r: r[1])
+    return (
+        f"Paused after {total} simulations failed and none scored. "
+        f"{message or 'No reason was given.'}"
+    )
+
+
 async def _nothing_scored(session: Any, study_id: int) -> str | None:
     """Why a task that scored nothing failed, or ``None`` when it scored something or nothing
     failed. Evolution's seeds were scored before the task began, so they do not count."""
-    scored = await session.scalar(
-        select(func.count()).where(
-            Trial.study_id == study_id,
-            Trial.state == TrialState.COMPLETE,
-            or_(Trial.generation.is_(None), Trial.generation != 0),
-        )
-    )
-    if scored:
+    if await _scored(session, study_id):
         return None
     reasons = (
         await session.execute(
@@ -1147,6 +1192,63 @@ if __name__ == "__main__":
                     found["and counts what the JSON says"] = counted == 2 and dict(
                         scores.tuples().all()
                     ) == {0: None, 1: 1.5, 2: 2, 3: None, 4: None}
+
+                # ``task`` writes a held-back refusal with no simulation row: never counted.
+                sinking = await task("sinking")
+                event = "Operator ts_backfill does not support event inputs."
+                async with db.session() as session:
+                    records = [
+                        SimulationRecord(
+                            request_hash=f"e{n}",
+                            payload={"settings": usa},
+                            expression="ts_backfill(x, 5)",
+                            sim_type="REGULAR",
+                            instrument_type="EQUITY",
+                            region="USA",
+                            delay=1,
+                            language="FASTEXPR",
+                            task="sinking",
+                            status=SimStatus.ERROR,
+                            message=event,
+                        )
+                        for n in range(DOOMED_AFTER)
+                    ]
+                    session.add_all(records)
+                    await session.flush()
+                    failed_ids = [r.id for r in records]
+
+                async def fail(n: int, record_id: int | None) -> None:
+                    async with db.session() as session:
+                        session.add(
+                            Trial(
+                                study_id=sinking,
+                                number=n,
+                                state=TrialState.FAIL,
+                                message=event,
+                                simulation_record_id=record_id,
+                            )
+                        )
+
+                for n, record_id in enumerate(failed_ids[:-1], start=1):
+                    await fail(n, record_id)
+                found["nine failed simulations do not pause"] = (
+                    await doomed(optimizer, sinking) is None
+                )
+                await fail(DOOMED_AFTER, failed_ids[-1])
+                reason = await doomed(optimizer, sinking)
+                found["the tenth pauses, naming BRAIN's reason"] = (
+                    reason is not None and str(DOOMED_AFTER) in reason and event in reason
+                )
+                async with db.session() as session:
+                    session.add(
+                        Trial(
+                            study_id=sinking,
+                            number=DOOMED_AFTER + 1,
+                            state=TrialState.COMPLETE,
+                            values=[1.0],
+                        )
+                    )
+                found["...but not once anything scored"] = await doomed(optimizer, sinking) is None
             finally:
                 await db.dispose()
         return found
