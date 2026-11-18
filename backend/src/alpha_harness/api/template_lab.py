@@ -671,6 +671,7 @@ async def _plan(body: TemplateTask, state: Any) -> dict[str, Any]:
                     "fields": pool.fields,
                     "absent": pool.absent,
                     "vector": wraps if types == ["MATRIX", "VECTOR"] else [],
+                    "vectorOptions": {v: list(table[v].explicit) for v in wraps if v in table},
                 }
             )
 

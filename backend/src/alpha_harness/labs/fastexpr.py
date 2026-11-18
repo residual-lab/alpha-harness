@@ -62,7 +62,7 @@ _SIGNATURE = re.compile(r"([A-Za-z_]\w*)\s*\(")
 _VARIADIC = re.compile(r"two or more inputs|all inputs|at least 2 inputs", re.IGNORECASE)
 #: Options BRAIN refuses to default ("Required attribute "k" must have a value") although
 #: the definitions give one.
-EXPLICIT = ("k", "target_tvr")
+EXPLICIT = ("k", "target_tvr", "percentage")
 #: Operators BRAIN has accepted without those options thousands of times: writing them out
 #: would only turn identical Alphas into new text, and spend quota on them again.
 DEFAULTS_ACCEPTED = frozenset({"ts_backfill"})

@@ -163,9 +163,16 @@ def families(cat: Catalogue) -> tuple[str, ...]:
 # --- expressions ------------------------------------------------------------
 
 
-def base(field_id: str, vector_op: str | None = None, backfill: int = BACKFILL) -> str:
-    """A field as every shape reads it: reduced to a matrix if it is a vector, then backfilled."""
-    inner = f"{vector_op}({field_id})" if vector_op else field_id
+def base(
+    field_id: str,
+    vector_op: str | None = None,
+    backfill: int = BACKFILL,
+    options: str | None = None,
+) -> str:
+    """A field as every shape reads it: reduced to a matrix if it is a vector, then backfilled.
+    ``options`` are what the vector operator must be given by name."""
+    written = f", {options}" if options else ""
+    inner = f"{vector_op}({field_id}{written})" if vector_op else field_id
     return f"ts_backfill({inner}, {backfill})"
 
 
@@ -173,8 +180,9 @@ def render(
     params: dict[str, Any], backfill: int = BACKFILL, keywords: dict[str, str] | None = None
 ) -> str:
     """The Fast Expression for one point of the search."""
-    b = base(params["field"], params.get("vector_op"), backfill)
     written = keywords or {}
+    vector_op = params.get("vector_op")
+    b = base(params["field"], vector_op, backfill, written.get(vector_op) if vector_op else None)
 
     def call(op: str, *inputs: object) -> str:
         options = written.get(op)
@@ -449,7 +457,27 @@ if __name__ == "__main__":
         return {request.settings.decay for _, request in drawn if request is not None}
 
     before = {k: v for k, v in space.items() if k != "decays"}
+    vectors = catalogue(
+        [
+            {
+                "name": "vec_percentage",
+                "definition": "vec_percentage(x, percentage=0.5)",
+                "category": "Vector",
+            },
+            {"name": "vec_avg", "definition": "vec_avg(x)", "category": "Vector"},
+        ]
+    )
+
+    def reduced(op: str) -> str:
+        return render(
+            {"family": "cs", "cs": "rank", "field": "f", "vector_op": op}, 21, vectors.keywords
+        )
+
     checks = {
+        # BRAIN: Required attribute "percentage" must have a value.
+        "a vector operator is given the options BRAIN will not default": reduced("vec_percentage")
+        == "rank(ts_backfill(vec_percentage(f, percentage=0.5), 21))"
+        and reduced("vec_avg") == "rank(ts_backfill(vec_avg(f), 21))",
         "several decays are searched": decays_sent(space) == {4, 12, 20},
         "one decay is held": decays_sent({**space, "decays": [300]}) == {300},
         "a task added before decays were searched holds its own": decays_sent(before, 5) == {5},

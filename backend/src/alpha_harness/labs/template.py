@@ -638,13 +638,18 @@ def render(text: str, space: dict[str, Any], params: dict[str, Any]) -> str:
     assigns, which is how BRAIN treats the last line whatever it is called.
     """
     kinds = {v["name"]: v["kind"] for v in space["variables"]}
+    # What each vector operator must be given by name; absent from tasks added before.
+    options = {v["name"]: v.get("vectorOptions") or {} for v in space["variables"]}
 
     def chosen(name: str) -> Node:
         value = params[f"${name}"]
         if kinds[name] != "fields":
             return _value(value)
         vector = params.get(f"${name}#vector")
-        return Node("call", vector, (Node("name", value),)) if vector else Node("name", value)
+        if not vector:
+            return Node("name", value)
+        named = tuple((key, parse(text)) for key, text in options[name].get(vector, ()))
+        return Node("call", vector, (Node("name", value),), named)
 
     def filled(node: Node) -> Node:
         if node.kind == "name" and node.value.startswith("$"):
@@ -789,7 +794,25 @@ if __name__ == "__main__":
     )
     idea = program("if_else(abs(ts_arg_min(low, $d) - ts_arg_max(high, $d)) > $d / 2, ..., ...)")
     lookbacks = {"lookback": ["21"], "d": ["21"]}
+    wrapped = {
+        "name": "a",
+        "kind": "fields",
+        "fields": {"f2": "VECTOR"},
+        "vector": ["vec_percentage"],
+        "vectorOptions": {"vec_percentage": [["percentage", "0.5"]]},
+    }
+    pick = {"$a": "f2", "$a#vector": "vec_percentage"}
     checks = {
+        "a vector wrap is given the options BRAIN will not default": render(
+            "alpha = rank($a)", {"variables": [wrapped]}, pick
+        )
+        == "rank(vec_percentage(f2, percentage=0.5))",
+        "a task added before options were kept writes its wraps as it did": render(
+            "alpha = rank($a)",
+            {"variables": [{k: v for k, v in wrapped.items() if k != "vectorOptions"}]},
+            pick,
+        )
+        == "rank(vec_percentage(f2))",
         "a Power Pool template is 8 operators and 3 fields": (
             size(power_pool, lookbacks).operators,
             size(power_pool, lookbacks).fields,

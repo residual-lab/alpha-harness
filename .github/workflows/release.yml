@@ -335,6 +335,14 @@ jobs:
           sys.exit(1 if too_new else 0)
           PY
 
+      # Signed without it, the app gets no camera for BRAIN's identity check, and macOS says nothing.
+      - name: Check the app may use the camera
+        if: runner.os == 'macOS'
+        run: |
+          codesign -d --entitlements - desktop/src-tauri/target/$TARGET/release/bundle/macos/*.app 2>&1 \
+            | grep -q com.apple.security.device.camera \
+            || { echo "::error::the app is signed without the camera entitlement"; exit 1; }
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: desktop-${{ matrix.asset }}
