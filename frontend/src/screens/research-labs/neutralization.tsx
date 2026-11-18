@@ -6,6 +6,9 @@ import { neutralizationLabel, splitNeutralizations } from '@/lib/neutralization'
 import type { Choice } from '@/lib/scope'
 import { Button, Chips, Fieldset } from '@/ui/kit'
 
+/** Named the way people ask for it, so it reads as the fix for too much industry exposure. */
+const RISK_TITLE = 'Risk (FAST, SLOW, … RAM)'
+
 /**
  * Every neutralization the market offers, grouped, with a button per family that ticks or
  * unticks the whole of it.
@@ -71,7 +74,7 @@ export function NeutralizationPicker({
                     onClick={() => toggle(all, ids)}
                     className="text-body font-medium text-ink transition-colors hover:text-link disabled:text-(--field-text-disabled)"
                   >
-                    {group.label}
+                    {group.id === 'risk' ? RISK_TITLE : group.label}
                   </button>
                   <span
                     className={cn(

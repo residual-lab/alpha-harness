@@ -1,8 +1,9 @@
 """Search Lab: first- and second-degree Alphas over chosen datasets, searched for Sharpe.
 
-Every field is cleaned with ``ts_backfill(field, 21)`` first. That is data cleaning, not a
-degree, and neither is the vector operator a VECTOR field needs before any other operator
-can read it. On that base ``B`` the lab writes six shapes:
+Every field is cleaned with ``ts_backfill`` first, carried as many days as its category
+needs (:data:`BACKFILL_BY_CATEGORY`). That is data cleaning, not a degree, and neither is the
+vector operator a VECTOR field needs before any other operator can read it. On that base
+``B`` the lab writes six shapes:
 
     cs(B)    ts(B, d)    group(B, g)    cs(ts(B, d))    ts(ts(B, d), d)    group(ts(B, d), g)
 
@@ -15,7 +16,7 @@ scores.
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -34,8 +35,20 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = structlog.get_logger(__name__)
 
-#: Data cleaning around every field. Not an operator in BRAIN's count, and not a degree.
+#: Data cleaning around every field: days a missing value is carried from the last one. Not an
+#: operator in BRAIN's count, and not a degree.
 BACKFILL = 21
+#: Where a month is the wrong carry. Reported a quarter apart, these would go missing for weeks
+#: between reports; BRAIN's own examples carry fundamentals 60 to 252 days. Option fields move
+#: with the live surface, and BRAIN advises "a short ts_backfill of 5 days" for them.
+BACKFILL_BY_CATEGORY = {
+    "fundamental": 63,
+    "analyst": 63,
+    "earnings": 63,
+    "institutions": 63,
+    "insiders": 63,
+    "option": 5,
+}
 #: The economic windows from the research notes: a week, a month, a quarter, half a year, a year.
 LOOKBACKS = (5, 21, 63, 126, 252)
 #: Grouping fields for group operators; they do not count as data fields.
@@ -52,6 +65,8 @@ FAMILIES = ("cs", "ts", "group", "cs_ts", "ts_ts", "group_ts")
 POOL_LIMIT = 20_000
 
 #: Cleaning operators, and operators whose inputs do not fit a one-field shape.
+#: The second input a two-input shape writes, by slot: a lookback, or a grouping.
+SECOND_INPUT = {"ts": "d", "group": "group"}
 EXCLUDED = frozenset(
     {
         "ts_backfill",
@@ -86,6 +101,8 @@ class Catalogue:
     ts: tuple[str, ...]
     group: tuple[str, ...]
     vector: tuple[str, ...]
+    #: Options to write after an operator's inputs, by operator: ``{"ts_moment": "k=0"}``.
+    keywords: dict[str, str]
 
 
 def _kind(info: OperatorInfo) -> str | None:
@@ -109,14 +126,24 @@ def catalogue(operators: list[dict[str, Any]]) -> Catalogue:
     Anything else, and the cleaning operators, never fill a slot.
     """
     slots: dict[str, list[str]] = {"cs": [], "ts": [], "group": [], "vector": []}
+    keywords: dict[str, str] = {}
     for name, info in sorted(operator_table(operators, "REGULAR").items()):
         kind = _kind(info)
         if kind is None or name in EXCLUDED:
             continue
         inputs = 2 if kind in ("ts", "group") else 1
-        if info.required == inputs and (info.maximum is None or info.maximum >= inputs):
+        # The shape writes a lookback or a grouping second: an operator wanting another
+        # series there would be handed a number.
+        second = SECOND_INPUT.get(kind)
+        if (
+            info.required == inputs
+            and (info.maximum is None or info.maximum >= inputs)
+            and (second is None or info.inputs[1:2] == (second,))
+        ):
             slots[kind].append(name)
-    return Catalogue(**{kind: tuple(names) for kind, names in slots.items()})
+            if info.explicit:
+                keywords[name] = ", ".join(f"{key}={value}" for key, value in info.explicit)
+    return Catalogue(**{kind: tuple(names) for kind, names in slots.items()}, keywords=keywords)
 
 
 def families(cat: Catalogue) -> tuple[str, ...]:
@@ -136,29 +163,37 @@ def families(cat: Catalogue) -> tuple[str, ...]:
 # --- expressions ------------------------------------------------------------
 
 
-def base(field_id: str, vector_op: str | None = None) -> str:
+def base(field_id: str, vector_op: str | None = None, backfill: int = BACKFILL) -> str:
     """A field as every shape reads it: reduced to a matrix if it is a vector, then backfilled."""
     inner = f"{vector_op}({field_id})" if vector_op else field_id
-    return f"ts_backfill({inner}, {BACKFILL})"
+    return f"ts_backfill({inner}, {backfill})"
 
 
-def render(params: dict[str, Any]) -> str:
+def render(
+    params: dict[str, Any], backfill: int = BACKFILL, keywords: dict[str, str] | None = None
+) -> str:
     """The Fast Expression for one point of the search."""
-    b = base(params["field"], params.get("vector_op"))
+    b = base(params["field"], params.get("vector_op"), backfill)
+    written = keywords or {}
+
+    def call(op: str, *inputs: object) -> str:
+        options = written.get(op)
+        return f"{op}({', '.join(map(str, inputs))}{', ' + options if options else ''})"
+
     match params["family"]:
         case "cs":
-            return f"{params['cs']}({b})"
+            return call(params["cs"], b)
         case "ts":
-            return f"{params['ts']}({b}, {params['d']})"
+            return call(params["ts"], b, params["d"])
         case "group":
-            return f"{params['group_op']}({b}, {params['group']})"
+            return call(params["group_op"], b, params["group"])
         case "cs_ts":
-            return f"{params['cs']}({params['ts']}({b}, {params['d']}))"
+            return call(params["cs"], call(params["ts"], b, params["d"]))
         case "ts_ts":
-            inner = f"{params['ts']}({b}, {params['d']})"
-            return f"{params['ts_outer']}({inner}, {params['d_outer']})"
+            inner = call(params["ts"], b, params["d"])
+            return call(params["ts_outer"], inner, params["d_outer"])
         case "group_ts":
-            return f"{params['group_op']}({params['ts']}({b}, {params['d']}), {params['group']})"
+            return call(params["group_op"], call(params["ts"], b, params["d"]), params["group"])
         case _:
             raise ValueError(f"Unknown shape {params['family']!r}")
 
@@ -237,6 +272,11 @@ def suggest(
         if len(neutralizations) == 1
         else trial.suggest_categorical("neutralization", neutralizations)
     )
+    # A task added before decays were searched has none here and holds its one ``decay``.
+    if decays := list(space.get("decays") or ()):
+        params["decay"] = (
+            decays[0] if len(decays) == 1 else trial.suggest_categorical("decay", decays)
+        )
     return params
 
 
@@ -257,10 +297,15 @@ def request_for(params: dict[str, Any], run: SearchParams) -> SimulationRequest:
             delay=run.delay,
             universe=params["universe"],
             neutralization=params["neutralization"],
-            decay=run.decay,
+            decay=params.get("decay", run.decay),
             truncation=TRUNCATION,
         ),
-        regular=render(params),
+        # A task added before backfills followed the category carries every field 21 days.
+        regular=render(
+            params,
+            (run.space.get("backfill") or {}).get(params["field"], BACKFILL),
+            run.space.get("keywords"),
+        ),
     )
 
 
@@ -297,6 +342,8 @@ class Pool:
     absent: dict[str, list[str]]
     #: Vector fields left out because no vector operator is allowed.
     vector_skipped: int
+    #: Fields carried other than :data:`BACKFILL` days, for their category.
+    backfill: dict[str, int] = field(default_factory=dict[str, int])
 
 
 async def field_pool(
@@ -342,10 +389,14 @@ async def field_pool(
         )
     )
     found: dict[str, dict[str, str]] = {}
+    carry: dict[str, int] = {}
     for universe, page in zip(universes, pages, strict=True):
         rows = page.get("results") or []
         if rows:
             found[universe] = {str(r["field_id"]): str(r["field_type"]) for r in rows}
+        for r in rows:
+            if (days := BACKFILL_BY_CATEGORY.get(str(r.get("category_id")))) is not None:
+                carry[str(r["field_id"])] = days
 
     fields: dict[str, str] = {}
     for held in found.values():
@@ -357,7 +408,13 @@ async def field_pool(
         fields = {f: t for f, t in fields.items() if t != "VECTOR"}
     kept = tuple(u for u, held in found.items() if any(f in held for f in fields))
     absent = {u: [f for f in fields if f not in found[u]] for u in kept}
-    return Pool(fields, kept, {u: ids for u, ids in absent.items() if ids}, skipped)
+    return Pool(
+        fields,
+        kept,
+        {u: ids for u, ids in absent.items() if ids},
+        skipped,
+        {f: days for f, days in carry.items() if f in fields},
+    )
 
 
 # --- drawing a point --------------------------------------------------------
@@ -369,3 +426,34 @@ def draw(
     """One point of the search and the simulation it becomes (see ``labs.scheduler``)."""
     params = suggest(trial, run.space, choices)
     return params, request_for(params, run)
+
+
+if __name__ == "__main__":
+    import random
+    import sys
+
+    from .params import SearchParams
+
+    space: dict[str, Any] = {
+        "fields": {"close": "MATRIX"},
+        "families": ["cs"],
+        "cs": ["rank"],
+        "universes": ["TOP3000"],
+        "neutralizations": ["MARKET"],
+        "decays": [4, 12, 20],
+    }
+
+    def decays_sent(space: dict[str, Any], held: int = 0) -> set[int]:
+        run = SearchParams(region="USA", delay=1, decay=held, space=space)
+        drawn = [draw(RandomTrial(random.Random(n)), run, field_choices(space)) for n in range(40)]
+        return {request.settings.decay for _, request in drawn if request is not None}
+
+    before = {k: v for k, v in space.items() if k != "decays"}
+    checks = {
+        "several decays are searched": decays_sent(space) == {4, 12, 20},
+        "one decay is held": decays_sent({**space, "decays": [300]}) == {300},
+        "a task added before decays were searched holds its own": decays_sent(before, 5) == {5},
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"search self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

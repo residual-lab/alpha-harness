@@ -61,6 +61,12 @@ class ModelInfo:
     def ref(self) -> str:
         return model_ref(self.provider, self.id)
 
+    @computed_field
+    @property
+    def retired(self) -> str | None:
+        """Why this model can no longer answer, or None. Kept so the user can remove it."""
+        return providers.get(self.provider).retired or None
+
     @property
     def prompt_tokens(self) -> int:
         return self.max_prompt_tokens or DEFAULT_PROMPT_TOKENS
@@ -139,7 +145,8 @@ class ModelRegistry:
         except ZoneInfoNotFoundError, ValueError:
             raise LLMError(f"{reset_timezone!r} is not a time zone this machine knows.") from None
         if provider not in providers.PROVIDERS:
-            raise LLMError(f"{provider!r} is not a provider this application knows.")
+            gone = providers.get(provider)
+            raise LLMError(f"{gone.label} cannot take a model. {gone.retired}")
         if not model_id:
             raise LLMError("Name the model: pick one from the list or type its ID.")
         if rpm < 1 or rpd < 1:

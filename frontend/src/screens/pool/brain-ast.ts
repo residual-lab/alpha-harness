@@ -1,4 +1,6 @@
-/** Splitting a Fast Expression into the pieces the Alpha inspector colours. */
+/** Splitting a Fast Expression into the pieces the Alpha inspector colours, as the grammar reads it. */
+
+import { tokens } from '@/lib/fastexpr'
 
 export type AstKind = 'operator' | 'field' | 'number' | 'punctuation' | 'other'
 
@@ -7,20 +9,34 @@ export interface AstToken {
   kind: AstKind
 }
 
-// The number branch takes an exponent too, so `1e-5` stays one token instead of leaving a
-// stray `e` to be coloured as a data field.
-const TOKEN =
-  /([a-zA-Z_][a-zA-Z0-9_]*(?=\s*\())|((?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)|([a-zA-Z_][a-zA-Z0-9_]*)|([(),])|(\s+)|([^a-zA-Z0-9_\s(),.]+|\.)/g
-
-/** Every character of `expr`, in order: a name followed by `(` is an operator. */
+/** Every character of `expr`, in order: a name followed by `(` is an operator. Comments,
+ *  strings and the space between are `other`. */
 export function tokenizeBrainAst(expr: string): AstToken[] {
-  const tokens: AstToken[] = []
-  for (const [full, op, num, id, punct] of expr.matchAll(TOKEN)) {
-    if (op) tokens.push({ text: op, kind: 'operator' })
-    else if (num) tokens.push({ text: num, kind: 'number' })
-    else if (punct) tokens.push({ text: punct, kind: 'punctuation' })
-    else if (id) tokens.push({ text: id, kind: 'field' })
-    else tokens.push({ text: full, kind: 'other' })
+  const found: AstToken[] = []
+  const read = tokens(expr)
+  let end = 0
+  const add = (to: number, kind: AstKind) => {
+    if (to > end) found.push({ text: expr.slice(end, to), kind })
+    end = to
   }
-  return tokens.length > 0 ? tokens : [{ text: expr, kind: 'other' }]
+  read.forEach(([kind, from, to], i) => {
+    add(from, 'other')
+    const text = expr.slice(from, to)
+    const next = read[i + 1]
+    const called = next?.[0] === 'op' && expr.slice(next[1], next[2]) === '('
+    add(
+      to,
+      kind === 'name'
+        ? called
+          ? 'operator'
+          : 'field'
+        : kind === 'num'
+          ? 'number'
+          : kind === 'op' && '(),'.includes(text)
+            ? 'punctuation'
+            : 'other',
+    )
+  })
+  add(expr.length, 'other')
+  return found.length > 0 ? found : [{ text: expr, kind: 'other' }]
 }

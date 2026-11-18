@@ -1,17 +1,19 @@
 """Pyramids: a dataset category in one region and delay.
 
 BRAIN pays a multiplier per pyramid and counts one as formulated once three Alphas are
-submitted in it in a quarter. Both numbers come from the account's activity endpoints;
-whether a pyramid can be researched here comes from the downloaded fields. BRAIN exposes
-no quarter dates, and Genius levels run on calendar quarters, so the quarter is derived
-from today's date in platform time.
+submitted in it in a quarter. Both numbers come from the account's activity endpoints, and
+the quarters from its consultant summary; whether a pyramid can be researched here comes
+from the downloaded fields.
 """
 
 import math
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+import structlog
+
+from ..brain.errors import BrainError
 from ..brain.filters import PLATFORM_TZ
 from ..brain.platform import PYRAMID_MIN_ALPHAS
 
@@ -20,6 +22,8 @@ if TYPE_CHECKING:
 
     from ..brain.endpoints import BrainEndpoints
     from ..db.duck import Catalog
+
+log = structlog.get_logger(__name__)
 
 MULTIPLIERS_TTL = 6 * 3600
 COUNTS_TTL = 600
@@ -95,7 +99,6 @@ def assemble(
             found["alphaCount"] = int(item.get("alphaCount") or 0)
 
     for key, found in cells.items():
-        found["lit"] = found["alphaCount"] >= PYRAMID_MIN_ALPHAS
         found["synced"] = key in synced
 
     # Both axes rank on the multiplier they average, richest first, ties alphabetical. A
@@ -124,19 +127,62 @@ def assemble(
     }
 
 
-async def pyramid_grid(endpoints: BrainEndpoints, catalog: Catalog) -> dict[str, Any]:
+#: The period that counts every Alpha the account has submitted.
+ALL_TIME = "all"
+
+
+class UnknownPeriodError(ValueError):
+    pass
+
+
+async def _quarters(endpoints: BrainEndpoints) -> list[dict[str, str]]:
+    """BRAIN's quarters, newest first. An account BRAIN gives no consultant summary gets the
+    calendar quarter in progress, which is what BRAIN's own site falls back to."""
+    try:
+        listed = await _cached("quarters", COUNTS_TTL, endpoints.quarters)
+    except BrainError:
+        log.warning("pyramids.quarters_failed", exc_info=True)
+        listed = []
+    if listed:
+        return listed
     today = datetime.now(PLATFORM_TZ).date()
-    start, end = quarter_start(today), next_quarter_start(today)
+    start = quarter_start(today)
+    return [
+        {
+            "name": f"{start.year}-Q{(start.month - 1) // 3 + 1}",
+            "startDate": start.isoformat(),
+            "endDate": (next_quarter_start(today) - timedelta(days=1)).isoformat(),
+        }
+    ]
+
+
+async def pyramid_grid(
+    endpoints: BrainEndpoints, catalog: Catalog, period: str | None = None
+) -> dict[str, Any]:
+    """The grid for ``period``: a quarter's name, :data:`ALL_TIME`, or the current quarter."""
+    quarters = await _quarters(endpoints)
+    if period == ALL_TIME:
+        start = end = None
+    else:
+        chosen = (
+            quarters[0] if not period else next((q for q in quarters if q["name"] == period), None)
+        )
+        if chosen is None:
+            raise UnknownPeriodError(period)
+        period, start = chosen["name"], chosen["startDate"]
+        # BRAIN's own site asks up to the day after the quarter, so its last day counts.
+        end = (date.fromisoformat(chosen["endDate"]) + timedelta(days=1)).isoformat()
     multipliers = await _cached("multipliers", MULTIPLIERS_TTL, endpoints.pyramid_multipliers)
     counts = await _cached(
-        f"alphas:{start}",
-        COUNTS_TTL,
-        lambda: endpoints.pyramid_alphas(start.isoformat(), end.isoformat()),
+        f"alphas:{period}", COUNTS_TTL, lambda: endpoints.pyramid_alphas(start, end)
     )
     rows = await catalog.query(
         "SELECT DISTINCT category_id, region, delay FROM data_field WHERE category_id IS NOT NULL"
     )
     synced = {(r["category_id"], r["region"], int(r["delay"])) for r in rows}
     return assemble(multipliers, counts, synced) | {
-        "quarter": {"start": start.isoformat(), "end": end.isoformat(), "today": today.isoformat()}
+        "period": period,
+        "quarters": [
+            {"name": q["name"], "start": q["startDate"], "end": q["endDate"]} for q in quarters
+        ],
     }

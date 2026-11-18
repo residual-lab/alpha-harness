@@ -157,7 +157,8 @@ class AuthService:
                 return self._session
             supplied = bool(email and password)
             if not supplied:
-                credential = await self.get_credential()
+                # A first sign-in still waiting on its check has only the login typed for it.
+                credential = self._unverified or await self.get_credential()
                 if credential is None:
                     raise NoCredentialError(
                         "No BRAIN credentials stored. Sign in with your BRAIN email and "
@@ -370,8 +371,9 @@ class PlatformMetadata:
             return cached
         try:
             return await self.refresh_metadata()
-        except BrainError:
-            log.warning("metadata.schema_refresh_failed", exc_info=True)
+        except BrainError as exc:
+            # An expected failure (offline, signed out): one line, not a traceback each time.
+            log.warning("metadata.schema_refresh_failed", error=exc.message)
             return cached
 
     async def refresh_operators(self) -> list[dict[str, Any]]:

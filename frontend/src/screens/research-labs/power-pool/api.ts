@@ -25,6 +25,10 @@ export interface PowerPoolRequest {
   universes: string[]
   cores: number
   simulations: number
+  /** An idea of the user's own for every call to test; empty lets the LLM explore. */
+  hypothesis: string
+  /** This quarter's unused operators, for the LLM to prefer; empty leaves the choice to it. */
+  favour_operators: string[]
 }
 
 const B = '/api/power-pool-lab'

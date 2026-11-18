@@ -64,11 +64,11 @@ FAST EXPRESSION
 
 POWER POOL RULES
 1. At most 8 operators. Count every operator call, every + - * / ^, every comparison, every \
-&& || !, every ?:, and every minus sign in front of something, -1 included. Repeats count each \
-time. ts_backfill and group_backfill are not counted.
+&& || !, every ?:, and every minus sign in front of something. A negative number such as -1 is \
+not an operator. Repeats count each time. ts_backfill and group_backfill are not counted.
      rank(-ts_delta(close, 5))                          counts 3
      group_rank(ts_backfill(x, 60) / cap, industry)     counts 2
-     trade_when(volume > adv20, rank(vec_avg(z)), -1)   counts 5
+     trade_when(volume > adv20, rank(vec_avg(z)), -1)   counts 4
 2. At most 3 different data fields, and at least 1 from the dataset in the message. The grouping \
 fields country, industry, subindustry, currency, market, sector, exchange, split and adjfactor \
 are not counted; \

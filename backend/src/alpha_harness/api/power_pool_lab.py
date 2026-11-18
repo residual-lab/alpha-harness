@@ -3,7 +3,7 @@
 Nothing here calls the LLM or simulates; the preview shows the exact first prompt.
 """
 
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from ..catalog.queries import FieldFilter
 from ..db.models import utcnow
 from ..labs import power_pool, search
+from ..labs.fastexpr import operator_table
 from ..labs.launch import (
     NO_NEUTRALIZATION,
     NO_SIMULATIONS,
@@ -47,6 +48,12 @@ class PowerPoolRequest(BaseModel):
     simulations: int = Field(default=0, ge=0, le=search.MAX_SIMULATIONS)
     #: The Data Explorer's filter the datasets were chosen under: only fields it shows are used.
     field_filter: FieldFilter | None = None
+    #: An idea of the consultant's own for every call to test; empty lets the LLM explore.
+    hypothesis: str = Field(default="", max_length=2000)
+    #: This quarter's unused operators, for the LLM to prefer; empty leaves the choice to it.
+    favour_operators: list[Annotated[str, Field(max_length=64)]] = Field(
+        default_factory=list[str], max_length=300
+    )
 
 
 class PowerPoolModel(Out):
@@ -97,6 +104,9 @@ async def _plan(body: PowerPoolRequest, state: Any) -> dict[str, Any]:
     operators = await account_operators(state, refresh=False)
     if not operators:
         problems.append(OPERATORS_UNREAD)
+    # Only operators the prompt lists: a name it does not would point the LLM nowhere.
+    listed = operator_table(operators)
+    favour = [name for name in dict.fromkeys(body.favour_operators) if name in listed]
     if not body.dataset_ids:
         problems.append("Choose at least one dataset.")
     models = {m["ref"]: m for m in await state.llm.runnable()}
@@ -143,6 +153,8 @@ async def _plan(body: PowerPoolRequest, state: Any) -> dict[str, Any]:
         delay=body.delay,
         universes=universes,
         neutralizations=neutralizations,
+        hypothesis=body.hypothesis.strip(),
+        favour_operators=favour,
     )
     if universes:
         for dataset in body.dataset_ids:
@@ -191,6 +203,7 @@ async def _plan(body: PowerPoolRequest, state: Any) -> dict[str, Any]:
         "problems": problems,
         "warnings": warnings,
         "model": info.ref if info else ref,
+        "favourOperators": favour,
     }
 
 
@@ -225,6 +238,8 @@ async def add_task(body: PowerPoolRequest, state: State) -> AddedTask:
             ),
             model=plan["model"],
             only_model=body.only_model,
+            hypothesis=body.hypothesis.strip(),
+            favour_operators=plan["favourOperators"],
             cores=body.cores,
             llm={"calls": 0},
         ),

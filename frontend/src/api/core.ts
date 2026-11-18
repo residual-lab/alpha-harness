@@ -47,6 +47,15 @@ export const today = {
   get: (scope?: Partial<Scope>) => http.get<Today>(`/api/today${scopeQs(scope)}`),
   /** The header clocks. Cheap. */
   bar: () => http.get<BarStatus>('/api/today/bar'),
+  /** The Dashboard's one click: the tasks it started, and why any of the run fell short. */
+  run: (simulations: number) => http.post<Schemas['TodayRun']>('/api/today/run', { simulations }),
+}
+
+/** What a person sends when they ask for help. */
+export const diagnostics = {
+  /** A scrubbed zip of the version, the system and the end of the log, saved in Downloads. */
+  export: () => http.post<Schemas['Exported']>('/api/diagnostics/export'),
+  openLogs: () => http.post<void>('/api/diagnostics/open-logs'),
 }
 
 export const auth = {
@@ -59,6 +68,7 @@ export const auth = {
   /** Close a paused sign-in's identity check. Answering early is normal: the session comes
    *  back unauthenticated and still carrying the inquiry. */
   verify: (inquiry: string) => http.post<Session>('/api/auth/verify', { inquiry }),
+  newCheck: () => http.post<Session>('/api/auth/new-check'),
   logout: () => http.post<Session>('/api/auth/logout'),
   /** Legal values for every settings field, given what is chosen. Keys use BRAIN's names. */
   settingsOptions: (settings: Record<string, unknown>) =>
@@ -70,9 +80,9 @@ export const simulations = {
   active: () => http.get<SimulationRow[]>('/api/simulations/active'),
   engine: () => http.get<EngineStatus>('/api/simulations/engine'),
   /** Cancel by record id. Cancel the batch PARENT: a child cannot be cancelled on BRAIN. */
-  cancel: (recordId: number) =>
+  cancel: (recordId: number, force = false) =>
     http.post<{ acknowledged: boolean; simulation: SimulationRow | null }>(
-      `/api/simulations/${recordId}/cancel`,
+      `/api/simulations/${recordId}/cancel${force ? '?force=true' : ''}`,
     ),
   /** Drop queued work that has not been sent. Omit `task` to drop everything queued. */
   dropQueue: (task?: string) =>

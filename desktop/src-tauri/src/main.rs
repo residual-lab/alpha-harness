@@ -14,6 +14,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, RunEvent, Url, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_opener::OpenerExt;
 
 /// The step the supervisor is on, for a start-up page that loads after it was announced.
 #[derive(Default)]
@@ -105,9 +106,10 @@ fn tray(app: &AppHandle) -> tauri::Result<()> {
         app.autolaunch().is_enabled().unwrap_or(false),
         None::<&str>,
     )?;
+    let logs = MenuItem::with_id(app, "logs", "Open Log Folder", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit Alpha Harness", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open, &login, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &login, &logs, &separator, &quit])?;
 
     let toggled = login.clone();
     let mut builder = TrayIconBuilder::with_id("main")
@@ -128,6 +130,13 @@ fn tray(app: &AppHandle) -> tauri::Result<()> {
                 let _ = toggled.set_checked(autostart.is_enabled().unwrap_or(on));
                 if let Err(error) = done {
                     supervisor::note(&format!("could not change start at login: {error}"));
+                }
+            }
+            "logs" => {
+                // From the tray, so the log is reachable even when the window will not open.
+                let folder = supervisor::home().to_string_lossy().into_owned();
+                if let Err(error) = app.opener().open_path(folder, None::<&str>) {
+                    supervisor::note(&format!("could not open the log folder: {error}"));
                 }
             }
             "quit" => supervisor::quit(app),

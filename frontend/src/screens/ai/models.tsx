@@ -44,9 +44,11 @@ const TIME_ZONES = ['UTC', ...Intl.supportedValuesOf('timeZone').filter((z) => z
 const SHOWN = 100
 
 /** A limit as typed: a whole number of at least one, or nothing yet. */
-const requests = (text: string) => {
+const MAX_PER_DAY = 1_000_000
+
+const requests = (text: string, max = Number.POSITIVE_INFINITY) => {
   const n = Number(text)
-  return text.trim() !== '' && Number.isInteger(n) && n >= 1 ? n : null
+  return text.trim() !== '' && Number.isInteger(n) && n >= 1 && n <= max ? n : null
 }
 
 /** Set one model up, or change the limits of one that is. */
@@ -88,7 +90,7 @@ export function ModelSetupForm({
   })
 
   const perMinute = requests(rpm)
-  const perDay = requests(rpd)
+  const perDay = requests(rpd, MAX_PER_DAY)
   // Optional: empty is the default, anything else has to be a real ceiling.
   const promptTokens = maxTokens.trim() === '' ? null : requests(maxTokens)
   const tokensInvalid = maxTokens.trim() !== '' && promptTokens === null
@@ -215,11 +217,16 @@ export function ModelSetupForm({
           </Field>
           <Field
             label="Requests per Day"
-            error={rpd !== '' && perDay === null ? 'A whole number, at least 1.' : null}
+            error={
+              rpd !== '' && perDay === null
+                ? `A whole number from 1 to ${fmt.int(MAX_PER_DAY)}.`
+                : null
+            }
           >
             <Input
               type="number"
               min={1}
+              max={MAX_PER_DAY}
               step={1}
               inputMode="numeric"
               className="num"
@@ -291,7 +298,9 @@ function ModelDialog({ editing, onClose }: { editing: Editing | null; onClose: (
   const keys = useKeys()
   const [picked, setPicked] = useState<string | null>(null)
 
-  const keyed = new Set(keys.data?.keys.filter((k) => k.enabled).map((k) => k.provider))
+  const keyed = new Set(
+    keys.data?.keys.filter((k) => k.enabled && !k.retired).map((k) => k.provider),
+  )
   const choices = (providers.data?.providers ?? []).filter((p) => keyed.has(p.id))
   const wanted = editing?.model?.provider ?? editing?.provider ?? picked
   const provider = choices.find((p) => p.id === wanted) ?? choices[0]
@@ -360,7 +369,9 @@ export function Models() {
   if (!models.data || !keys.data) return <Skeleton className="h-64" />
 
   const setUp = models.data.models
-  const keyed = [...new Set(keys.data.keys.filter((k) => k.enabled).map((k) => k.provider))]
+  const keyed = [
+    ...new Set(keys.data.keys.filter((k) => k.enabled && !k.retired).map((k) => k.provider)),
+  ]
   const bare = keyed.filter((p) => !setUp.some((m) => m.provider === p))
   const budget = new Map(keys.data.budget.map((b) => [b.ref, b]))
 
@@ -423,6 +434,7 @@ export function Models() {
       width: 'minmax(180px,1fr)',
       cell: (m) => {
         const b = budget.get(m.ref)
+        if (m.retired) return <span className="text-ink-subtle">Retired</span>
         if (!b || b.allowedToday === 0)
           return <span className="text-ink-subtle">No enabled Key</span>
         return (
@@ -445,9 +457,11 @@ export function Models() {
       width: '150px',
       cell: (m) => (
         <div className="flex w-full justify-end gap-1">
-          <Button variant="ghost" size="sm" onClick={() => setEditing({ model: m })}>
-            Edit limits
-          </Button>
+          {!m.retired && (
+            <Button variant="ghost" size="sm" onClick={() => setEditing({ model: m })}>
+              Edit limits
+            </Button>
+          )}
           <Button variant="danger" size="sm" onClick={() => setRemoving(m)}>
             Remove
           </Button>
@@ -458,6 +472,12 @@ export function Models() {
 
   return (
     <div className="flex flex-col gap-3">
+      {setUp.some((m) => m.retired) && (
+        <Notice tone="warn" title="Some models belong to a provider that no longer exists">
+          {[...new Set(setUp.flatMap((m) => (m.retired ? [m.retired] : [])))].join(' ')} These
+          models are never used. Remove them below.
+        </Notice>
+      )}
       {bare.map((p) => (
         <Notice
           key={p}

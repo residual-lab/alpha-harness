@@ -6,8 +6,6 @@ page and a desktop app to the person using it. Only the *default* browser is eve
 in its ordinary profile: a different browser, or a private profile, would start the app with
 none of the drafts and settings the reader's browser already keeps for it. Anything else —
 Firefox, Safari, a browser that cannot be found — gets a tab, exactly as before.
-
-Standard library only: the launcher keeps a copy of this, and must run with no venv at all.
 """
 
 import os
@@ -51,7 +49,7 @@ def open_window(url: str) -> None:
     command = _app_command(url)
     if command is not None:
         try:
-            _detached(command)
+            detached(command)
             return
         except OSError:
             # An older Windows launcher's job refuses the breakaway; a tab is what it
@@ -60,10 +58,11 @@ def open_window(url: str) -> None:
     webbrowser.open(url)
 
 
-def _detached(command: list[str]) -> None:
-    """Start the browser so that nothing about this process's end can end it."""
+def detached(command: list[str]) -> None:
+    """Start a program, the browser or the desktop app, so that nothing about this process's
+    end can end it."""
     if sys.platform == "win32":
-        subprocess.Popen(  # noqa: S603 - the default browser's own executable
+        subprocess.Popen(  # noqa: S603 - a browser's or the desktop app's own executable
             command,
             creationflags=BREAKAWAY | subprocess.DETACHED_PROCESS,
             stdin=subprocess.DEVNULL,
@@ -71,7 +70,7 @@ def _detached(command: list[str]) -> None:
             stderr=subprocess.DEVNULL,
         )
         return
-    subprocess.Popen(  # noqa: S603 - the default browser's own executable
+    subprocess.Popen(  # noqa: S603 - a browser's or the desktop app's own executable
         command,
         start_new_session=True,
         stdin=subprocess.DEVNULL,

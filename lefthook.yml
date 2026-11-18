@@ -68,16 +68,17 @@ check:
       run: >-
         uv run ruff check . && uv run ruff format --check . && uv run pyproject-fmt --check pyproject.toml
         && uv run pyrefly check && uv run basedpyright
-    # The Windows launcher is frozen separately and imports nothing from the backend, so it
-    # sits outside the package and would otherwise be the one Python here nothing checks.
-    - name: launcher
-      root: backend/
-      run: uv run ruff check ../launcher && uv run ruff format --check ../launcher
     - name: frontend
       root: frontend/
       run: pnpm check
     - name: contract
       run: sh frontend/tools/codegen/generate.sh --check frontend/src/api/generated.ts
+    # The browser's Fast Expression parser, as crates/fastexpr builds it, then proven to read
+    # every expression as labs/fastexpr.py does.
+    - name: fastexpr
+      run: >-
+        sh crates/fastexpr/build.sh --check frontend/src/lib/fastexpr.wasm
+        && cd backend && uv run python -m alpha_harness.labs.fastexpr_conformance
     - name: design
       run: sh frontend/tools/design-lint.sh DESIGN.md
 

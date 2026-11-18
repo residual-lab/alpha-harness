@@ -31,6 +31,12 @@ export interface AlphaPageRequest {
   minimum?: Partial<Record<AlphaMetricKey, number>>
   maximum?: Partial<Record<AlphaMetricKey, number>>
   search?: string | null
+  /** Alphas carrying any of these tags, or all of them with `tags_all`. */
+  tags?: string[] | null
+  tags_all?: boolean
+  /** `YYYY-MM-DD` days on BRAIN's clock, both included. */
+  created_after?: string | null
+  created_before?: string | null
   /** Only Alphas the Evolution Lab can breed from, for when this table picks seeds. */
   evolvable?: boolean
   /** 1..500 */
@@ -49,9 +55,13 @@ export type AlphaPnl = Schemas['AlphaPnl']
 export type SubmittableAlpha = Omit<Schemas['SubmittableAlpha'], 'checks'> & {
   checks: AlphaCheck[]
 }
-export type SubmittableResponse = Omit<Schemas['SubmittableResponse'], 'alphas' | 'shortlist'> & {
+export type SubmittableResponse = Omit<
+  Schemas['SubmittableResponse'],
+  'alphas' | 'shortlist' | 'nearMissAlphas'
+> & {
   alphas: SubmittableAlpha[]
   shortlist: SubmittableAlpha[]
+  nearMissAlphas: SubmittableAlpha[]
 }
 
 export interface BrainCorrelation {
@@ -82,19 +92,30 @@ export const pool = {
   summary: () => http.get<Record<string, number>>('/api/alphas/summary'),
   sync: () => http.post<Schemas['SyncStarted']>('/api/vault/sync'),
   query: (body: AlphaPageRequest) => http.post<AlphaPage>('/api/vault/alphas/query', body),
+  /** Every Alpha the filters keep, newest first: what a tag group analyses. */
+  group: (body: AlphaPageRequest) =>
+    http.post<Schemas['AlphaGroup']>('/api/vault/alphas/group', body),
+  /** Stores what BRAIN holds under any of these tags. A background job; reads only. */
+  importTagged: (tags: string[]) =>
+    http.post<Schemas['JobStarted']>('/api/vault/import-tagged', { tags }),
+  /** Downloads the PnL these Alphas lack. A background job; reads only. */
+  downloadPnl: (alphaIds: string[]) =>
+    http.post<Schemas['JobStarted']>('/api/vault/download-pnl', { alphaIds }),
   detail: (alphaId: string) =>
     http.get<AlphaDetail>(`/api/vault/alphas/${encodeURIComponent(alphaId)}/detail`),
   /** Downloads the daily PnL from BRAIN the first time, so it can take a while. */
   pnl: (alphaId: string) =>
     http.get<AlphaPnl>(`/api/vault/alphas/${encodeURIComponent(alphaId)}/pnl`),
-  submittable: (scope: Scope, limit = 200) =>
+  /** ``implausible`` also lists Alphas with a Sharpe beyond ±10 in some period, left out by
+   *  default as straight lines rather than signals. */
+  submittable: (scope: Scope, limit = 200, implausible = false) =>
     http.get<SubmittableResponse>(
-      `/api/vault/submittable${qs({ region: scope.region, delay: scope.delay, universe: scope.universe, instrument_type: scope.instrumentType, limit })}`,
+      `/api/vault/submittable${qs({ region: scope.region, delay: scope.delay, universe: scope.universe, instrument_type: scope.instrumentType, limit, implausible: implausible || undefined })}`,
     ),
   /** Every market at once: where an empty market points instead. */
   everywhere: queryOptions({
     queryKey: ['pool', 'submittable-count'],
-    queryFn: () => http.get<SubmittableResponse>('/api/vault/submittable?limit=1'),
+    queryFn: () => http.get<SubmittableResponse>('/api/vault/submittable?limit=1&shortlist=false'),
   }),
   /** Re-runs the submission checks on BRAIN without submitting. */
   check: (alphaId: string) =>

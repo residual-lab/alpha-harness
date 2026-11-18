@@ -1,0 +1,5 @@
+# The desktop app's Rust, with the WebAssembly target the frontend's parser is built for.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+targets = ["wasm32-unknown-unknown"]

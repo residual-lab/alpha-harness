@@ -11,17 +11,19 @@ if the series are kept. The stored series rebuilds the platform's own figures (s
 import asyncio
 import itertools
 import json
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import structlog
 
+from ..brain.filters import PLATFORM_TZ
 from ..db.duck import ALPHA_COLUMNS, TRAIN_COLUMNS, Catalog
 from . import metrics
 from .yields import SUBMITTED, checks_of, children_check, limits_of, without_quota_checks
 
 if TYPE_CHECKING:
+    import numpy.typing as npt
     import pyarrow as pa
 
     from ..brain.schemas import Alpha
@@ -31,6 +33,9 @@ log = structlog.get_logger(__name__)
 #: 3: turnover calibrated to ``yearly-stats`` where it misses by more than rounding. A series
 #: stored under an older version is fetched again on the next sync.
 SERIES_VERSION = 3
+#: How long a sync leaves alone an Alpha BRAIN has no PnL for: a new submission's may simply not
+#: be computed yet, so it is asked for again the next day.
+PNL_ABSENT_RETRY = timedelta(hours=24)
 #: Alphas holding a current daily PnL, with or without its turnover. A full series written
 #: before ``pnl_version`` existed carries only ``series_version``. One ``?``: the version.
 PNL_STORED = "SELECT alpha_id FROM alpha WHERE coalesce(pnl_version, series_version) = ?"
@@ -39,6 +44,8 @@ REBUILD_CHUNK = 100
 
 #: :meth:`AlphaVault.pnl_grid`: the Alphas holding a PnL, the calendar, a ``date x alpha`` matrix.
 type PnlGrid = tuple[list[str], list[date], metrics.Floats]
+#: :meth:`AlphaVault.series`: each Alpha's days, oldest first, with its PnL and turnover on them.
+type Series = dict[str, tuple[metrics.Days, metrics.Floats, metrics.Floats]]
 
 
 def checks_json(alpha: Alpha) -> str | None:
@@ -126,7 +133,16 @@ def alpha_row(alpha: Alpha, fetched_at: datetime) -> tuple[Any, ...]:
         settings.language if settings else None,
         settings.pasteurization if settings else None,
         settings.nan_handling if settings else None,
+        brain_json(alpha),
     )
+
+
+def brain_json(alpha: Alpha) -> str:
+    """BRAIN's in-sample block whole: the breakdowns the other columns flatten away, such as
+    Investability Constrained, and its checks. ``checks`` holds those too, as ``/check`` last
+    said, but a submitted Alpha's body can be the more settled of the two."""
+    body = alpha.model_dump(mode="json", by_alias=True)
+    return json.dumps({"is": body["is"]} if body.get("is") else {}, separators=(",", ":"))
 
 
 #: What the Simulations table may sort and filter on, as SQL over ``alpha a``. Anything
@@ -331,17 +347,30 @@ def _page_row(r: dict[str, Any]) -> dict[str, Any]:
         "trainSharpe": r["train_sharpe"],
         "testSharpe": r["test_sharpe"],
         "standingRegion": r.get("standing_region"),
+        "tags": json_list(r["tags"]),
     }
 
 
-def _by_alpha[T](ids: list[str], days: list[date], values: list[T]) -> dict[str, dict[date, T]]:
-    """Rows sorted by Alpha, each Alpha's days made a dict in one go rather than row by row."""
-    starts = [i for i in range(len(ids)) if i == 0 or ids[i] != ids[i - 1]]
-    ends = [*starts[1:], len(ids)]
-    return {
-        ids[s]: dict(zip(days[s:e], values[s:e], strict=True))
-        for s, e in zip(starts, ends, strict=True)
-    }
+def _runs(table: pa.Table) -> dict[str, slice]:
+    """Where each Alpha's rows are in a table sorted by ``alpha_id``.
+
+    DuckDB sorts: on Linux two to three times quicker than reading the rows unsorted and
+    sorting them here, on Windows about as quick. For 2,000 series the sort peaks 190 MB higher
+    on Linux and 40 MB on Windows, measured, and both give it back once done (Linux through
+    the allocator setting in :mod:`..db.duck`).
+    """
+    ids = table.column("alpha_id").combine_chunks().dictionary_encode()
+    codes = ids.indices.to_numpy()
+    names: list[str] = ids.dictionary.to_pylist()
+    starts = [0, *(np.flatnonzero(np.diff(codes)) + 1).tolist()]
+    ends = [*starts[1:], len(codes)]
+    return {names[codes[s]]: slice(s, e) for s, e in zip(starts, ends, strict=True)}
+
+
+def _column(table: pa.Table, name: str) -> npt.NDArray[Any]:
+    """A column as an array NumPy allocated. Arrow's own copy of a column of several chunks
+    kept its memory once freed: 70 MB more for 2,000 series, measured."""
+    return np.concatenate([c.to_numpy(zero_copy_only=False) for c in table.column(name).chunks])
 
 
 # The three below run in a worker thread: on a portfolio's 240,000 days each holds the
@@ -349,27 +378,42 @@ def _by_alpha[T](ids: list[str], days: list[date], values: list[T]) -> dict[str,
 
 
 def _daily(table: pa.Table) -> dict[str, dict[date, float]]:
-    """``alpha_id, date, pnl`` rows, sorted by Alpha and date, as each Alpha's PnL by date."""
+    """``alpha_id, date, pnl`` rows, sorted by Alpha and date, as each Alpha's PnL by date.
+
+    Converted to Python an Alpha at a time: one call over the whole table holds the GIL, and
+    the event loop with it, for as long as it runs, even from a worker thread.
+    """
+    if not table.num_rows:
+        return {}
     # Through numpy: Arrow's own to_pylist builds dates twenty times slower.
-    return _by_alpha(
-        table.column("alpha_id").to_pylist(),
-        table.column("date").to_numpy().tolist(),
-        table.column("pnl").to_numpy().tolist(),
-    )
+    days, pnl = _column(table, "date"), _column(table, "pnl")
+    return {
+        alpha_id: dict(zip(days[rows].tolist(), pnl[rows].tolist(), strict=True))
+        for alpha_id, rows in _runs(table).items()
+    }
 
 
-def _daily_traded(table: pa.Table) -> dict[str, dict[date, tuple[float, float]]]:
-    """:func:`_daily` with each day's turnover beside its PnL."""
-    pnl, traded = table.column("pnl").to_numpy(), table.column("turnover").to_numpy()
-    return _by_alpha(
-        table.column("alpha_id").to_pylist(),
-        table.column("date").to_numpy().tolist(),
-        list(zip(pnl.tolist(), traded.tolist(), strict=True)),
-    )
+def _daily_traded(table: pa.Table) -> Series:
+    """``alpha_id, date, pnl, turnover`` rows, sorted by Alpha and date, as each Alpha's slice of
+    the three columns. Never a Python object per day: as dicts, 2,000 series took 1.5 GB."""
+    if not table.num_rows:
+        return {}
+    days, pnl, traded = (_column(table, c) for c in ("date", "pnl", "turnover"))
+    return {a: (days[rows], pnl[rows], traded[rows]) for a, rows in _runs(table).items()}
 
 
-def _grid(table: pa.Table) -> PnlGrid:
-    """``alpha_id, date, pnl`` rows as a calendar of dates by Alphas, NaN where one has none."""
+def days_of(
+    stored: tuple[metrics.Days, metrics.Floats, metrics.Floats],
+) -> list[tuple[date, float, float]]:
+    """One Alpha's :meth:`AlphaVault.series` as the ``(date, pnl, turnover)`` rows
+    :mod:`.metrics` reads."""
+    days, pnl, turnover = stored
+    return list(zip(days.tolist(), pnl.tolist(), turnover.tolist(), strict=True))
+
+
+def _grid(table: pa.Table, absent: list[str] | None = None) -> PnlGrid:
+    """``alpha_id, date, pnl`` rows as a calendar of dates by Alphas, NaN where one has none.
+    ``absent`` are Alphas without a row in the table, kept as columns of NaN after the rest."""
     ids = table.column("alpha_id").combine_chunks().dictionary_encode()
     # The few thousand distinct days sorted, not every row's: measured, a third of the time.
     dates = table.column("date").combine_chunks().dictionary_encode()
@@ -377,9 +421,10 @@ def _grid(table: pa.Table) -> PnlGrid:
     order = np.argsort(distinct)
     rank = np.empty_like(order)
     rank[order] = np.arange(len(order))
-    grid = np.full((len(distinct), len(ids.dictionary)), np.nan)
+    kept = ids.dictionary.to_pylist()
+    grid = np.full((len(distinct), len(kept) + len(absent or [])), np.nan)
     grid[rank[dates.indices.to_numpy()], ids.indices.to_numpy()] = table.column("pnl").to_numpy()
-    return ids.dictionary.to_pylist(), distinct[order].tolist(), grid
+    return [*kept, *(absent or [])], distinct[order].tolist(), grid
 
 
 def json_list(raw: Any) -> list[str]:
@@ -392,6 +437,13 @@ def _as_date(value: Any) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
+
+
+def _day_starts(day: date) -> datetime:
+    """When ``day`` starts on BRAIN's clock, which its Date Created counts days on, in the
+    naive UTC the vault keeps times in."""
+    start = datetime(day.year, day.month, day.day, tzinfo=PLATFORM_TZ)
+    return start.astimezone(UTC).replace(tzinfo=None)
 
 
 class AlphaVault:
@@ -546,9 +598,9 @@ class AlphaVault:
         for chunk in itertools.batched(pending, REBUILD_CHUNK, strict=False):
             series = await self.series([str(r["alpha_id"]) for r in chunk])
             rows = [
-                (a, _after_cost_sharpe([(d, p, t) for d, (p, t) in sorted(days.items())], info))
+                (a, _after_cost_sharpe(days_of(stored), info))
                 for a, info in ((str(r["alpha_id"]), r) for r in chunk)
-                if (days := series.get(a))
+                if (stored := series.get(a))
             ]
             rebuilt += await self.catalog.upsert("alpha", ("alpha_id", "after_cost_5bps"), rows)
         log.info("vault.after_cost_sharpe_rebuilt", alphas=rebuilt)
@@ -563,6 +615,19 @@ class AlphaVault:
         """
         kept = json.dumps(without_quota_checks(checks))
         await self.catalog.upsert("alpha", ("alpha_id", "checks"), [(alpha_id, kept)])
+
+    async def save_tags(self, tags: dict[str, list[str]]) -> None:
+        """Replace stored Alphas' tags and touch nothing else. An update, not an upsert: an
+        Alpha not stored yet arrives whole with the next sync, not as a row of tags alone."""
+        if tags:
+            await self.catalog.execute(
+                """
+                UPDATE alpha SET tags = t.tags
+                FROM (SELECT unnest(?::VARCHAR[]) AS alpha_id, unnest(?::VARCHAR[]) AS tags) t
+                WHERE alpha.alpha_id = t.alpha_id
+                """,
+                [list(tags), [json.dumps(kept) for kept in tags.values()]],
+            )
 
     # -- reading ---------------------------------------------------------
 
@@ -600,6 +665,17 @@ class AlphaVault:
             """
         )
 
+    async def tags(self) -> list[str]:
+        """Every tag the Alphas the Simulations table lists carry, for its tag filter."""
+        rows = await self.catalog.query(
+            """
+            SELECT DISTINCT unnest(from_json(tags, '["VARCHAR"]')) AS tag FROM alpha
+            WHERE date_created IS NOT NULL
+            ORDER BY tag
+            """
+        )
+        return [str(r["tag"]) for r in rows]
+
     async def evolvable_markets(self) -> list[dict[str, Any]]:
         """Equity scopes holding unsubmitted alphas the Evolution Lab would take as seeds.
 
@@ -628,6 +704,44 @@ class AlphaVault:
         """The newest alpha stored, which is where an incremental sync resumes."""
         return await self.catalog.scalar("SELECT max(date_created) FROM alpha")
 
+    async def matching_ids(
+        self,
+        *,
+        limit: int,
+        submitted: bool = False,
+        regions: list[str] | None = None,
+        delays: list[int] | None = None,
+        universes: list[str] | None = None,
+        minimum: dict[str, float] | None = None,
+        maximum: dict[str, float] | None = None,
+        search: str | None = None,
+        tags: list[str] | None = None,
+        tags_all: bool = False,
+        created_after: date | None = None,
+        created_before: date | None = None,
+    ) -> list[str]:
+        """Every Alpha the Simulations table's filters keep, newest first, up to ``limit``."""
+        clauses, params = _filters(
+            submitted=submitted,
+            regions=regions,
+            delays=delays,
+            universes=universes,
+            minimum=minimum,
+            maximum=maximum,
+            search=search,
+            tags=tags,
+            tags_all=tags_all,
+            created_after=created_after,
+            created_before=created_before,
+            evolvable=False,
+        )
+        rows = await self.catalog.query(
+            f"SELECT a.alpha_id FROM alpha a WHERE {' AND '.join(clauses)} "  # noqa: S608
+            "ORDER BY a.date_created DESC, a.alpha_id LIMIT ?",
+            [*params, limit],
+        )
+        return [str(r["alpha_id"]) for r in rows]
+
     async def page(
         self,
         *,
@@ -640,11 +754,19 @@ class AlphaVault:
         minimum: dict[str, float] | None = None,
         maximum: dict[str, float] | None = None,
         search: str | None = None,
+        tags: list[str] | None = None,
+        tags_all: bool = False,
+        created_after: date | None = None,
+        created_before: date | None = None,
         evolvable: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
         """One page of the Simulations table: sorted, filtered, with the total.
+
+        ``tags`` keeps Alphas carrying any of them, or all of them with ``tags_all``.
+        ``created_after`` and ``created_before`` are days on BRAIN's clock, both included,
+        as its own date filter reads them.
 
         ``evolvable`` keeps only what the Evolution Lab can breed from. The same predicate
         the lab itself enforces, so the table offering an Alpha and the lab accepting it can
@@ -652,36 +774,20 @@ class AlphaVault:
         and picking one only to be told later that it cannot be a seed is the table's fault,
         not the user's.
         """
-        clauses = ["a.date_created IS NOT NULL", SUBMITTED if submitted else f"NOT {SUBMITTED}"]
-        if evolvable:
-            # Every condition ``ga.seed_problem`` and ``ga.auto_seeds`` apply, not just the
-            # type: an Alpha with no Fitness is refused there too, so offering it here would
-            # be the same lie in a different place.
-            clauses.extend(
-                [
-                    SEEDABLE,
-                    "coalesce(a.instrument_type, 'EQUITY') = 'EQUITY'",
-                    "a.expression IS NOT NULL",
-                ]
-            )
-        params: list[Any] = []
-        for column, values in (("region", regions), ("delay", delays), ("universe", universes)):
-            if values:
-                clauses.append(f"a.{column} IN ({', '.join('?' for _ in values)})")
-                params.extend(values)
-        for bounds, op in ((minimum, ">="), (maximum, "<=")):
-            for key, value in (bounds or {}).items():
-                if key in ALPHA_METRICS and not key.startswith("date_"):
-                    clauses.append(f"({ALPHA_METRICS[key]}) {op} ?")
-                    params.append(value)
-        if search:
-            needle = f"%{search.lower()}%"
-            clauses.append(
-                "(lower(a.alpha_id) LIKE ? OR lower(coalesce(a.expression, '')) LIKE ? "
-                "OR lower(coalesce(a.name, '')) LIKE ?)"
-            )
-            params.extend([needle, needle, needle])
-
+        clauses, params = _filters(
+            submitted=submitted,
+            regions=regions,
+            delays=delays,
+            universes=universes,
+            minimum=minimum,
+            maximum=maximum,
+            search=search,
+            tags=tags,
+            tags_all=tags_all,
+            created_after=created_after,
+            created_before=created_before,
+            evolvable=evolvable,
+        )
         where = " AND ".join(clauses)
         order = ALPHA_METRICS.get(sort_by, ALPHA_METRICS["date_created"])
         direction = "DESC" if sort_desc else "ASC"
@@ -700,8 +806,8 @@ class AlphaVault:
                        a.fitness, a.turnover, a.returns, a.drawdown, a.margin,
                        a.operator_count, {ALPHA_METRICS["calmar"]} AS calmar,
                        a.date_created, a.date_submitted, a.long_count, a.short_count,
-                       a.max_trade, a.max_position, a.classifications, a.pyramids,
-                       a.train_sharpe, a.test_sharpe, a.checks, {standing}, {order} AS sort_key
+                       a.max_trade, a.max_position, a.classifications, a.pyramids, a.tags,
+                       a.train_sharpe, a.test_sharpe, {standing}, {order} AS sort_key
                 FROM {source} a
                 WHERE {where}
                 ORDER BY sort_key {direction} NULLS LAST, a.alpha_id
@@ -711,7 +817,23 @@ class AlphaVault:
             """,  # noqa: S608
             [*params, limit, offset],
         )
-        return {"total": int(total or 0), "results": [_page_row(r) for r in rows]}
+        # Checks are ~2 KB of JSON an Alpha: inside the sort, DuckDB decompressed every row's
+        # to keep a page's, eight times the rest of the query. Read for the page alone instead.
+        checks: dict[str, str | None] = {}
+        if rows:
+            ids = [r["alpha_id"] for r in rows]
+            listed = ", ".join("?" for _ in ids)
+            checks = {
+                r["alpha_id"]: r["checks"]
+                for r in await self.catalog.query(
+                    f"SELECT alpha_id, checks FROM alpha WHERE alpha_id IN ({listed})",  # noqa: S608
+                    ids,
+                )
+            }
+        return {
+            "total": int(total or 0),
+            "results": [_page_row(r | {"checks": checks.get(r["alpha_id"])}) for r in rows],
+        }
 
     async def pnl_series(self, alpha_id: str) -> list[dict[str, Any]]:
         """The stored daily PnL, oldest first, as ``{date, pnl}`` rows."""
@@ -740,9 +862,9 @@ class AlphaVault:
         )
         return await asyncio.to_thread(_daily, table)
 
-    async def series(self, alpha_ids: list[str]) -> dict[str, dict[date, tuple[float, float]]]:
-        """Each Alpha's daily ``(pnl, turnover)`` by date. Alphas still on the old series,
-        which has no turnover, are absent."""
+    async def series(self, alpha_ids: list[str]) -> Series:
+        """Each Alpha's days, oldest first, with its PnL and turnover on them. Alphas still on
+        the old series, which has no turnover, are absent."""
         if not alpha_ids:
             return {}
         placeholders = ", ".join("?" for _ in alpha_ids)
@@ -756,10 +878,13 @@ class AlphaVault:
         )
         return await asyncio.to_thread(_daily_traded, table)
 
-    async def pnl_grid(self, alpha_ids: list[str]) -> PnlGrid:
+    async def pnl_grid(self, alpha_ids: list[str], since: date | None = None) -> PnlGrid:
         """Of these Alphas, the ones holding a current daily PnL (turnover or not); every date
         any of them traded; and their PnL on that calendar, a column each, NaN where one has
         no row.
+
+        With ``since``, only the days from it on. Every Alpha holding a PnL is still a column,
+        all NaN when it traded none of them, so the Alphas are the same as without it.
 
         Arrow into numpy, never a Python object per day. As dicts a series costs 1.3 MB and
         6 ms, so the Power Pool of a sweep of 1,500 took 1.9 GB and nine seconds a request.
@@ -767,14 +892,44 @@ class AlphaVault:
         if not alpha_ids:
             return [], [], np.empty((0, 0))
         placeholders = ", ".join("?" for _ in alpha_ids)
+        params: list[Any] = [*alpha_ids, SERIES_VERSION]
+        recent = ""
+        if since is not None:
+            recent = "AND date >= ?"
+            params.append(since)
+        # Materialized: DuckDB streams an unordered ``IN`` result into Arrow twice as slowly.
         table = await self.catalog.arrow(
             f"""
-            SELECT alpha_id, date, coalesce(pnl, 0) AS pnl FROM alpha_pnl
-            WHERE alpha_id IN ({placeholders}) AND alpha_id IN ({PNL_STORED})
+            WITH rows AS MATERIALIZED (
+                SELECT alpha_id, date, coalesce(pnl, 0) AS pnl FROM alpha_pnl
+                WHERE alpha_id IN ({placeholders}) AND alpha_id IN ({PNL_STORED}) {recent}
+            )
+            SELECT * FROM rows
             """,  # noqa: S608
-            [*alpha_ids, SERIES_VERSION],
+            params,
         )
-        return await asyncio.to_thread(_grid, table)
+        absent: list[str] = []
+        if since is not None:
+            present = set(table.column("alpha_id").unique().to_pylist())
+            absent = [a for a in await self.last_days(alpha_ids) if a not in present]
+        return await asyncio.to_thread(_grid, table, absent)
+
+    async def last_days(self, alpha_ids: list[str]) -> dict[str, date]:
+        """Of these Alphas, the ones holding a current daily PnL, each with the last day it has
+        a row on: the one :meth:`pnl_grid` marks as traded, whatever its PnL was."""
+        if not alpha_ids:
+            return {}
+        # Every Alpha's, picked here: an ``IN`` list over the table takes a second, this 70 ms.
+        rows = await self.catalog.query(
+            f"""
+            SELECT alpha_id, max(date) AS last FROM alpha_pnl
+            WHERE alpha_id IN ({PNL_STORED})
+            GROUP BY alpha_id
+            """,  # noqa: S608
+            [SERIES_VERSION],
+        )
+        wanted = set(alpha_ids)
+        return {str(r["alpha_id"]): _as_date(r["last"]) for r in rows if r["alpha_id"] in wanted}
 
     async def submitted_members(self) -> list[dict[str, Any]]:
         """Every submitted Alpha with what the Portfolio page filters on.
@@ -823,6 +978,30 @@ class AlphaVault:
         )
         stored = {str(r["alpha_id"]) for r in rows}
         return [a for a in alpha_ids if a not in stored]
+
+    async def mark_pnl_absent(self, alpha_id: str) -> None:
+        """Record that BRAIN just answered with no daily PnL for this Alpha."""
+        await self.catalog.execute(
+            "UPDATE alpha SET pnl_absent_at = now() WHERE alpha_id = ?", [alpha_id]
+        )
+
+    async def pnl_absent(
+        self, alpha_ids: list[str], *, within: timedelta | None = None
+    ) -> set[str]:
+        """Those of these Alphas BRAIN has no PnL for, as of its last answer, or as of the
+        last ``within`` of it."""
+        if not alpha_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in alpha_ids)
+        recent = "" if within is None else "AND pnl_absent_at > now() - ?"
+        rows = await self.catalog.query(
+            f"""
+            SELECT alpha_id FROM alpha
+            WHERE alpha_id IN ({placeholders}) AND pnl_absent_at IS NOT NULL {recent}
+            """,  # noqa: S608
+            [*alpha_ids, *([] if within is None else [within])],
+        )
+        return {str(r["alpha_id"]) for r in rows}
 
     async def lacking_pnl(self, alpha_ids: list[str]) -> list[str]:
         """Those of these Alphas with no daily PnL stored, turnover or not, in the order given."""
@@ -942,13 +1121,236 @@ class AlphaVault:
             for a in alpha_ids
         }
 
-    async def by_ids(self, alpha_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Look several alphas up at once, keyed by id."""
+    async def by_ids(
+        self, alpha_ids: list[str], *, brain: bool = False
+    ) -> dict[str, dict[str, Any]]:
+        """Look several alphas up at once, keyed by id. Their ``brain`` column only when asked
+        for: a third of what a row holds, and only copying an Alpha out reads it."""
         if not alpha_ids:
             return {}
         placeholders = ", ".join("?" for _ in alpha_ids)
+        columns = "*" if brain else "* EXCLUDE (brain)"
         rows = await self.catalog.query(
-            f"SELECT * FROM alpha WHERE alpha_id IN ({placeholders})",  # noqa: S608
+            f"SELECT {columns} FROM alpha WHERE alpha_id IN ({placeholders})",  # noqa: S608
             list(alpha_ids),
         )
         return {str(r["alpha_id"]): r for r in rows}
+
+
+def _filters(
+    *,
+    submitted: bool,
+    regions: list[str] | None,
+    delays: list[int] | None,
+    universes: list[str] | None,
+    minimum: dict[str, float] | None,
+    maximum: dict[str, float] | None,
+    search: str | None,
+    tags: list[str] | None,
+    tags_all: bool,
+    created_after: date | None,
+    created_before: date | None,
+    evolvable: bool,
+) -> tuple[list[str], list[Any]]:
+    """The Simulations table's filters as SQL over ``alpha a``, and their parameters."""
+    clauses = ["a.date_created IS NOT NULL", SUBMITTED if submitted else f"NOT {SUBMITTED}"]
+    if evolvable:
+        # Every condition ``ga.seed_problem`` and ``ga.auto_seeds`` apply, not just the
+        # type: an Alpha with no Fitness is refused there too, so offering it here would
+        # be the same lie in a different place.
+        clauses.extend(
+            [
+                SEEDABLE,
+                "coalesce(a.instrument_type, 'EQUITY') = 'EQUITY'",
+                "a.expression IS NOT NULL",
+            ]
+        )
+    params: list[Any] = []
+    for column, values in (("region", regions), ("delay", delays), ("universe", universes)):
+        if values:
+            clauses.append(f"a.{column} IN ({', '.join('?' for _ in values)})")
+            params.extend(values)
+    for bounds, op in ((minimum, ">="), (maximum, "<=")):
+        for key, value in (bounds or {}).items():
+            # Bounds are numbers, and DuckDB refuses to compare a timestamp with one,
+            # failing the whole page: dates have bounds of their own, below.
+            if key in ALPHA_METRICS and not key.startswith("date_"):
+                clauses.append(f"({ALPHA_METRICS[key]}) {op} ?")
+                params.append(value)
+    if created_after:
+        clauses.append("a.date_created >= ?")
+        params.append(_day_starts(created_after))
+    if created_before:
+        clauses.append("a.date_created < ?")
+        params.append(_day_starts(created_before + timedelta(days=1)))
+    if tags:
+        has = "list_has_all" if tags_all else "list_has_any"
+        clauses.append(f"""{has}(from_json(a.tags, '["VARCHAR"]'), ?::VARCHAR[])""")
+        params.append(tags)
+    if search:
+        needle = f"%{search.lower()}%"
+        clauses.append(
+            "(lower(a.alpha_id) LIKE ? OR lower(coalesce(a.expression, '')) LIKE ? "
+            "OR lower(coalesce(a.name, '')) LIKE ?)"
+        )
+        params.extend([needle, needle, needle])
+    return clauses, params
+
+
+if __name__ == "__main__":
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    async def filtered() -> dict[str, bool]:
+        with tempfile.TemporaryDirectory() as folder:
+            catalog = Catalog(Path(folder) / "catalog.duckdb")
+            await catalog.open()
+            try:
+                vault = AlphaVault(catalog)
+                # 03:30 UTC on Oct 8 is still Oct 7 on BRAIN's New York clock.
+                created = {
+                    "late": (datetime(2026, 10, 8, 3, 30, tzinfo=UTC), ["momentum", "café"]),
+                    "next": (datetime(2026, 10, 8, 4, 30, tzinfo=UTC), ["value"]),
+                    "bare": (datetime(2026, 10, 9, 12, tzinfo=UTC), None),
+                }
+                await catalog.upsert(
+                    "alpha",
+                    ("alpha_id", "date_created", "tags", "status"),
+                    [
+                        (a, at, None if tags is None else json.dumps(tags), "UNSUBMITTED")
+                        for a, (at, tags) in created.items()
+                    ],
+                )
+
+                async def ids(**filters: Any) -> list[str]:
+                    page = await vault.page(sort_by="date_created", sort_desc=False, **filters)
+                    return [r["alphaId"] for r in page["results"]]
+
+                oct7, oct8 = date(2026, 10, 7), date(2026, 10, 8)
+                found = {
+                    "after a day, by BRAIN's clock": await ids(created_after=oct8)
+                    == ["next", "bare"],
+                    "before a day, that day included": await ids(created_before=oct7) == ["late"],
+                    "one day": await ids(created_after=oct8, created_before=oct8) == ["next"],
+                    "a date bound among the numbers is ignored": len(
+                        await ids(minimum={"date_created": 1.0})
+                    )
+                    == 3,
+                    "a tag": await ids(tags=["momentum"]) == ["late"],
+                    "any of several tags": await ids(tags=["café", "value"]) == ["late", "next"],
+                    "rows carry their tags": (await vault.page(tags=["momentum"]))["results"][0][
+                        "tags"
+                    ]
+                    == ["momentum", "café"],
+                    "every tag, once": await vault.tags() == ["café", "momentum", "value"],
+                }
+                await vault.save_tags({"bare": ["value"], "unstored": ["value"]})
+                found |= {
+                    "saved tags filter at once": await ids(tags=["value"]) == ["next", "bare"],
+                    "an Alpha not stored is not written": await vault.by_ids(["unstored"]) == {},
+                }
+                # Stored newest first, read back oldest first.
+                late = [(date(2026, 10, 8 - k), 100.0 * k, 0.01 * k) for k in range(3)]
+                bare = [(date(2026, 10, 9), -7.5, 0.2)]
+                for alpha_id, days in (("late", late), ("bare", bare)):
+                    await catalog.replace_pnl(alpha_id, [(alpha_id, *day) for day in days])
+                await catalog.replace_pnl("next", [("next", date(2026, 10, 8), 5.0, None)])
+                await catalog.upsert("alpha", ("alpha_id", "brain"), [("late", "{}")])
+                series = await vault.series(["late", "next", "bare"])
+                plain = await vault.by_ids(["late"])
+                whole = await vault.by_ids(["late"], brain=True)
+                daily = await vault.daily_pnl(["late", "next", "bare"])
+                found |= {
+                    "each series oldest day first, Alphas in id order": list(series)
+                    == ["bare", "late"]
+                    and days_of(series["late"]) == sorted(late)
+                    and days_of(series["bare"]) == bare,
+                    "a PnL without turnover is no series": set(series) == {"late", "bare"},
+                    "daily PnL in id order, oldest day first, turnover or not": [
+                        (a, list(d)) for a, d in daily.items()
+                    ]
+                    == [
+                        ("bare", [bare[0][0]]),
+                        ("late", [d for d, _, _ in sorted(late)]),
+                        ("next", [date(2026, 10, 8)]),
+                    ],
+                    "brain only when asked for": "brain" not in plain["late"]
+                    and whole["late"]["brain"] == "{}",
+                }
+                return found
+            finally:
+                await catalog.close()
+
+    async def interleaved() -> dict[str, bool]:
+        """Rows stored in no order at all come back by Alpha, oldest day first, the ids in the
+        order Python sorts them."""
+        rows = [
+            ("b1", date(2026, 1, 5), 5.0, 0.5),
+            ("B2", date(2026, 1, 2), 2.0, 0.2),
+            ("a3", date(2026, 1, 3), 3.0, 0.3),
+            ("b1", date(2025, 12, 31), -1.0, 0.1),
+            ("B2", date(2026, 1, 9), 9.0, 0.9),
+            ("b1", date(2023, 1, 2), 7.0, 0.7),
+            ("b1", date(2026, 1, 2), 2.5, 0.25),
+            ("B2", date(2023, 6, 1), 4.0, 0.4),
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            catalog = Catalog(Path(folder) / "catalog.duckdb")
+            await catalog.open()
+            try:
+                await catalog.upsert("alpha_pnl", ("alpha_id", "date", "pnl", "turnover"), rows)
+                vault = AlphaVault(catalog)
+                ids = ["b1", "B2", "a3"]
+                daily, series = await vault.daily_pnl(ids), await vault.series(ids)
+                train = await vault.train_pnl(ids)
+                await catalog.upsert(
+                    "alpha", ("alpha_id", "series_version"), [(a, SERIES_VERSION) for a in ids]
+                )
+                every = await vault.pnl_grid([*ids, "unstored"])
+                recent = await vault.pnl_grid([*ids, "unstored"], since=date(2026, 1, 4))
+                last = await vault.last_days([*ids, "unstored"])
+            finally:
+                await catalog.close()
+        ordered = sorted(rows)
+        alphas = list(dict.fromkeys(a for a, *_ in ordered))
+
+        def cells(grid: PnlGrid) -> dict[str, dict[date, float]]:
+            names, days, pnl = grid
+            return {
+                a: {d: v for d, v in zip(days, pnl[:, i].tolist(), strict=True) if v == v}
+                for i, a in enumerate(names)
+            }
+
+        whole = cells(every)
+        return {
+            "a grid from a day on keeps the Alphas, and from then on their days alone": set(
+                recent[0]
+            )
+            == set(every[0])
+            and cells(recent)
+            == {
+                a: {d: p for d, p in days.items() if d >= date(2026, 1, 4)}
+                for a, days in whole.items()
+            }
+            and recent[1] == sorted({d for days in cells(recent).values() for d in days}),
+            "last days, the Alphas holding a PnL only": last
+            == {"b1": date(2026, 1, 5), "B2": date(2026, 1, 9), "a3": date(2026, 1, 3)},
+            "PnL by Alpha in id order, oldest day first": [
+                (a, list(days.items())) for a, days in daily.items()
+            ]
+            == [(a, [(d, p) for b, d, p, _ in ordered if b == a]) for a in alphas],
+            "series by Alpha in id order, oldest day first": [
+                (a, days_of(s)) for a, s in series.items()
+            ]
+            == [(a, [(d, p, t) for b, d, p, t in ordered if b == a]) for a in alphas],
+            "train PnL before each Alpha's last two years, in the same order": [
+                (a, list(days.items())) for a, days in train.items()
+            ]
+            == [("B2", [(date(2023, 6, 1), 4.0)]), ("b1", [(date(2023, 1, 2), 7.0)])],
+        }
+
+    checks = asyncio.run(interleaved()) | asyncio.run(filtered())
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"vault store self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

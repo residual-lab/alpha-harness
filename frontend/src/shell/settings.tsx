@@ -27,7 +27,7 @@ import { fmt } from '@/lib/format'
 import { usePreferences, useSavePreferences } from '@/lib/preferences'
 import { DEFAULT_SCOPE, useScopeOptions } from '@/lib/scope'
 import { useProviderLabel, useRunnableModels } from '@/screens/ai/shared'
-import { Button, Chips, ErrorNotice, Segmented, Skeleton, Switch } from '@/ui/kit'
+import { Button, Chips, ErrorNotice, Input, Segmented, Skeleton, Switch } from '@/ui/kit'
 import { BACKDROP, Select } from '@/ui/overlay'
 import { MOD } from './desktop'
 import { useApplyUpdate, useUpdateStatus } from './update'
@@ -304,6 +304,7 @@ function AlphaRows({ current, change }: Rows) {
   return (
     <>
       <PnlRow current={current} change={change} />
+      <AutoTagRow current={current} change={change} />
       <DescriptionModelRow current={current} change={change} />
     </>
   )
@@ -339,6 +340,47 @@ function PnlRow({ current, change }: Rows) {
           {current.pnlDownload ? describeResults(chosen) : 'Off: nothing downloads by itself.'}{' '}
           Checks that only label an Alpha, such as Pyramid, Theme or Competition matches, do not
           count.
+        </Status>
+      </div>
+    </SettingRow>
+  )
+}
+
+/** A tag as BRAIN keeps them. */
+const TAG = /^[A-Za-z0-9_-]{1,40}$/
+
+function AutoTagRow({ current, change }: Rows) {
+  const [draft, setDraft] = useState(current.autoTagName)
+  const valid = TAG.test(draft)
+  const save = () => valid && draft !== current.autoTagName && change({ autoTagName: draft })
+  return (
+    <SettingRow
+      title="Tag Alphas on BRAIN"
+      description={`Tags every Alpha a lab makes, as ACE's notebooks do, so you can find them on BRAIN's Alphas page or pick them in a SuperAlpha with in(tags, "${current.autoTagName}"). Each also gets its lab's tag, such as ${current.autoTagName}_search. Each tag is one more BRAIN request, sent behind your simulations.`}
+      control={(labels) => (
+        <Switch checked={current.autoTag} onChange={(on) => change({ autoTag: on })} {...labels} />
+      )}
+    >
+      <div className="flex flex-col gap-2 rounded-md border border-hairline bg-surface-1 p-3">
+        <label className="flex flex-wrap items-center gap-2 text-body-compact font-medium text-ink-muted">
+          Tag
+          <Input
+            value={draft}
+            maxLength={40}
+            spellCheck={false}
+            disabled={!current.autoTag}
+            className="num w-48"
+            onChange={(e) => setDraft(e.target.value.trim())}
+            onBlur={save}
+            onKeyDown={(e) => e.key === 'Enter' && save()}
+          />
+        </label>
+        <Status>
+          {!valid
+            ? 'Letters, digits, _ and - only, up to 40 characters.'
+            : current.autoTag
+              ? `New Alphas get ${draft} and ${draft}_<lab>. Alphas made before this was on keep their tags as they are.`
+              : 'Off: Alphas are not tagged.'}
         </Status>
       </div>
     </SettingRow>

@@ -2,12 +2,13 @@
 
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
-import { CopyIcon, SearchIcon } from 'lucide-react'
+import { ChartLineIcon, CopyIcon, SearchIcon } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { errorMessage } from '@/api/http'
 import { REGION_AGNOSTIC_REGION } from '@/api/platform'
 import type { Scope } from '@/api/types'
+import { copyFromWorker } from '@/lib/clipboard'
 import { CORE_ORDER, fmt } from '@/lib/format'
 import { regionLabel } from '@/lib/scope'
 import { useDebounced } from '@/lib/use-debounced'
@@ -33,8 +34,9 @@ import {
   Segmented,
 } from '@/ui/kit'
 import { Pager, type Sort } from '@/ui/table'
-import { alphasMarkdown } from './copy'
+import type { alphasMarkdown } from './copy'
 import { alphaIds } from './detail'
+import { BringInTagged, TagAnalysis, TagFilter } from './tag-groups'
 
 /** Bounds as the user types them; `div` converts the display unit to the wire fraction. */
 const BOUNDS: { key: AlphaMetricKey; label: string; div: number }[] = [
@@ -54,6 +56,7 @@ const OFFER = [
   'dateCreated',
   'dateSubmitted',
   'classifications',
+  'tags',
   'pyramids',
   'operatorCount',
   'hasPnl',
@@ -109,6 +112,11 @@ export function Stored({
   const [regions, setRegions] = useState<string[]>([])
   const [delays, setDelays] = useState<string[]>([])
   const [universes, setUniverses] = useState<string[]>([])
+  const [tags, setTags] = useState<string[]>([])
+  const [tagsAll, setTagsAll] = useState(false)
+  const [analysing, setAnalysing] = useState(false)
+  const [createdAfter, setCreatedAfter] = useState('')
+  const [createdBefore, setCreatedBefore] = useState('')
   const [bounds, setBounds] = useState<Record<string, { min: string; max: string }>>({})
   const [sort, setSort] = useState<Sort>({ key: 'sharpe', desc: true })
   const [limit, setLimit] = useState(100)
@@ -141,6 +149,10 @@ export function Stored({
     delays: market ? [market.delay] : delays.length ? delays.map(Number) : null,
     universes: market ? [market.universe] : universes.length ? universes : null,
     search: quietSearch.trim() || null,
+    tags: tags.length ? tags : null,
+    tags_all: tagsAll,
+    created_after: createdAfter || null,
+    created_before: createdBefore || null,
     minimum: Object.fromEntries(
       BOUNDS.flatMap((b) => {
         const v = parseNum(quietBounds[b.key]?.min ?? '')
@@ -179,14 +191,18 @@ export function Stored({
     value: v,
     label: v,
   }))
+  const tagItems = (overview.data?.tags ?? []).map((v) => ({ value: v, label: v }))
 
-  // Rows are ticked only to pick seeds; anywhere else a tick would lead nowhere.
+  // Picking seeds, a tick picks a seed; otherwise the table's own ticks tag Alphas.
   const toggle = (ids: string[], on: boolean) =>
     useSeedPick.setState((s) => ({
       ids: on ? [...new Set([...s.ids, ...ids])] : s.ids.filter((id) => !ids.includes(id)),
     }))
   const activeBounds =
     BOUNDS.filter((b) => bounds[b.key]?.min || bounds[b.key]?.max).length +
+    tags.length +
+    (createdAfter ? 1 : 0) +
+    (createdBefore ? 1 : 0) +
     (market ? 0 : regions.length + delays.length + universes.length)
 
   return (
@@ -218,6 +234,18 @@ export function Stored({
               ]}
             />
           )}
+          {!market && (
+            <Button
+              size="sm"
+              variant={analysing ? 'secondary' : 'ghost'}
+              aria-pressed={analysing}
+              disabled={!page.data?.total}
+              onClick={() => setAnalysing((on) => !on)}
+            >
+              <ChartLineIcon />
+              Analyse as a Portfolio
+            </Button>
+          )}
           {!market && submitted === 'yes' && (
             <Button
               size="sm"
@@ -226,8 +254,11 @@ export function Stored({
               disabled={!page.data?.total}
               onClick={() => {
                 setCopying(true)
-                alphasMarkdown(body, 'Submitted Alphas')
-                  .then((text) => navigator.clipboard.writeText(text))
+                copyFromWorker<typeof alphasMarkdown>(
+                  new Worker(new URL('./copy.worker.ts', import.meta.url), { type: 'module' }),
+                  body,
+                  'Submitted Alphas',
+                )
                   .then(
                     () =>
                       toast.success(`Copied ${fmt.int(page.data?.total ?? 0)} Submitted Alphas`),
@@ -274,6 +305,52 @@ export function Stored({
                   />
                 </Fieldset>
               </div>
+            )}
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+              <Fieldset
+                legend="Tags"
+                className="lg:col-span-2"
+                hint={
+                  overview.data && !tagItems.length && !tags.length
+                    ? 'No tags yet. Tick Alphas in the table to tag them, or bring tagged Alphas in from BRAIN below.'
+                    : undefined
+                }
+              >
+                <TagFilter
+                  options={tagItems.map((i) => i.value)}
+                  tags={tags}
+                  every={tagsAll}
+                  onChange={(next, every) => {
+                    setTags(next)
+                    setTagsAll(every)
+                    setOffset(0)
+                  }}
+                />
+              </Fieldset>
+              <Fieldset legend="Date Created">
+                <div className="flex items-center gap-1.5">
+                  <Input
+                    type="date"
+                    aria-label="Created on or after"
+                    value={createdAfter}
+                    max={createdBefore || undefined}
+                    onChange={(e) => reset(setCreatedAfter)(e.target.value)}
+                  />
+                  <span className="text-ink-subtle">–</span>
+                  <Input
+                    type="date"
+                    aria-label="Created on or before"
+                    value={createdBefore}
+                    min={createdAfter || undefined}
+                    onChange={(e) => reset(setCreatedBefore)(e.target.value)}
+                  />
+                </div>
+              </Fieldset>
+            </div>
+            {!market && (
+              <Fieldset legend="Bring In from BRAIN by Tag">
+                <BringInTagged suggested={tags} />
+              </Fieldset>
             )}
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-4">
               {BOUNDS.map((b) => (
@@ -373,6 +450,15 @@ export function Stored({
           <Pager total={page.data?.total ?? 0} offset={offset} limit={limit} onChange={setOffset} />
         </div>
       </Panel>
+      {analysing && !market && (
+        <Panel
+          title="These Alphas as a Portfolio"
+          description="Every Alpha these filters keep, combined at equal weight, as the Portfolio screen combines submitted ones."
+          bodyClassName="flex flex-col gap-4"
+        >
+          <TagAnalysis body={body} onOpen={onOpen} />
+        </Panel>
+      )}
     </>
   )
 }

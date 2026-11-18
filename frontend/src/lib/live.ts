@@ -65,8 +65,6 @@ interface Live {
   simulations: SimulationRow[] | null
   tasks: TasksSummary | null
   sync: SyncRun | null
-  /** Set when any call reports BRAIN wants identity verification; cleared on dismiss. */
-  verificationUrl: string | null
 }
 
 export const useLive = create<Live>(() => ({
@@ -74,7 +72,6 @@ export const useLive = create<Live>(() => ({
   simulations: null,
   tasks: null,
   sync: null,
-  verificationUrl: null,
 }))
 
 // A snapshot from before a disconnect may be long stale, and a restarted backend has no tasks

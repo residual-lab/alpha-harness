@@ -30,6 +30,7 @@ import { NeutralizationPicker } from '@/screens/research-labs/neutralization'
 import { CoresSetting, SimulationsSetting } from '@/screens/research-labs/task-settings'
 import {
   Button,
+  Checkbox,
   Disclosure,
   Empty,
   ErrorNotice,
@@ -92,6 +93,7 @@ export function EvolutionLabScreen() {
     cores,
     population: draft.population,
     mutation_rate: draft.mutationRate,
+    keep_decay: draft.keepDecay,
     simulations: draft.simulations ?? 0,
   }
   const { preview, current: planned } = useLabPreview('evolution-lab', body, evolutionLab.preview)
@@ -233,6 +235,25 @@ export function EvolutionLabScreen() {
       width: '80px',
       align: 'right',
       cell: (r) => fmt.ratio(r.fitness),
+    },
+    // The held-out years, shown only: breeding never reads them.
+    {
+      key: 'testSharpe',
+      header: 'Test Sharpe',
+      width: '96px',
+      align: 'right',
+      cell: (r) => (
+        <span className={TEXT_TONE[figureTone('sharpe', r.testSharpe, r.limits)]}>
+          {fmt.ratio(r.testSharpe)}
+        </span>
+      ),
+    },
+    {
+      key: 'testFitness',
+      header: 'Test Fitness',
+      width: '96px',
+      align: 'right',
+      cell: (r) => fmt.ratio(r.testFitness),
     },
     {
       key: 'turnover',
@@ -402,6 +423,13 @@ export function EvolutionLabScreen() {
                   }))}
                   value={draft.mutationRate}
                   onChange={(mutationRate) => set({ mutationRate })}
+                />
+              </Fieldset>
+              <Fieldset legend="Decay" hint="Off, a mutation may give a child a new decay.">
+                <Checkbox
+                  label="Keep the parent's decay"
+                  checked={draft.keepDecay}
+                  onChange={(keepDecay) => set({ keepDecay })}
                 />
               </Fieldset>
             </div>

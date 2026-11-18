@@ -47,6 +47,9 @@ class LLMKey(Out):
     id: int
     label: str
     provider: str
+    #: Why the Key can no longer be used (its provider is gone), or null. It is kept for the
+    #: user to delete.
+    retired: str | None
     hint: str
     enabled: bool
     #: The user's own daily ceiling, or null to use the model's.
@@ -113,7 +116,7 @@ class SetModel(BaseModel):
     provider: str
     model: str = Field(min_length=1, max_length=200, description="The provider's model id")
     requests_per_minute: int = Field(ge=1)
-    requests_per_day: int = Field(ge=1)
+    requests_per_day: int = Field(ge=1, le=1_000_000)
     reset_timezone: str = Field(
         min_length=1, max_length=64, description="IANA time zone whose midnight starts a new day"
     )

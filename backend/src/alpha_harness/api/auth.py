@@ -10,6 +10,7 @@ from ..brain.auth import SessionInfo
 from ..brain.settings_schema import resolve_options, validate_settings
 from ..realtime import TOPIC_SESSION
 from ..schemas import Out
+from ..tasks import spawn
 from .deps import State
 
 log = structlog.get_logger(__name__)
@@ -35,6 +36,8 @@ class Session(Out):
     detail: str | None
     can_multi_simulate: bool
     expires_in_seconds: int | None
+    #: The identity check expired unfinished; ``/new-check`` starts another.
+    verification_expired: bool = False
 
 
 class SettingsField(Out):
@@ -71,6 +74,7 @@ async def _answer(state: State, info: SessionInfo) -> Session:
             await state.metadata.refresh_metadata()
         except Exception:
             log.warning("auth.metadata_refresh_failed", exc_info=True)
+        spawn(state.first_sync(), name="catalog-first-sync")
     await state.hub.broadcast(TOPIC_SESSION, info.to_dict())
     return Session.model_validate(info.to_dict())
 
@@ -105,6 +109,16 @@ async def verify(payload: VerifyRequest, state: State) -> Session:
     is what lets the window and this poll finish in either order.
     """
     return await _answer(state, await state.auth.verify(payload.inquiry))
+
+
+@router.post("/new-check")
+async def new_check(state: State) -> Session:
+    """Start a new identity check once the last one expired unfinished.
+
+    Signs in again with the login already given, which BRAIN answers with a fresh check. Only
+    on the person's press: each sign-in spends BRAIN's lockout budget.
+    """
+    return await _answer(state, await state.auth.login())
 
 
 @router.post("/logout")

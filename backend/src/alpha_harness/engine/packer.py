@@ -203,6 +203,7 @@ def allocate_slots(
     quotas: dict[str, int],
     in_flight: dict[str, int] | None = None,
     lend: bool = False,
+    ceilings: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """Divide free slots between tasks that want them.
 
@@ -217,7 +218,8 @@ def allocate_slots(
     tasks with more work than that, so a one-core task does not leave seven idle while
     nothing else wants them. A task at quota 0 is paused or finished and borrows nothing.
     Nothing is taken back mid-batch: a task that starts later waits for borrowed batches
-    to come back, a few minutes at most.
+    to come back, a few minutes at most. ``ceilings`` caps what a task may hold even then,
+    for work BRAIN itself limits.
     """
     if free_slots <= 0:
         return {}
@@ -236,10 +238,16 @@ def allocate_slots(
     allocation: dict[str, int] = defaultdict(int)
     granted = _round_robin(allocation, headroom, free_slots)
     if lend and granted < free_slots:
+        ceiling = ceilings or {}
         beyond = {
-            task: wanted - allocation[task]
+            task: room
             for task, wanted in demand.items()
-            if quotas.get(task, 1) > 0 and wanted > allocation[task]
+            if quotas.get(task, 1) > 0
+            and (
+                room := min(wanted, ceiling.get(task, wanted) - running.get(task, 0))
+                - allocation[task]
+            )
+            > 0
         }
         _round_robin(allocation, beyond, free_slots - granted)
 
@@ -302,13 +310,17 @@ def match_children(
     resolved: dict[int, dict[str, Any]] = {}
     unmatched: list[tuple[str, dict[str, Any]]] = []
     for child_id, body in children:
-        match = next(
+        echoed = (body.get("settings") or {}).keys()
+        # Of the rows that fit, the one that pinned the most of what BRAIN echoed: a row that
+        # left a setting to BRAIN's default fits a sibling's child as well as its own.
+        match = max(
             (
                 record_id
                 for record_id, payload in payloads.items()
                 if record_id not in resolved and _asked_for(payload, body)
             ),
-            None,
+            key=lambda record_id: len((payloads[record_id].get("settings") or {}).keys() & echoed),
+            default=None,
         )
         if match is not None:
             resolved[match] = {"platform_id": child_id, "body": body}

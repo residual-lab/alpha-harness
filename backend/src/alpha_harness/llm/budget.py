@@ -150,11 +150,16 @@ class Ledger:
         #: Requests sent and not yet settled, per (key, model). They count against the day
         #: until :meth:`record` makes it permanent, or callers at once could overrun a cap.
         self._in_flight: Counter[tuple[int, str]] = Counter()
+        #: (key, model id, day) pairs the provider has refused for the rest of the day. Kept
+        #: apart from the counts, which stay the requests actually sent. shortcut: lost on
+        #: restart, so the first request after one finds out again with a single 429.
+        self._spent: set[tuple[int, str, str]] = set()
 
     def forget(self, key_id: int) -> None:
         """Drop a removed key's counts: SQLite hands its id to the next key added."""
         self._windows = {k: v for k, v in self._windows.items() if k[0] != key_id}
         self._daily = {k: v for k, v in self._daily.items() if k[0] != key_id}
+        self._spent = {k for k in self._spent if k[0] != key_id}
 
     def _window(self, key_id: int, model: str) -> Window:
         return self._windows.setdefault((key_id, model), Window())
@@ -194,6 +199,8 @@ class Ledger:
             )
             if cap - spent < daily - today:
                 today, daily = spent, cap
+        if (key_id, model.id, day) in self._spent:
+            today = max(today, daily)
 
         state = Headroom(
             key_id=key_id,
@@ -277,29 +284,13 @@ class Ledger:
     async def penalise(self, key_id: int, model: ModelInfo, *, daily: bool) -> None:
         """Believe the provider over our own arithmetic.
 
-        A ``429`` means the local count was wrong, so the count is moved to the model's
-        ceiling and rotation immediately treats this pair as spent rather than retrying into
-        it. Only this model's row: the key's all-models row counts what was actually sent.
+        A ``429`` means the local count was wrong, so rotation immediately treats this pair
+        as spent rather than retrying into it. The request counts stay the real ones.
         """
-        ceiling = model.rpd
         if daily:
             day = model_day(model)
-            async with self.db.session() as session:
-                row = await session.scalar(
-                    select(KeyUsage).where(
-                        KeyUsage.api_key_id == key_id,
-                        KeyUsage.model == model.id,
-                        KeyUsage.day == day,
-                    )
-                )
-                if row is None:
-                    # Explicit zeros: column defaults are only applied at flush, and this
-                    # row is read back before then.
-                    row = KeyUsage(api_key_id=key_id, model=model.id, day=day, requests=0, tokens=0)
-                    session.add(row)
-                row.requests = max(row.requests or 0, ceiling)
-                await session.commit()
-                self._daily[(key_id, model.id, day)] = row.requests
+            self._spent = {k for k in self._spent if k[:2] != (key_id, model.id)}
+            self._spent.add((key_id, model.id, day))
             log.warning("llm.budget.daily_exhausted", key_id=key_id, model=model.id)
         else:
             now = time.monotonic()

@@ -19,6 +19,7 @@ import structlog
 
 from ..schemas import camel_dict
 from .altcha import solve
+from .connection import Link
 from .errors import (
     INQUIRY_INCOMPLETE_DETAIL,
     PERSONA_PATH,
@@ -51,6 +52,8 @@ class SessionInfo:
     #: BRAIN refused the login itself (wrong password, throttled, locked), so trying the same
     #: one again can only spend the lockout budget. A rejected captcha is not a refusal.
     refused: bool = False
+    #: The identity check expired unfinished: a new one has to be started.
+    verification_expired: bool = False
 
     @property
     def can_multi_simulate(self) -> bool:
@@ -195,6 +198,17 @@ class Authenticator:
                 detail=exc.detail,
                 body=exc.body,
             )
+            if exc.status == 410:
+                # Persona expired it unfinished. Asking again cannot succeed, and keeping it held
+                # the screen on "Waiting for BRAIN" until the person signed out and in again.
+                self.endpoints.client.connection.move(
+                    Link.VERIFYING_EXPIRED, "The identity check expired before it was finished."
+                )
+                return SessionInfo(
+                    authenticated=False,
+                    verification_expired=True,
+                    detail="This identity check expired before it was finished. Start a new one.",
+                )
             return None
         state = AuthState.model_validate(r.body or {})
         if state.user_id is None:

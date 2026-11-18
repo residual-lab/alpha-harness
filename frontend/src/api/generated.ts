@@ -24,6 +24,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/alphas/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Add Tags
+         * @description Add tags to each Alpha on BRAIN, beside the ones it has, and change nothing else.
+         *
+         *     Each Alpha's tags are read from BRAIN first: saving replaces the whole list, and the
+         *     vault's copy can be older than an edit made on BRAIN since.
+         */
+        post: operations["add_tags_api_alphas_tags_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alphas/{alpha_id}": {
         parameters: {
             query?: never;
@@ -119,6 +142,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/alphas/{alpha_id}/flip": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Flip Sign
+         * @description Add a task simulating the Alpha's expression with its sign flipped, at its own settings.
+         *
+         *     One simulation, in Full mode so a winner needs no second run before it can be submitted.
+         *     Negated through the parser: only the last statement is the Alpha, so the steps before it
+         *     keep their sign. Added as every tool adds its task; the screen starts it once confirmed.
+         */
+        post: operations["flip_sign_api_alphas__alpha_id__flip_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/alphas/{alpha_id}/page": {
         parameters: {
             query?: never;
@@ -131,7 +178,7 @@ export interface paths {
          * @description The Alpha as BRAIN's own page shows it; its series come from :func:`recordset`.
          *
          *     Read from BRAIN on every open, since its checks and properties change, falling back to
-         *     the last copy when BRAIN cannot answer.
+         *     the last copy when BRAIN cannot answer, or at once when a download holds its rate limit.
          */
         get: operations["page_api_alphas__alpha_id__page_get"];
         put?: never;
@@ -220,6 +267,29 @@ export interface paths {
         put?: never;
         /** Logout */
         post: operations["logout_api_auth_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/auth/new-check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * New Check
+         * @description Start a new identity check once the last one expired unfinished.
+         *
+         *     Signs in again with the login already given, which BRAIN answers with a fresh check. Only
+         *     on the person's press: each sign-in spends BRAIN's lockout budget.
+         */
+        post: operations["new_check_api_auth_new_check_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -489,7 +559,9 @@ export interface paths {
         };
         /**
          * Pyramids
-         * @description Every pyramid: its multiplier, this quarter's alpha count, and download state.
+         * @description Every pyramid: its multiplier, its Alphas submitted in ``period``, and download state.
+         *
+         *     ``period`` is a quarter BRAIN names, ``all``, or left out for the quarter in progress.
          */
         get: operations["pyramids_api_catalog_pyramids_get"];
         put?: never;
@@ -717,6 +789,46 @@ export interface paths {
         get: operations["competitions_api_competitions_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/diagnostics/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Export
+         * @description Save the version, the system and the end of the log, scrubbed, as a zip in Downloads.
+         */
+        post: operations["export_api_diagnostics_export_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/diagnostics/open-logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open Logs
+         * @description Show the folder the launcher keeps its log in.
+         */
+        post: operations["open_logs_api_diagnostics_open_logs_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1367,8 +1479,7 @@ export interface paths {
         put?: never;
         /**
          * Markdown
-         * @description These Alphas as BRAIN shows them: expression, classifications and Simulation Settings,
-         *     then a glossary of every data field they read.
+         * @description These Alphas as BRAIN shows them; see :func:`copied_alphas`.
          */
         post: operations["markdown_api_portfolio_markdown_post"];
         delete?: never;
@@ -1494,6 +1605,69 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/preferences/correlation-breaker": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Breaker
+         * @description Null until the screen first saves, which is when it uploads the copy it kept itself.
+         */
+        get: operations["read_breaker_api_preferences_correlation_breaker_get"];
+        /** Write Breaker */
+        put: operations["write_breaker_api_preferences_correlation_breaker_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/preferences/super-lab": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Super Lab
+         * @description Null until the screen first saves, which is when it uploads the copy it kept itself.
+         */
+        get: operations["read_super_lab_api_preferences_super_lab_get"];
+        /** Write Super Lab */
+        put: operations["write_super_lab_api_preferences_super_lab_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/preferences/tag-groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Tag Groups
+         * @description Null until the screen first saves, which is when it uploads the copy it kept itself.
+         */
+        get: operations["read_tag_groups_api_preferences_tag_groups_get"];
+        /** Write Tag Groups */
+        put: operations["write_tag_groups_api_preferences_tag_groups_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/quarter": {
         parameters: {
             query?: never;
@@ -1510,6 +1684,29 @@ export interface paths {
          *     number of Alphas and cannot stand in for it.
          */
         get: operations["standing_api_quarter_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/quarter/operators": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Operators
+         * @description How many of the quarter's submitted Alphas use each of the account's operators.
+         *
+         *     The unused lead: BRAIN ranks the distinct operators a consultant used in the quarter, so
+         *     they are the ones worth a try.
+         */
+        get: operations["operators_api_quarter_operators_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1676,7 +1873,8 @@ export interface paths {
          * @description Cancel a running simulation.
          *
          *     Uses the stored platform id — the reason that id is written to disk before the
-         *     submission request is even sent.
+         *     submission request is even sent. ``force`` is the second press, after BRAIN refused:
+         *     the row ends here anyway, so its core is freed.
          */
         post: operations["cancel_api_simulations__record_id__cancel_post"];
         delete?: never;
@@ -1696,7 +1894,8 @@ export interface paths {
         put?: never;
         /**
          * Plan
-         * @description What a task with these settings would run, without running anything.
+         * @description What a task with these settings would run, without running anything. Lists the
+         *     built-in selections and combos whatever was chosen, so a screen can offer them all.
          */
         post: operations["plan_api_super_lab_plan_post"];
         delete?: never;
@@ -1869,26 +2068,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/template-lab/tree": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Tree
-         * @description The template as blocks, read with the same grammar every task runs on.
-         */
-        post: operations["tree_api_template_lab_tree_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/today": {
         parameters: {
             query?: never;
@@ -1926,6 +2105,31 @@ export interface paths {
         get: operations["bar_api_today_bar_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/today/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run Today
+         * @description Run some of today's unclaimed simulations now, with nothing to choose.
+         *
+         *     Half goes to a Fields Sampler swapping the fields of the best Top pick, which builds on
+         *     what already held up; half to Search Lab over the pyramids not yet formulated this
+         *     quarter, so the day does not only clone what exists. Either takes the whole run when the
+         *     other has nothing to do. Every task is planned before any is added.
+         */
+        post: operations["run_today_api_today_run_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2010,6 +2214,67 @@ export interface paths {
          * @description Queue the chosen fields' swaps, and let every winner be swept the same way after.
          */
         post: operations["fields_task_api_tools_fields_sampler_tasks_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tools/paste-alphas/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Paste Preview
+         * @description Every Alpha in the pasted text, its settings resolved. Free: simulates nothing.
+         */
+        post: operations["paste_preview_api_tools_paste_alphas_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tools/paste-alphas/tasks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Paste Task
+         * @description Queue every pasted Alpha that can run, ordered to finish soonest.
+         */
+        post: operations["paste_task_api_tools_paste_alphas_tasks_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tools/paste-alphas/tasks/{task_id}/copy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Paste Copy
+         * @description The task's results as Copy Alphas writes them, each with its checks, then the
+         *     simulations that failed with BRAIN's reason. No glossaries: the LLM already has them.
+         */
+        post: operations["paste_copy_api_tools_paste_alphas_tasks__task_id__copy_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2127,6 +2392,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/vault/alphas/group": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Alpha Group
+         * @description The Alphas a filter keeps, newest first, ready to be analysed as one portfolio.
+         */
+        post: operations["alpha_group_api_vault_alphas_group_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/vault/alphas/query": {
         parameters: {
             query?: never;
@@ -2188,6 +2473,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/vault/download-pnl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Download Pnl
+         * @description Download the daily PnL and turnover these Alphas lack, so they can be analysed.
+         */
+        post: operations["download_pnl_api_vault_download_pnl_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/vault/import-tagged": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Tagged
+         * @description Bring in every Alpha BRAIN lists under any of these tags, made here or elsewhere.
+         */
+        post: operations["import_tagged_api_vault_import_tagged_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/vault/submittable": {
         parameters: {
             query?: never;
@@ -2197,7 +2522,8 @@ export interface paths {
         };
         /**
          * Submittable
-         * @description Alphas that passed every submission check, ready to submit on BRAIN.
+         * @description Alphas that passed every submission check, ready to submit on BRAIN. ``shortlist=false``
+         *     asks for the counts alone, without the shortlist and the PnL it reads.
          *
          *     Each entry carries the platform's own check results, the numbers behind them, and a
          *     link to the alpha on BRAIN — which is where it gets submitted. This application never does.
@@ -2314,6 +2640,23 @@ export interface components {
             /** Expression */
             expression: string | null;
             settings: components["schemas"]["AlphaSettings"];
+            /** Sharpe */
+            sharpe: number | null;
+        };
+        /**
+         * AlphaGroup
+         * @description Every Alpha a filter keeps, for analysing them together.
+         */
+        AlphaGroup: {
+            /** Alphaids */
+            alphaIds: string[];
+            /** More */
+            more: boolean;
+        };
+        /** AlphaIdList */
+        AlphaIdList: {
+            /** Alphaids */
+            alphaIds: string[];
         };
         /**
          * AlphaIds
@@ -2395,6 +2738,10 @@ export interface components {
         };
         /** AlphaPageRequest */
         AlphaPageRequest: {
+            /** Created After */
+            created_after?: string | null;
+            /** Created Before */
+            created_before?: string | null;
             /** Delays */
             delays?: number[] | null;
             /**
@@ -2439,6 +2786,13 @@ export interface components {
              * @default false
              */
             submitted: boolean;
+            /** Tags */
+            tags?: string[] | null;
+            /**
+             * Tags All
+             * @default false
+             */
+            tags_all: boolean;
             /** Universes */
             universes?: string[] | null;
         };
@@ -2522,6 +2876,8 @@ export interface components {
             standingRegion?: string | null;
             /** Status */
             status: string | null;
+            /** Tags */
+            tags?: string[];
             /** Testsharpe */
             testSharpe?: number | null;
             /** Trainsharpe */
@@ -2623,6 +2979,8 @@ export interface components {
          * @description Fields each availability toggle would show if pressed, under the other filters.
          */
         AvailabilityCounts: {
+            /** Fast D1 */
+            fast_d1: number;
             /** Region Agnostic */
             region_agnostic: number;
             /** Region Exclusive */
@@ -2683,6 +3041,10 @@ export interface components {
             alphaId: string;
             /** By */
             by: string;
+            /** Passesfirst */
+            passesFirst: boolean;
+            /** Sharpe */
+            sharpe: number | null;
         };
         /**
          * BrainPayload
@@ -2714,6 +3076,11 @@ export interface components {
             /** Recipes */
             recipes: components["schemas"]["BreakerRecipe"][];
             settings: components["schemas"]["AlphaSettings"];
+            /**
+             * Singledataset
+             * @default false
+             */
+            singleDataset: boolean;
         };
         /** BreakerRecipe */
         BreakerRecipe: {
@@ -2721,20 +3088,45 @@ export interface components {
             blocked: string;
             /** Caution */
             caution: string;
+            /**
+             * Custom
+             * @default false
+             */
+            custom: boolean;
             /** Datafields */
             dataFields: number;
+            /**
+             * Gaveup
+             * @default false
+             */
+            gaveUp: boolean;
             /** Id */
             id: string;
+            /**
+             * Judged
+             * @default 0
+             */
+            judged: number;
             /** Name */
             name: string;
             /** Operators */
             operators: number;
             /** Overpowerpool */
             overPowerPool: string;
+            /**
+             * Oversingledataset
+             * @default
+             */
+            overSingleDataset: string;
             /** Transform */
             transform: string;
             /** Why */
             why: string;
+            /**
+             * Worked
+             * @default 0
+             */
+            worked: number;
         };
         /** BreakerRequest */
         BreakerRequest: {
@@ -2745,8 +3137,18 @@ export interface components {
              * @default 8
              */
             cores: number;
+            /** Custom */
+            custom?: components["schemas"]["CustomReshape"][];
             /** Recipes */
             recipes?: string[];
+        };
+        /**
+         * BreakerReshapes
+         * @description The Correlation Breaker's own re-shapes, offered for every Alpha.
+         */
+        BreakerReshapes: {
+            /** Reshapes */
+            reshapes?: components["schemas"]["OwnRecipe"][];
         };
         /** CancelResult */
         CancelResult: {
@@ -2967,6 +3369,28 @@ export interface components {
             /** Competitions */
             competitions: components["schemas"]["Competition"][];
         };
+        /**
+         * Connection
+         * @description The session layer (``brain.connection``).
+         */
+        Connection: {
+            /** Detail */
+            detail: string | null;
+            /** Inquiry */
+            inquiry: string | null;
+            /**
+             * Since
+             * Format: date-time
+             */
+            since: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "CONNECTED" | "OFFLINE" | "VERIFYING" | "VERIFYING_EXPIRED" | "SIGNED_OUT";
+            /** Verificationurl */
+            verificationUrl: string | null;
+        };
         /** CopiedAlphas */
         CopiedAlphas: {
             /** Text */
@@ -2987,6 +3411,18 @@ export interface components {
             b: string;
             /** Correlation */
             correlation: number;
+        };
+        /**
+         * CustomReshape
+         * @description A re-shape the consultant wrote around ``alpha``, or a built-in one edited.
+         */
+        CustomReshape: {
+            /** Code */
+            code: string;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
         };
         /** DataFieldDetail */
         DataFieldDetail: {
@@ -3119,6 +3555,11 @@ export interface components {
              * @enum {string}
              */
             awake: "idle" | "held" | "unavailable";
+            /** Busyelsewhere */
+            busyElsewhere: boolean;
+            /** Busyuntil */
+            busyUntil: string | null;
+            connection: components["schemas"]["Connection"];
             /** Dailylimithit */
             dailyLimitHit: boolean;
             /** Inflight */
@@ -3203,6 +3644,11 @@ export interface components {
             /** Delay */
             delay: number;
             /**
+             * Keep Decay
+             * @default false
+             */
+            keep_decay: boolean;
+            /**
              * Mutation Rate
              * @default 0.05
              */
@@ -3220,6 +3666,11 @@ export interface components {
             simulations: number;
             /** Universe */
             universe: string;
+        };
+        /** Exported */
+        Exported: {
+            /** Path */
+            path: string;
         };
         /** Failure */
         Failure: {
@@ -3282,6 +3733,11 @@ export interface components {
             date_created_from?: string | null;
             /** Date Created To */
             date_created_to?: string | null;
+            /**
+             * Fast D1
+             * @default false
+             */
+            fast_d1: boolean;
             /** Field Ids */
             field_ids?: string[];
             /** Field Types */
@@ -3449,6 +3905,11 @@ export interface components {
             /** Websocketclients */
             websocketClients: number;
         };
+        /** JobStarted */
+        JobStarted: {
+            /** Taskid */
+            taskId: string;
+        };
         /** KeyFailed */
         KeyFailed: {
             /** Error */
@@ -3530,6 +3991,8 @@ export interface components {
             remainingToday: {
                 [key: string]: number;
             };
+            /** Retired */
+            retired: string | null;
             /** Usage */
             usage: components["schemas"]["LLMKeyUsage"][];
         };
@@ -3596,6 +4059,8 @@ export interface components {
             paidNote: string;
             /** Providers */
             providers: components["schemas"]["LLMProvider"][];
+            /** Retired */
+            retired: components["schemas"]["RetiredProvider"][];
         };
         /** LLMUsage */
         LLMUsage: {
@@ -3624,6 +4089,8 @@ export interface components {
             datasetIds: string[];
             /** Decay */
             decay: number | null;
+            /** Decays */
+            decays?: number[];
             /** Delay */
             delay: number | null;
             /** Expression */
@@ -3699,6 +4166,11 @@ export interface components {
             truncationAgent: boolean;
             /** Universe */
             universe: string | null;
+            /**
+             * Visualization
+             * @default false
+             */
+            visualization: boolean;
         };
         /** LabTasks */
         LabTasks: {
@@ -3789,6 +4261,11 @@ export interface components {
             readonly ref: string;
             /** Resettimezone */
             resetTimezone: string;
+            /**
+             * Retired
+             * @description Why this model can no longer answer, or None. Kept so the user can remove it.
+             */
+            readonly retired: string | null;
             /** Rpd */
             rpd: number;
             /** Rpm */
@@ -3838,6 +4315,30 @@ export interface components {
             definition: string;
             /** Description */
             description: string;
+            /** Inputs */
+            inputs: string[];
+            /** Name */
+            name: string;
+        };
+        /** OperatorUsage */
+        OperatorUsage: {
+            /** Alphas */
+            alphas: number;
+            /** Label */
+            label: string;
+            /** Operators */
+            operators: components["schemas"]["OperatorUse"][];
+            /** Unlisted */
+            unlisted: number;
+            /** Unreadable */
+            unreadable: number;
+        };
+        /** OperatorUse */
+        OperatorUse: {
+            /** Alphas */
+            alphas: number;
+            /** Category */
+            category: string;
             /** Name */
             name: string;
         };
@@ -3867,6 +4368,18 @@ export interface components {
             /** Field Ids */
             field_ids?: string[];
         };
+        /**
+         * OwnRecipe
+         * @description A selection, combo or re-shape the consultant wrote, as their screen holds it.
+         */
+        OwnRecipe: {
+            /** Code */
+            code: string;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+        };
         /** Pair */
         Pair: {
             /** Maxposition */
@@ -3886,6 +4399,67 @@ export interface components {
              * @enum {string}
              */
             maxTrade: "ON" | "OFF";
+        };
+        /** PastePlan */
+        PastePlan: {
+            /** Alphas */
+            alphas: components["schemas"]["PastedAlpha"][];
+            /** Batches */
+            batches: number;
+            /** Maxcores */
+            maxCores: number;
+            /** Problems */
+            problems: string[];
+            /** Simulations */
+            simulations: number;
+        };
+        /** PasteRequest */
+        PasteRequest: {
+            /**
+             * Cores
+             * @default 8
+             */
+            cores: number;
+            /** Text */
+            text: string;
+        };
+        /** PasteResults */
+        PasteResults: {
+            /** Alphas */
+            alphas: number;
+            /** Downloading */
+            downloading: number;
+            /** Failed */
+            failed: number;
+            /** Text */
+            text: string;
+            /** Unsynced */
+            unsynced: number;
+            /** Waiting */
+            waiting: number;
+        };
+        /** PastedAlpha */
+        PastedAlpha: {
+            /** Categories */
+            categories: string[];
+            /** Defaulted */
+            defaulted: string[];
+            /** Duplicateof */
+            duplicateOf: number | null;
+            /** Expression */
+            expression: string;
+            /** Labels */
+            labels: {
+                [key: string]: string;
+            };
+            /** Number */
+            number: number;
+            /** Problems */
+            problems: string[];
+            /** Settings */
+            settings: {
+                [key: string]: unknown;
+            };
         };
         /** Pause */
         Pause: {
@@ -4155,7 +4729,14 @@ export interface components {
             dataset_ids?: string[];
             /** Delay */
             delay: number;
+            /** Favour Operators */
+            favour_operators?: string[];
             field_filter?: components["schemas"]["FieldFilter"] | null;
+            /**
+             * Hypothesis
+             * @default
+             */
+            hypothesis: string;
             /** Model */
             model?: string | null;
             /** Neutralizations */
@@ -4215,6 +4796,8 @@ export interface components {
         PowerPoolScope: {
             /** Pool */
             pool: string[];
+            /** Poolnopnlonbrain */
+            poolNoPnlOnBrain: string[];
             /** Poolwithoutpnl */
             poolWithoutPnl: string[];
             /** Region */
@@ -4222,6 +4805,16 @@ export interface components {
         };
         /** Preferences */
         Preferences: {
+            /**
+             * Autotag
+             * @default false
+             */
+            autoTag: boolean;
+            /**
+             * Autotagname
+             * @default harness
+             */
+            autoTagName: string;
             /**
              * Autoupdate
              * @default true
@@ -4352,8 +4945,6 @@ export interface components {
             categoryId: string;
             /** Delay */
             delay: number;
-            /** Lit */
-            lit: boolean;
             /** Multiplier */
             multiplier: number | null;
             /** Region */
@@ -4378,19 +4969,22 @@ export interface components {
             cells: components["schemas"]["PyramidCell"][];
             /** Columns */
             columns: components["schemas"]["PyramidColumn"][];
-            quarter: components["schemas"]["Quarter"];
+            /** Period */
+            period: string;
+            /** Quarters */
+            quarters: components["schemas"]["Quarter"][];
         };
         /**
          * Quarter
-         * @description Calendar quarter in platform time; ``end`` is the next quarter's first day.
+         * @description A quarter as BRAIN names it, ``2026-Q4``, with both dates inclusive.
          */
         Quarter: {
             /** End */
             end: string;
+            /** Name */
+            name: string;
             /** Start */
             start: string;
-            /** Today */
-            today: string;
         };
         /** QuarterStanding */
         QuarterStanding: {
@@ -4478,6 +5072,8 @@ export interface components {
             testFitness?: number | null;
             /** Testsharpe */
             testSharpe?: number | null;
+            /** Trainsharpe */
+            trainSharpe?: number | null;
             /** Trialid */
             trialId: number;
             /** Turnover */
@@ -4538,6 +5134,18 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /**
+         * RetiredProvider
+         * @description A provider that is gone but still has Keys or models stored under it.
+         */
+        RetiredProvider: {
+            /** Id */
+            id: string;
+            /** Label */
+            label: string;
+            /** Note */
+            note: string;
+        };
         /** SampleAlpha */
         SampleAlpha: {
             /** Expression */
@@ -4565,6 +5173,8 @@ export interface components {
             cores: number;
             /** Decay */
             decay?: number | null;
+            /** Decays */
+            decays?: number[];
             /** Expression */
             expression?: string | null;
             /**
@@ -4591,6 +5201,11 @@ export interface components {
              * @default false
              */
             truncationAgent: boolean;
+            /**
+             * Visualization
+             * @default false
+             */
+            visualization: boolean;
         };
         /**
          * Say
@@ -4627,16 +5242,18 @@ export interface components {
             cores: number;
             /** Dataset Ids */
             dataset_ids?: string[];
-            /**
-             * Decay
-             * @default 0
-             */
-            decay: number;
+            /** Decays */
+            decays?: number[];
             /** Delay */
             delay: number;
             field_filter?: components["schemas"]["FieldFilter"] | null;
             /** Neutralizations */
             neutralizations?: string[];
+            /**
+             * Only Universe
+             * @default false
+             */
+            only_universe: boolean;
             /** Region */
             region: string;
             /**
@@ -4678,6 +5295,10 @@ export interface components {
             score: number | null;
             /** Sharpe */
             sharpe: number | null;
+            /** Testfitness */
+            testFitness?: number | null;
+            /** Testsharpe */
+            testSharpe?: number | null;
             /** Turnover */
             turnover: number | null;
         };
@@ -4699,6 +5320,11 @@ export interface components {
             permissions: string[];
             /** Userid */
             userId: string | null;
+            /**
+             * Verificationexpired
+             * @default false
+             */
+            verificationExpired: boolean;
             /** Verificationurl */
             verificationUrl: string | null;
         };
@@ -4915,7 +5541,8 @@ export interface components {
         };
         /**
          * SubmissionOrder
-         * @description Greedy submission, best After-Cost Sharpe first, worked out without submitting.
+         * @description Greedy submission, best After-Cost Sharpe first, worked out without submitting. A
+         *     blocked Alpha says when submitting it before its blocker would keep both.
          */
         SubmissionOrder: {
             /** Blocked */
@@ -5006,8 +5633,15 @@ export interface components {
             correlatedPruned: number;
             /** Heldoutfailed */
             heldOutFailed: number;
+            /**
+             * Implausiblehidden
+             * @default 0
+             */
+            implausibleHidden: number;
             /** Markets */
             markets: components["schemas"]["SubmittableMarket"][];
+            /** Nearmissalphas */
+            nearMissAlphas: components["schemas"]["SubmittableAlpha"][];
             /** Nearmisses */
             nearMisses: number;
             /** Pending */
@@ -5018,6 +5652,18 @@ export interface components {
             total: number;
             /** Unvalidated */
             unvalidated: number;
+        };
+        /**
+         * SuperLabRecipes
+         * @description The Super Alpha Lab's own selections and combos, and which of every one are unticked.
+         */
+        SuperLabRecipes: {
+            /** Combos */
+            combos?: components["schemas"]["OwnRecipe"][];
+            /** Off */
+            off?: string[];
+            /** Selections */
+            selections?: components["schemas"]["OwnRecipe"][];
         };
         /** SuperPlan */
         SuperPlan: {
@@ -5040,6 +5686,8 @@ export interface components {
              * @enum {string}
              */
             activation: "IS" | "OS" | "BOTH";
+            /** Combos */
+            combos?: components["schemas"]["Recipe"][] | null;
             /**
              * Cores
              * @default 3
@@ -5061,6 +5709,8 @@ export interface components {
              * @default 30
              */
             selectionLimit: number;
+            /** Selections */
+            selections?: components["schemas"]["Recipe"][] | null;
             /** Universe */
             universe: string;
         };
@@ -5195,6 +5845,49 @@ export interface components {
          */
         SyncStatus: "RUNNING" | "COMPLETE" | "FAILED" | "CANCELLED";
         /**
+         * TagGroup
+         * @description Tags the Alphas screen filters by together, kept under a name: a list of Alphas.
+         */
+        TagGroup: {
+            /**
+             * Every
+             * @default false
+             */
+            every: boolean;
+            /** Id */
+            id: string;
+            /** Name */
+            name: string;
+            /** Tags */
+            tags: string[];
+        };
+        /** TagGroups */
+        TagGroups: {
+            /** Groups */
+            groups?: components["schemas"]["TagGroup"][];
+        };
+        /** TagRequest */
+        TagRequest: {
+            /** Alpha Ids */
+            alpha_ids: string[];
+            /** Tags */
+            tags: string[];
+        };
+        /** TagResult */
+        TagResult: {
+            /** Failed */
+            failed: {
+                [key: string]: string;
+            };
+            /** Tagged */
+            tagged: string[];
+        };
+        /** TaggedRequest */
+        TaggedRequest: {
+            /** Tags */
+            tags: string[];
+        };
+        /**
          * TaskAlpha
          * @description A submittable Alpha, with the task that found it.
          */
@@ -5265,6 +5958,8 @@ export interface components {
             testFitness?: number | null;
             /** Testsharpe */
             testSharpe?: number | null;
+            /** Trainsharpe */
+            trainSharpe?: number | null;
             /** Trialid */
             trialId: number;
             /** Turnover */
@@ -5383,6 +6078,8 @@ export interface components {
             powerPool: number[] | null;
             /** Problem */
             problem: string | null;
+            /** Pyramids */
+            pyramids?: number | null;
             /** Singledataset */
             singleDataset: boolean;
         };
@@ -5472,12 +6169,6 @@ export interface components {
                 [key: string]: components["schemas"]["FieldsVariable"] | components["schemas"]["ValuesVariable"];
             };
         };
-        /** TemplateTree */
-        TemplateTree: {
-            /** Problem */
-            problem?: string | null;
-            tree?: components["schemas"]["TreeNode"] | null;
-        };
         /** ThreadScope */
         ThreadScope: {
             /** Delay */
@@ -5501,6 +6192,23 @@ export interface components {
             step: "sign-in" | "add-key" | "ready";
             you: components["schemas"]["You"];
         };
+        /** TodayRun */
+        TodayRun: {
+            /** Notes */
+            notes: string[];
+            /** Simulations */
+            simulations: number;
+            /** Tasks */
+            tasks: components["schemas"]["AddedTask"][];
+        };
+        /** TodayRunRequest */
+        TodayRunRequest: {
+            /**
+             * Simulations
+             * @default 500
+             */
+            simulations: number;
+        };
         /** TodaySimulations */
         TodaySimulations: {
             engine: components["schemas"]["EngineStatus"];
@@ -5522,34 +6230,6 @@ export interface components {
             unspoken: number;
             /** Used */
             used: number;
-        };
-        /**
-         * TreeNode
-         * @description One step of a template, as the Blocks view draws it. ``...`` is a name: an empty input.
-         */
-        TreeNode: {
-            /** Args */
-            args: components["schemas"]["TreeNode"][];
-            /**
-             * Kind
-             * @enum {string}
-             */
-            kind: "num" | "str" | "name" | "call" | "unary" | "binary" | "ternary" | "assign" | "seq";
-            /** Kwargs */
-            kwargs: components["schemas"]["TreeOption"][];
-            /** Value */
-            value: string;
-        };
-        /** TreeOption */
-        TreeOption: {
-            /** Name */
-            name: string;
-            value: components["schemas"]["TreeNode"];
-        };
-        /** TreeRequest */
-        TreeRequest: {
-            /** Text */
-            text: string;
         };
         /**
          * Tuple4
@@ -5681,6 +6361,8 @@ export interface components {
             lastSync: components["schemas"]["LastSync"] | null;
             /** Scopes */
             scopes: components["schemas"]["VaultScope"][];
+            /** Tags */
+            tags: string[];
         };
         /**
          * VaultScope
@@ -5787,6 +6469,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BrainPayload"];
+                };
+            };
+        };
+    };
+    add_tags_api_alphas_tags_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TagRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TagResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -5912,6 +6627,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AlphaDescription"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    flip_sign_api_alphas__alpha_id__flip_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                alpha_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddedTask"];
                 };
             };
             /** @description Validation Error */
@@ -6058,6 +6804,26 @@ export interface operations {
         };
     };
     logout_api_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Session"];
+                };
+            };
+        };
+    };
+    new_check_api_auth_new_check_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -6489,7 +7255,9 @@ export interface operations {
     };
     pyramids_api_catalog_pyramids_get: {
         parameters: {
-            query?: never;
+            query?: {
+                period?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -6503,6 +7271,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PyramidGrid"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -6815,6 +7592,44 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Competitions"];
                 };
+            };
+        };
+    };
+    export_api_diagnostics_export_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Exported"];
+                };
+            };
+        };
+    };
+    open_logs_api_diagnostics_open_logs_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -8021,6 +8836,165 @@ export interface operations {
             };
         };
     };
+    read_breaker_api_preferences_correlation_breaker_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BreakerReshapes"] | null;
+                };
+            };
+        };
+    };
+    write_breaker_api_preferences_correlation_breaker_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BreakerReshapes"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BreakerReshapes"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_super_lab_api_preferences_super_lab_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SuperLabRecipes"] | null;
+                };
+            };
+        };
+    };
+    write_super_lab_api_preferences_super_lab_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SuperLabRecipes"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SuperLabRecipes"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_tag_groups_api_preferences_tag_groups_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TagGroups"] | null;
+                };
+            };
+        };
+    };
+    write_tag_groups_api_preferences_tag_groups_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TagGroups"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TagGroups"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     standing_api_quarter_get: {
         parameters: {
             query?: never;
@@ -8037,6 +9011,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["QuarterStanding"];
+                };
+            };
+        };
+    };
+    operators_api_quarter_operators_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OperatorUsage"];
                 };
             };
         };
@@ -8220,7 +9214,9 @@ export interface operations {
     };
     cancel_api_simulations__record_id__cancel_post: {
         parameters: {
-            query?: never;
+            query?: {
+                force?: boolean;
+            };
             header?: never;
             path: {
                 record_id: number;
@@ -8584,39 +9580,6 @@ export interface operations {
             };
         };
     };
-    tree_api_template_lab_tree_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["TreeRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TemplateTree"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     today_api_today_get: {
         parameters: {
             query?: {
@@ -8667,6 +9630,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Bar"];
+                };
+            };
+        };
+    };
+    run_today_api_today_run_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TodayRunRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TodayRun"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -8790,6 +9786,103 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AddedTask"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    paste_preview_api_tools_paste_alphas_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PastePlan"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    paste_task_api_tools_paste_alphas_tasks_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AddedTask"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    paste_copy_api_tools_paste_alphas_tasks__task_id__copy_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasteResults"];
                 };
             };
             /** @description Validation Error */
@@ -8973,6 +10066,39 @@ export interface operations {
             };
         };
     };
+    alpha_group_api_vault_alphas_group_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlphaPageRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlphaGroup"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     query_alphas_api_vault_alphas_query_post: {
         parameters: {
             query?: never;
@@ -9068,6 +10194,72 @@ export interface operations {
             };
         };
     };
+    download_pnl_api_vault_download_pnl_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AlphaIdList"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobStarted"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_tagged_api_vault_import_tagged_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaggedRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobStarted"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     submittable_api_vault_submittable_get: {
         parameters: {
             query?: {
@@ -9076,6 +10268,8 @@ export interface operations {
                 universe?: string | null;
                 instrument_type?: string;
                 limit?: number;
+                shortlist?: boolean;
+                implausible?: boolean;
             };
             header?: never;
             path?: never;

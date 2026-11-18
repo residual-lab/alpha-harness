@@ -23,7 +23,7 @@ import {
   indentOnInput,
   syntaxHighlighting,
 } from '@codemirror/language'
-import { type Diagnostic, forceLinting, linter, lintKeymap } from '@codemirror/lint'
+import { forceLinting, linter, lintKeymap } from '@codemirror/lint'
 import { highlightSelectionMatches, searchKeymap } from '@codemirror/search'
 import {
   Annotation,
@@ -63,6 +63,7 @@ import {
   group,
   hole,
   inputsOf,
+  lint,
   local,
   locals,
   NAMES,
@@ -198,6 +199,10 @@ function nameColours() {
     class {
       decorations: DecorationSet
       gone = false
+      /** Names in the text with no type asked yet: looked up once typing pauses, so the
+       *  `c`, `cl`, `clo` on the way to `close` are never asked. */
+      unknown = new Set<string>()
+      pause: ReturnType<typeof setTimeout> | undefined
       readonly view: EditorView
       constructor(view: EditorView) {
         this.view = view
@@ -212,11 +217,13 @@ function nameColours() {
       }
       destroy() {
         this.gone = true
+        clearTimeout(this.pause)
       }
       marked(): DecorationSet {
         const blank = code(this.view.state.doc.toString())
         const names = locals(blank)
         const builder = new RangeSetBuilder<Decoration>()
+        this.unknown.clear()
         for (const m of blank.matchAll(NAMES)) {
           const name = m[0]
           let mark: Decoration | undefined
@@ -225,18 +232,23 @@ function nameColours() {
             mark = this.fieldMark(name)
           if (mark) builder.add(m.index, m.index + name.length, mark)
         }
+        clearTimeout(this.pause)
+        if (this.unknown.size) this.pause = setTimeout(() => this.lookUpUnknown(), 400)
         return builder.finish()
       }
       fieldMark(name: string): Decoration | undefined {
-        if (!typed.has(name)) {
+        const type = typed.get(name)
+        if (type === undefined) this.unknown.add(name)
+        return type === 'VECTOR' ? MARK.vector : type === 'GROUP' ? MARK.group : undefined
+      }
+      lookUpUnknown() {
+        for (const name of this.unknown) {
           typed.set(name, null)
           void lookUp(name).then((field) => {
             typed.set(name, field?.field_type ?? null)
             if (field && !this.gone) this.view.dispatch({ effects: recolour.of(null) })
           })
         }
-        const type = typed.get(name)
-        return type === 'VECTOR' ? MARK.vector : type === 'GROUP' ? MARK.group : undefined
       }
     },
     { decorations: (plugin) => plugin.decorations },
@@ -501,99 +513,6 @@ async function complete(context: CompletionContext, live: Live): Promise<Complet
   return { from, options }
 }
 
-/**
- * The preview's problems that name something in the text, by the exact words it writes them in:
- * a variable's own as `$name: …`, the rest as a sentence about a named operator or field. Any
- * other sentence has no place and stays below the editor.
- */
-const SHAPES: { pattern: RegExp; call?: boolean }[] = [
-  { pattern: /^(\$[A-Za-z_]\w*): (.+)$/ },
-  { pattern: /^(\$[A-Za-z_]\w*) is chosen by the search/ },
-  { pattern: /^([A-Za-z_]\w*) is not one of your operators\.$/, call: true },
-  { pattern: /^([A-Za-z_]\w*) does not take \d+ inputs?\.$/, call: true },
-  { pattern: /^([A-Za-z_]\w*) is not a data field in /, call: false },
-]
-
-/** Problems the preview found, drawn on the text they name; ones with no place stay below. */
-function diagnose(view: EditorView, live: Live): Diagnostic[] {
-  const text = view.state.doc.toString()
-  const blank = code(text)
-  const found: Diagnostic[] = []
-  for (const m of blank.matchAll(/\.\.\./g))
-    found.push({
-      from: m.index,
-      to: m.index + 3,
-      severity: 'warning',
-      message: 'Write a signal here.',
-    })
-  const open: number[] = []
-  for (const m of blank.matchAll(/[()]/g)) {
-    if (m[0] === '(') open.push(m.index)
-    else if (open.pop() === undefined)
-      found.push({
-        from: m.index,
-        to: m.index + 1,
-        severity: 'error',
-        message: 'Nothing opens this bracket.',
-      })
-  }
-  for (const at of open)
-    found.push({
-      from: at,
-      to: at + 1,
-      severity: 'error',
-      message: 'This bracket is never closed.',
-    })
-  if (live.reference.length) {
-    const known = new Set(live.reference.map((o) => o.name))
-    for (const m of blank.matchAll(/(?<![$\w.])([A-Za-z_]\w*)(?=\s*\()/g)) {
-      const name = m[1] ?? ''
-      if (!known.has(name))
-        found.push({
-          from: m.index,
-          to: m.index + name.length,
-          severity: 'error',
-          message: `${name} is not one of your operators.`,
-        })
-    }
-  }
-
-  for (const problem of live.problems) {
-    const parsed = / at (\d+)/.exec(problem)
-    if (problem.startsWith("The template can't be read") && parsed) {
-      const at = Math.min(Number(parsed[1]), Math.max(0, text.length - 1))
-      found.push({
-        from: at,
-        to: Math.min(text.length, at + 1),
-        severity: 'error',
-        message: problem,
-      })
-      continue
-    }
-    for (const shape of SHAPES) {
-      const named = shape.pattern.exec(problem)
-      const name = named?.[1]
-      if (!name) continue
-      const message = named[2] ?? problem
-      const escaped = name.replace('$', '\\$')
-      const where = name.startsWith('$')
-        ? `${escaped}(?!\\w)`
-        : `(?<![$\\w])${escaped}(?!\\w)${shape.call ? '(?=\\s*\\()' : '(?!\\s*\\()'}`
-      for (const m of blank.matchAll(new RegExp(where, 'g')))
-        found.push({ from: m.index, to: m.index + name.length, severity: 'error', message })
-      break
-    }
-  }
-
-  const seen = new Set<string>()
-  return found.filter((d) => {
-    const key = `${d.from}:${d.to}:${d.message}`
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
-}
-
 /** Marks a change made from outside the editor, which is not the reader's typing. */
 const outside = Annotation.define<boolean>()
 
@@ -626,11 +545,19 @@ function extensions(live: { current: Live }, label: string, readOnly: boolean) {
     nameColours(),
     ...(readOnly ? [] : [signatures(live)]),
     hoverTooltip((view, pos) => hover(view, pos, live.current), { hoverTime: 300 }),
-    linter((view) => diagnose(view, live.current), {
-      delay: 250,
-      needsRefresh: (update) =>
-        update.transactions.some((tr) => tr.effects.some((e) => e.is(relint))),
-    }),
+    linter(
+      (view) =>
+        lint(
+          view.state.doc.toString(),
+          new Set(live.current.reference.map((o) => o.name)),
+          live.current.problems,
+        ),
+      {
+        delay: 250,
+        needsRefresh: (update) =>
+          update.transactions.some((tr) => tr.effects.some((e) => e.is(relint))),
+      },
+    ),
     keymap.of([
       { key: 'Tab', run: acceptCompletion },
       ...closeBracketsKeymap,

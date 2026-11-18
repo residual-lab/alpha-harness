@@ -4,21 +4,74 @@
  * The settings are the Alpha's own and are shown as read-only, because the whole idea is to
  * hold everything it was judged on and change only what it is exposed to. Every re-shape is
  * printed in full before anything is queued: a consultant should be able to read what will run.
+ * Re-shapes of the user's own sit beside the built-in ones, kept on this computer for every
+ * Alpha, and a built-in one can be copied to edit.
  */
 
 import { useQuery } from '@tanstack/react-query'
 import { Link, useNavigate, useSearch } from '@tanstack/react-router'
-import { UnlinkIcon } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { PencilIcon, PlusIcon, Trash2Icon, UnlinkIcon } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
 import { PROD_CORRELATION_CEILING } from '@/api/platform'
 import { cn } from '@/lib/cn'
 import { fmt } from '@/lib/format'
-import { useCores } from '@/lib/preferences'
+import { keepInHarness, useCores } from '@/lib/preferences'
+import { followOtherTabs } from '@/lib/tabs'
+import { useDebounced } from '@/lib/use-debounced'
 import { AddTaskButtons, useAddTask } from '@/screens/research-labs/add-task'
 import { CoresSetting } from '@/screens/research-labs/task-settings'
 import { AlphaPanel, HeldMetrics } from '@/screens/tools/one-alpha'
-import { Checkbox, Empty, LINK, Notice, Page, PageHeader, Panel, Skeleton } from '@/ui/kit'
-import { correlationBreaker } from './api'
+import {
+  Button,
+  Checkbox,
+  Empty,
+  ErrorNotice,
+  Input,
+  LINK,
+  Notice,
+  Page,
+  PageHeader,
+  Panel,
+  Skeleton,
+  Textarea,
+} from '@/ui/kit'
+import { correlationBreaker, type Reshape } from './api'
+
+/** The user's own re-shapes, kept on this computer and offered for every Alpha. */
+const useReshapes = create<{ reshapes: Reshape[] }>()(
+  persist(() => ({ reshapes: [] as Reshape[] }), {
+    name: 'alpha-harness-correlation-breaker',
+    version: 1,
+  }),
+)
+followOtherTabs(useReshapes)
+const useKeptReshapes = keepInHarness(
+  useReshapes,
+  '/api/preferences/correlation-breaker',
+  're-shapes',
+)
+
+const CUSTOM = 'custom:'
+/** The heavy-tailed remap people ask for by name, offered as a re-shape of their own. */
+const QUANTILE = 'quantile(alpha, driver = "cauchy", sigma = 1.0)'
+
+function updateReshape(id: string, change: Partial<Reshape>) {
+  useReshapes.setState((s) => ({
+    reshapes: s.reshapes.map((r) => (r.id === id ? { ...r, ...change } : r)),
+  }))
+}
+
+function addReshape(name: string, code: string) {
+  useReshapes.setState((s) => ({
+    reshapes: [...s.reshapes, { id: crypto.randomUUID(), name, code }],
+  }))
+}
+
+function removeReshape(id: string) {
+  useReshapes.setState((s) => ({ reshapes: s.reshapes.filter((r) => r.id !== id) }))
+}
 
 export function CorrelationBreakerScreen() {
   const search = useSearch({ from: '/tools/correlation-breaker' })
@@ -33,20 +86,42 @@ export function CorrelationBreakerScreen() {
 
   useEffect(() => setDraft(search.alpha ?? ''), [search.alpha])
 
+  const reshapes = useReshapes((s) => s.reshapes)
+  const kept = useKeptReshapes()
+  // Checked as typed, but not on every keystroke.
+  const custom = useDebounced(reshapes, 400)
   const query = useQuery({
-    queryKey: ['correlation-breaker', alphaId],
-    queryFn: () => correlationBreaker.preview({ alphaId, recipes: [], cores: 1 }),
+    queryKey: ['correlation-breaker', alphaId, custom],
+    queryFn: () => correlationBreaker.preview({ alphaId, recipes: [], custom, cores: 1 }),
     enabled: alphaId.length > 0,
     retry: false,
+    placeholderData: (previous, last) => (last?.queryKey[1] === alphaId ? previous : undefined),
   })
   const plan = query.data
   const runnable = useMemo(() => (plan?.recipes ?? []).filter((r) => !r.blocked), [plan])
+  // Only what can run is sent: a ticked re-shape since edited into one that cannot is left out.
+  const picked = runnable.filter((r) => chosen.has(r.id)).map((r) => r.id)
 
-  // A new Alpha starts with every re-shape it can run ticked: the point is to try them. One
-  // that would cost a Power Pool Alpha its eligibility waits to be asked for.
+  // Each re-shape is ticked when first offered, the point being to try them, and left as the
+  // reader set it after. One that would cost the Alpha Power Pool or single dataset status,
+  // or that has only ever failed here, waits to be asked for.
+  const offered = useRef({ alpha: '', ids: new Set<string>() })
   useEffect(() => {
-    setChosen(new Set(runnable.filter((r) => !r.overPowerPool).map((r) => r.id)))
-  }, [runnable])
+    if (offered.current.alpha !== alphaId) {
+      offered.current = { alpha: alphaId, ids: new Set() }
+      setChosen(new Set())
+    }
+    const { ids } = offered.current
+    const fresh = runnable.filter((r) => !ids.has(r.id))
+    if (!fresh.length) return
+    for (const r of fresh) ids.add(r.id)
+    setChosen((prev) => {
+      const next = new Set(prev)
+      for (const r of fresh)
+        if (!r.overPowerPool && !r.overSingleDataset && !r.gaveUp) next.add(r.id)
+      return next
+    })
+  }, [runnable, alphaId])
 
   const analyse = (event: React.FormEvent) => {
     event.preventDefault()
@@ -57,7 +132,9 @@ export function CorrelationBreakerScreen() {
     })
   }
 
-  const add = useAddTask(() => correlationBreaker.addTask({ alphaId, recipes: [...chosen], cores }))
+  const add = useAddTask(() =>
+    correlationBreaker.addTask({ alphaId, recipes: picked, custom: reshapes, cores }),
+  )
   // A typed ID that has not been analysed is not the Alpha the re-shapes below were read from.
   const analysed = draft.trim() === alphaId
 
@@ -77,7 +154,7 @@ export function CorrelationBreakerScreen() {
         actions={
           <AddTaskButtons
             add={add}
-            disabled={chosen.size === 0 || !analysed}
+            disabled={picked.length === 0 || !analysed}
             blocked={!analysed ? 'Analyse an Alpha first.' : 'Tick a recipe to run.'}
           />
         }
@@ -103,7 +180,7 @@ export function CorrelationBreakerScreen() {
         >
           <Panel
             title="Held Fixed"
-            description="Every re-shape runs at the Alpha's own settings. Nothing here changes."
+            description="Every re-shape runs at the Alpha's own settings, Decay included. Nothing here changes; if a result's Turnover rises, Sweep Decay in its menu in Tasks tries higher Decays."
           >
             <div className="flex flex-col gap-4">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
@@ -145,7 +222,7 @@ export function CorrelationBreakerScreen() {
 
           <Panel
             title="Re-shapes"
-            description="Each one wraps the Alpha below. Only the re-shape is shown; the binding is the same for all of them."
+            description="Each one wraps the Alpha below, read as alpha. Only the re-shape is shown; the binding is the same for all of them. Add your own, or copy a built-in one to edit; yours are kept on this computer for every Alpha."
             actions={<CoresSetting value={cores} onChange={setCores} />}
           >
             {plan.powerPool && (
@@ -156,16 +233,46 @@ export function CorrelationBreakerScreen() {
                 longer be a Power Pool Alpha.
               </Notice>
             )}
+            {plan.singleDataset && (
+              <Notice tone="info" className="mb-4" title="A Single Data Set Alpha">
+                It reads one dataset. A re-shape that brings in a field of another dataset, such as
+                cap or returns from Price Volume, is left unticked, because it would no longer be a
+                Single Data Set Alpha. Grouping fields like sector and industry do not count.
+              </Notice>
+            )}
+            {kept.isError && (
+              <ErrorNotice
+                className="mb-4"
+                error={kept.error}
+                title="Could not load your own re-shapes"
+              />
+            )}
             {/* Said once, so a dozen cards do not repeat the same two hundred characters. */}
             <pre className="num mb-4 overflow-x-auto rounded-sm border border-hairline bg-canvas p-3 text-body-compact whitespace-pre text-ink-muted">
               {plan.bound}
             </pre>
+            <div className="mb-3">
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  addReshape(`My Re-shape ${reshapes.length + 1}`, 'ts_av_diff(alpha, 60)')
+                }
+              >
+                <PlusIcon />
+                Add Re-shape
+              </Button>
+            </div>
             {plan.recipes.length === 0 ? (
               <Empty title="Nothing to re-shape" />
             ) : (
               <ul className="flex flex-col gap-3">
                 {plan.recipes.map((recipe) => {
                   const on = chosen.has(recipe.id)
+                  const own = recipe.custom
+                    ? reshapes.find((r) => CUSTOM + r.id === recipe.id)
+                    : undefined
+                  // Deleted here, still listed until the next check comes back.
+                  if (recipe.custom && !own) return null
                   return (
                     <li
                       key={recipe.id}
@@ -179,35 +286,110 @@ export function CorrelationBreakerScreen() {
                       )}
                     >
                       <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div className="flex min-w-0 flex-col gap-1">
-                          <Checkbox
-                            checked={on}
-                            disabled={Boolean(recipe.blocked)}
-                            onChange={() => toggle(recipe.id)}
-                            label={<span className="font-medium text-ink">{recipe.name}</span>}
-                          />
+                        <div className="flex min-w-0 flex-1 flex-col gap-1">
+                          {own ? (
+                            <div className="flex items-center gap-2">
+                              <Checkbox
+                                checked={on}
+                                disabled={Boolean(recipe.blocked)}
+                                onChange={() => toggle(recipe.id)}
+                                label={null}
+                                aria-label={`Run ${own.name}`}
+                              />
+                              <Input
+                                aria-label="Re-shape name"
+                                className="max-w-md flex-1 font-medium"
+                                maxLength={120}
+                                value={own.name}
+                                onChange={(e) => updateReshape(own.id, { name: e.target.value })}
+                              />
+                              <Button
+                                size="icon-sm"
+                                variant="ghost"
+                                aria-label={`Delete ${own.name}`}
+                                title="Delete this re-shape"
+                                onClick={() => removeReshape(own.id)}
+                              >
+                                <Trash2Icon />
+                              </Button>
+                            </div>
+                          ) : (
+                            <Checkbox
+                              checked={on}
+                              disabled={Boolean(recipe.blocked)}
+                              onChange={() => toggle(recipe.id)}
+                              label={<span className="font-medium text-ink">{recipe.name}</span>}
+                            />
+                          )}
                           {recipe.why && (
                             <p className="max-w-3xl text-body-compact text-pretty text-ink-subtle">
                               {recipe.why}
                             </p>
                           )}
                         </div>
-                        {recipe.blocked ? (
-                          <span className="shrink-0 text-body-compact text-status-warning">
-                            {recipe.blocked}
-                          </span>
-                        ) : (
-                          <span className="num shrink-0 text-caption text-ink-subtle">
-                            {fmt.int(recipe.operators)} operators · {fmt.int(recipe.dataFields)}{' '}
-                            data fields
-                          </span>
-                        )}
+                        <div className="flex shrink-0 items-center gap-2">
+                          {recipe.blocked ? (
+                            <span className="text-body-compact text-status-warning">
+                              {recipe.blocked}
+                            </span>
+                          ) : (
+                            <span className="num text-caption text-ink-subtle">
+                              {fmt.int(recipe.operators)} operators · {fmt.int(recipe.dataFields)}{' '}
+                              data fields
+                            </span>
+                          )}
+                          {!own && recipe.transform && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              title="Add a copy of this re-shape to edit as your own"
+                              onClick={() =>
+                                addReshape(`${recipe.name} (edited)`, recipe.transform)
+                              }
+                            >
+                              <PencilIcon />
+                              Edit a Copy
+                            </Button>
+                          )}
+                        </div>
                       </div>
-                      {/* Empty for a grouping this market has none of: nothing to show. */}
-                      {recipe.transform && (
-                        <pre className="num mt-2 overflow-x-auto rounded-sm border border-hairline bg-canvas p-3 text-body-compact whitespace-pre text-ink-muted">
-                          {recipe.transform}
-                        </pre>
+                      {own ? (
+                        <Textarea
+                          aria-label={`${own.name}, written around alpha`}
+                          className="mt-2 font-mono"
+                          maxLength={4000}
+                          rows={Math.min(8, Math.max(2, own.code.split('\n').length + 1))}
+                          spellCheck={false}
+                          value={own.code}
+                          onChange={(e) => updateReshape(own.id, { code: e.target.value })}
+                        />
+                      ) : (
+                        // Empty for a grouping this market has none of: nothing to show.
+                        recipe.transform && (
+                          <pre className="num mt-2 overflow-x-auto rounded-sm border border-hairline bg-canvas p-3 text-body-compact whitespace-pre text-ink-muted">
+                            {recipe.transform}
+                          </pre>
+                        )
+                      )}
+                      {recipe.judged > 0 && (
+                        <p
+                          className={cn(
+                            'mt-2 text-body-compact text-pretty',
+                            recipe.worked > 0 ? 'text-ink-muted' : 'text-ink-subtle',
+                          )}
+                        >
+                          Broke Production Correlation for you{' '}
+                          <span className="num">
+                            {fmt.int(recipe.worked)} of {fmt.int(recipe.judged)}
+                          </span>{' '}
+                          time{recipe.judged === 1 ? '' : 's'}
+                          {recipe.gaveUp ? ', so it starts unticked.' : '.'}
+                        </p>
+                      )}
+                      {recipe.overSingleDataset && !recipe.blocked && (
+                        <p className="mt-2 text-body-compact text-pretty text-status-warning">
+                          No longer a Single Data Set Alpha: reads {recipe.overSingleDataset}.
+                        </p>
                       )}
                       {recipe.overPowerPool && !recipe.blocked && (
                         <p className="mt-2 text-body-compact text-pretty text-status-warning">
@@ -223,6 +405,41 @@ export function CorrelationBreakerScreen() {
                     </li>
                   )
                 })}
+                {/* Added or copied here, listed once the next check comes back. */}
+                {reshapes
+                  .filter((r) => !plan.recipes.some((row) => row.id === CUSTOM + r.id))
+                  .map((r) => (
+                    <li key={r.id} className="rounded-md border border-hairline bg-surface-1 p-3">
+                      <span className="font-medium text-ink">{r.name}</span>
+                      <p className="mt-1 text-body-compact text-ink-subtle">Checking…</p>
+                    </li>
+                  ))}
+                {/* Asked for by name, so where it went is said where it would have been. */}
+                {!reshapes.some((r) => r.code === QUANTILE) && (
+                  <li className="rounded-md border border-hairline bg-surface-1 p-3">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="flex min-w-0 flex-1 flex-col gap-1">
+                        <span className="font-medium text-ink">Quantile</span>
+                        <p className="max-w-3xl text-body-compact text-pretty text-ink-subtle">
+                          Not built in: it moves the weights, not the directional bets a PnL
+                          correlation is made of, so on its own it seldom passes Production
+                          Correlation. Add it as your own to try it anyway.
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => addReshape('Quantile', QUANTILE)}
+                      >
+                        <PlusIcon />
+                        Add as Your Own
+                      </Button>
+                    </div>
+                    <pre className="num mt-2 overflow-x-auto rounded-sm border border-hairline bg-canvas p-3 text-body-compact whitespace-pre text-ink-muted">
+                      {QUANTILE}
+                    </pre>
+                  </li>
+                )}
               </ul>
             )}
           </Panel>

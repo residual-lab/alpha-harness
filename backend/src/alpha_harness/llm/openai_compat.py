@@ -1,7 +1,7 @@
 """One client for every provider: each of them, Google included, speaks chat-completions.
 
 Built on the OpenAI SDK, which also streams. Google's endpoint is its OpenAI-compatible
-one, which holds the answer to a JSON schema and takes a reasoning effort.
+one, which takes a reasoning effort.
 """
 
 import asyncio
@@ -37,10 +37,22 @@ class ProviderError(RuntimeError):
 class OpenAICompatible:
     """A chat-completions client for one key, on a connection pool it shares."""
 
-    def __init__(self, base_url: str, api_key: str, http: httpx2.AsyncClient) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        http: httpx2.AsyncClient,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         # No SDK retries: a 429 means this key is spent for now, which rotation answers by
         # moving to the next key, and sending it again only burns the day's requests.
-        self._sdk = AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http, max_retries=0)
+        self._sdk = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=http,
+            max_retries=0,
+            default_headers=headers,
+        )
 
     async def generate(
         self,
@@ -49,26 +61,33 @@ class OpenAICompatible:
         system: str,
         user: str,
         temperature: float | None,
-        schema: dict[str, Any] | None,
+        response_format: ResponseFormat | None,
         reasoning_effort: ReasoningEffort = None,
+        prompt_cache_key: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """One completion as JSON: its text, and the ``usage`` the provider reported.
+        """One completion: its text, and the ``usage`` the provider reported.
 
-        ``schema`` holds the answer to it; without one only a JSON object is asked for. Not
-        every provider honours either, which is why the callers also ask for JSON in the
-        prompt itself and parse defensively. A 503 is sent again after a short wait.
+        ``response_format`` and ``prompt_cache_key`` go as given, or not at all when ``None``.
+        A 503 is sent again after a short wait.
         """
+        args = (
+            model,
+            system,
+            user,
+            temperature,
+            response_format,
+            reasoning_effort,
+            prompt_cache_key,
+        )
         for wait in OVERLOADED_WAITS:
             try:
-                return await self._complete(
-                    model, system, user, temperature, schema, reasoning_effort
-                )
+                return await self._complete(*args)
             except ProviderError as exc:
                 if exc.status != 503:
                     raise
             log.info("llm.overloaded", model=model, wait=wait)
             await asyncio.sleep(wait)
-        return await self._complete(model, system, user, temperature, schema, reasoning_effort)
+        return await self._complete(*args)
 
     async def _complete(
         self,
@@ -76,25 +95,22 @@ class OpenAICompatible:
         system: str,
         user: str,
         temperature: float | None,
-        schema: dict[str, Any] | None,
+        response_format: ResponseFormat | None,
         reasoning_effort: ReasoningEffort,
+        prompt_cache_key: str | None,
     ) -> tuple[str, dict[str, Any]]:
         messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        response_format: ResponseFormat = (
-            {"type": "json_schema", "json_schema": {"name": "answer", "schema": schema}}
-            if schema is not None
-            else {"type": "json_object"}
-        )
         try:
             completion = await self._sdk.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature if temperature is not None else omit,
-                response_format=response_format,
+                response_format=response_format if response_format is not None else omit,
                 reasoning_effort=reasoning_effort if reasoning_effort is not None else omit,
+                prompt_cache_key=prompt_cache_key if prompt_cache_key is not None else omit,
             )
         except APIStatusError as exc:
             raise ProviderError(exc.status_code, _detail(exc.response)) from exc

@@ -1,0 +1,17 @@
+[package]
+name = "fastexpr"
+description = "Fast Expression, read the way the backend's labs/fastexpr.py reads it, for the browser."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+# cdylib is the WebAssembly module; rlib lets `cargo test` run natively.
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

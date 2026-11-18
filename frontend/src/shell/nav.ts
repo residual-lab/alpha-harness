@@ -45,6 +45,7 @@ export const TOOL_TABS = [
   { tab: 'settings-sampler', label: 'Settings Sampler', to: '/tools/settings-sampler' },
   { tab: 'correlation-breaker', label: 'Correlation Breaker', to: '/tools/correlation-breaker' },
   { tab: 'fields-sampler', label: 'Fields Sampler', to: '/tools/fields-sampler' },
+  { tab: 'paste-alphas', label: 'Paste Alphas', to: '/tools/paste-alphas' },
 ] as const
 
 /** `group` heads a run of items in the sidebar; empty sits above every heading. An item's

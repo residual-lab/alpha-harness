@@ -2,24 +2,24 @@
  * The gate and the workspace. `GET /api/today` decides: backend down, sign-in, or work.
  */
 
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Outlet } from '@tanstack/react-router'
-import { RefreshCwIcon, ServerCrashIcon, XIcon } from 'lucide-react'
-import { Suspense, useEffect, useState } from 'react'
+import { RefreshCwIcon, ServerCrashIcon } from 'lucide-react'
+import { Suspense, useCallback, useEffect, useState } from 'react'
 import { Group, Panel, useDefaultLayout } from 'react-resizable-panels'
-import { today } from '@/api/core'
+import { simulations, today } from '@/api/core'
 import { errorMessage } from '@/api/http'
 import type { Today } from '@/api/types'
-import { useLive } from '@/lib/live'
 import { useRefetchOn } from '@/lib/ws'
-import { Button, Empty, LINK, Notice, Skeleton, Spinner } from '@/ui/kit'
+import { Button, Empty, Skeleton, Spinner } from '@/ui/kit'
 import { ResizeHandle, useMediaQuery, WIDE } from '@/ui/panels'
 import { CommandMenu } from './command-menu'
 import { DesktopNotifications, inDesktop } from './desktop'
 import { Header } from './header'
+import { PauseAlerts } from './pause'
 import { SettingsDialog } from './settings'
 import { SIDEBAR_WIDTH, Sidebar, useSidebarHidden } from './sidebar'
-import { SignIn } from './sign-in'
+import { SignIn, Verification } from './sign-in'
 import { InstallingOverlay } from './update'
 
 export function Shell() {
@@ -119,6 +119,7 @@ function Workspace({ you }: { you: Today['you'] }) {
     <div className="flex h-svh flex-col">
       <Header />
       {inDesktop && <DesktopNotifications />}
+      <PauseAlerts />
       <Group
         id="shell"
         orientation="horizontal"
@@ -188,30 +189,21 @@ function Workspace({ you }: { you: Today['you'] }) {
   )
 }
 
+/** BRAIN's identity check, finished in place. It cannot be dismissed: nothing is sent until it
+ * is done. */
 function VerificationBanner() {
-  const url = useLive((s) => s.verificationUrl)
-  if (!url) return null
+  const queryClient = useQueryClient()
+  const engine = useQuery({ queryKey: ['simulations', 'engine'], queryFn: simulations.engine })
+  const onVerified = useCallback(() => void queryClient.invalidateQueries(), [queryClient])
+  const connection = engine.data?.connection
+  if (connection?.state !== 'VERIFYING' && connection?.state !== 'VERIFYING_EXPIRED') return null
   return (
     <div className="border-b border-hairline p-2">
-      <Notice
-        tone="warn"
-        title="BRAIN needs to verify your identity"
-        action={
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Dismiss"
-            onClick={() => useLive.setState({ verificationUrl: null })}
-          >
-            <XIcon />
-          </Button>
-        }
-      >
-        Finish the check in your browser, then sign in again.{' '}
-        <a href={url} target="_blank" rel="noopener noreferrer" className={LINK}>
-          Open the verification page
-        </a>
-      </Notice>
+      <Verification
+        url={connection.verificationUrl}
+        inquiry={connection.inquiry}
+        onVerified={onVerified}
+      />
     </div>
   )
 }

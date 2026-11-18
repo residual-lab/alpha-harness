@@ -5,23 +5,22 @@ local vault, and nothing reads them from the environment: seeding them from a fi
 let a checked-out repository sign in as its owner.
 """
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
-#: The pages that may open the telemetry socket: the Vite dev server, and the built UI the
-#: backend serves itself.
-ALLOWED_ORIGINS = frozenset(
-    {
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-    }
-)
+#: The pages besides the backend's own that may open the telemetry socket: the Vite dev server.
+#: The built UI is accepted as the backend's own page on whatever port it serves (``api/ws.py``).
+#: 8000 is not listed: when the app has moved off it, another program holds it.
+ALLOWED_ORIGINS = frozenset({"http://localhost:5173", "http://127.0.0.1:5173"})
 
 
 #: Home-relative. Must stay on native ext4 — see CLAUDE.md.
 DATA_DIR = Path.home().joinpath(".alpha-harness").resolve()
+#: Owner-only on POSIX. Not on Windows: Python 3.13+ turns 0o700 into an access list of its
+#: own that stops the folder inheriting the profile's, and the profile's already admits only
+#: this account, SYSTEM and Administrators.
+PRIVATE_DIR_MODE = 0o777 if os.name == "nt" else 0o700
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,4 +45,4 @@ class Settings:
         return self.data_dir / "key"
 
     def ensure_data_dir(self) -> None:
-        self.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.data_dir.mkdir(mode=PRIVATE_DIR_MODE, parents=True, exist_ok=True)

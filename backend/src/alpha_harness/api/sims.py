@@ -52,17 +52,18 @@ async def active(state: State) -> list[SimulationRow]:
 
 
 @router.post("/simulations/{record_id}/cancel")
-async def cancel(record_id: int, state: State) -> CancelResult:
+async def cancel(record_id: int, state: State, force: bool = False) -> CancelResult:
     """Cancel a running simulation.
 
     Uses the stored platform id — the reason that id is written to disk before the
-    submission request is even sent.
+    submission request is even sent. ``force`` is the second press, after BRAIN refused:
+    the row ends here anyway, so its core is freed.
     """
     record = await state.tracker.get(record_id)
     if record is None:
         raise HTTPException(404, "No such simulation")
 
-    acknowledged = await state.tracker.cancel(record_id)
+    acknowledged = await state.tracker.cancel(record_id, force=force)
     updated = await state.tracker.get(record_id)
     return CancelResult(
         acknowledged=acknowledged,

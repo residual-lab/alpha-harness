@@ -13,10 +13,11 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from ..brain.connection import background
 from ..brain.filters import AlphaQuery, Filter
 from ..brain.platform import ALPHA_LIST_MAX_OFFSET, ALPHA_LIST_PAGE
 from ..brain.schemas import QUICK_MODE, Alpha, RecordSet, SimulationType
-from .store import checks_json
+from .store import PNL_ABSENT_RETRY, checks_json
 from .yields import checks_of, gating_results
 
 if TYPE_CHECKING:
@@ -142,6 +143,18 @@ class Backfill:
         """
         return await self._launch(kind, label, lambda task: self._job(task, work))
 
+    async def start_tagged(self, tags: list[str]) -> str:
+        """Bring in every Alpha BRAIN lists under any of ``tags``, made here or elsewhere."""
+        names = ", ".join(tags)
+
+        async def work(task: Task) -> str:
+            # A comma becomes BRAIN's "any of these" separator on the wire.
+            tagged = [Filter("tags", "=", ",".join(tags))]
+            found = await self._import_alphas(task, since=None, filters=tagged)
+            return f"Imported {found} Alpha{'' if found == 1 else 's'} tagged {names}"
+
+        return await self.start_job("tagged", f"Alphas tagged {names}", work)
+
     def cancel_job(self, kind: str) -> bool:
         """Stop the running job if it is a ``kind``. Whatever it already saved stays."""
         job = self._running
@@ -263,14 +276,17 @@ class Backfill:
                     before, offset = bound, 0
             ids = list(dict.fromkeys(ids))
 
-            # A simulated series never changes, so one already stored is not fetched again.
-            missing = await self.vault.lacking_series(ids)
+            # A simulated series never changes, so one already stored is not fetched again, and
+            # one BRAIN had none for within the day is left until then.
+            lacking = await self.vault.lacking_series(ids)
+            waiting = await self.vault.pnl_absent(lacking, within=PNL_ABSENT_RETRY)
+            missing = [a for a in lacking if a not in waiting]
             failed = await self.fetch_each(
                 task, missing, self.fetch_returns, what="Downloading PnL and turnover"
             )
             detail = f"Synced {len(ids)} SUBMITTED Alphas"
             if failed:
-                detail += f". BRAIN gave no PnL for {len(failed)}: sync again to retry them"
+                detail += f". No PnL downloaded for {len(failed)}: a later sync tries them again"
             await self.tasks.update(task, detail=detail)
             await self.tasks.finish(task)
             log.info(
@@ -315,8 +331,12 @@ class Backfill:
                 "finishedAt": _now(),
             }
 
-    async def _import_alphas(self, task: Any, *, since: datetime | None) -> int:
+    async def _import_alphas(
+        self, task: Any, *, since: datetime | None, filters: list[Filter] | None = None
+    ) -> int:
         """Page the pool into the vault, newest first, until BRAIN lists no older Alphas.
+
+        ``filters`` narrows what BRAIN lists, e.g. to the Alphas carrying a tag.
 
         Ends on a short page, or when the date window below the oldest Alpha seen stops
         moving; an account at 5,000 simulations a day passes any fixed count within weeks.
@@ -335,6 +355,7 @@ class Backfill:
                 AlphaQuery(
                     limit=ALPHA_LIST_PAGE,
                     offset=offset,
+                    filters=filters,
                     hidden=None,
                     created_after=since,
                     created_before=before,
@@ -379,23 +400,36 @@ class Backfill:
 
         From the cumulative ``pnl`` recordset rather than ``daily-pnl``, which is rounded
         separately and drifts from the platform's own figures, with turnover scaled to
-        ``yearly-stats`` (see :mod:`.metrics`). A PnL already stored without its turnover is
+        ``yearly-stats`` (see :mod:`.metrics`) where BRAIN made one: it makes none for a Quick
+        Alpha, whose turnover is kept as exported. A PnL already stored without its turnover is
         not asked for again.
         """
+        stored_as = (await self.vault.by_ids([alpha_id])).get(alpha_id) or {}
+        quick = stored_as.get("simulation_mode") == QUICK_MODE
+
+        async def yearly() -> list[dict[str, Any]]:
+            if quick:
+                return []
+            return (await self.endpoints.get_recordset(alpha_id, "yearly-stats")).rows()
+
         if await self.vault.lacking_pnl([alpha_id]):
             pnl = await self.endpoints.get_recordset(alpha_id, "pnl")
+            if not pnl.records:
+                await self.vault.mark_pnl_absent(alpha_id)
             turnover = await self.endpoints.get_recordset(alpha_id, "turnover")
-            yearly = await self.endpoints.get_recordset(alpha_id, "yearly-stats")
-            stored = await self.vault.save_pnl(alpha_id, pnl.rows(), turnover.rows(), yearly.rows())
+            stored = await self.vault.save_pnl(
+                alpha_id, pnl.rows(), turnover.rows(), await yearly()
+            )
             _warn_unreadable(alpha_id, pnl, stored)
             return stored
         turnover = await self.endpoints.get_recordset(alpha_id, "turnover")
-        yearly = await self.endpoints.get_recordset(alpha_id, "yearly-stats")
-        return await self.vault.save_turnover(alpha_id, turnover.rows(), yearly.rows())
+        return await self.vault.save_turnover(alpha_id, turnover.rows(), await yearly())
 
     async def fetch_pnl(self, alpha_id: str) -> int:
         """Fetch and store one alpha's daily PnL alone: one request, all a correlation needs."""
         pnl = await self.endpoints.get_recordset(alpha_id, "pnl")
+        if not pnl.records:
+            await self.vault.mark_pnl_absent(alpha_id)
         stored = await self.vault.save_pnl_only(alpha_id, pnl.rows())
         _warn_unreadable(alpha_id, pnl, stored)
         return stored
@@ -415,6 +449,7 @@ class Backfill:
         task.add_done_callback(self._background.discard)
 
     async def _fetch_each(self, alpha_ids: list[str]) -> None:
+        background()
         for alpha_id in alpha_ids:
             try:
                 await self.fetch_returns(alpha_id)
@@ -438,6 +473,7 @@ class Backfill:
         await asyncio.shield(future)
 
     async def _drain_landed(self) -> None:
+        background()
         try:
             while self._landed:
                 await asyncio.sleep(CAPTURE_DEBOUNCE_SECONDS)

@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from ..brain.platform import (
     IGNORED_CHECKS,
+    IMPLAUSIBLE_SHARPE,
     PLATFORM_ALPHA_URL,
     POWER_POOL_CHECK,
     QUOTA_CHECKS,
@@ -31,6 +32,7 @@ from ..brain.platform import (
 )
 from ..brain.schemas import QUICK_MODE
 from ..db.models import SimulationRecord
+from ..db.sqlite import loads
 
 if TYPE_CHECKING:
     from ..db.sqlite import Database
@@ -72,7 +74,7 @@ def checks_of(checks_json: str | None) -> list[dict[str, Any]]:
     if not checks_json:
         return []
     try:
-        checks = json.loads(checks_json)
+        checks = loads(checks_json)
     except json.JSONDecodeError, TypeError:
         return []
     if not isinstance(checks, list):
@@ -155,6 +157,13 @@ def verdict(checks: list[dict[str, Any]], simulation_mode: str | None = None) ->
     return "pending"
 
 
+def implausible(*sharpes: Any) -> bool:
+    """Whether any of these Sharpe figures, missing ones skipped, is beyond
+    :data:`IMPLAUSIBLE_SHARPE` either way. Such an Alpha stays in the vault but is not offered
+    for submission, and the searches score it as a failure (labs.objectives)."""
+    return any(isinstance(s, int | float) and abs(s) > IMPLAUSIBLE_SHARPE for s in sharpes)
+
+
 #: Anything past UNSUBMITTED (ACTIVE, DECOMMISSIONED, ...) has been submitted.
 SUBMITTED = "(a.status IS NOT NULL AND a.status <> 'UNSUBMITTED')"
 
@@ -185,9 +194,15 @@ async def submittable(
     universe: str | None = None,
     instrument_type: str | None = None,
     limit: int = 50,
+    shortlist: bool = True,
+    show_implausible: bool = False,
 ) -> dict[str, Any]:
     """Every alpha that passed all of BRAIN's submission checks, best Sharpe first, and
-    a shortlist of the few worth submitting.
+    a shortlist of the few worth submitting. Without ``shortlist``, only the counts: no PnL is
+    read for the shortlist, which across every market is most of the work.
+
+    An Alpha with an :func:`implausible` Sharpe in any period is left out and counted, unless
+    ``show_implausible``: a test-years step function would otherwise top the list.
 
     Alphas already submitted are left out, so nobody submits the same idea twice. Best
     Sharpe first is also most overfit first, so the shortlist ignores it: only Alphas
@@ -208,20 +223,32 @@ async def submittable(
 
     # Every row is judged, never a Sharpe-ordered head of the table: a scan capped at a
     # few hundred rows hid every submittable alpha ranked below it.
-    ready_ids, pending, near = await _tally(
+    ready_ids, pending, near_ids = await _tally(
         alphas, f"{' AND '.join(clauses)} AND a.checks IS NOT NULL", params
     )
-    total = len(ready_ids)
-    placeholders = ", ".join("?" for _ in ready_ids)
-    ready = (
-        await alphas.catalog.query(
+
+    async def best_first(ids: list[str]) -> list[dict[str, Any]]:
+        if not ids:
+            return []
+        placeholders = ", ".join("?" for _ in ids)
+        return await alphas.catalog.query(
             f"SELECT a.* FROM alpha a WHERE a.alpha_id IN ({placeholders}) "  # noqa: S608
             "ORDER BY a.sharpe DESC NULLS LAST",
-            ready_ids,
+            ids,
         )
-        if ready_ids
-        else []
-    )
+
+    def plausible(row: dict[str, Any]) -> bool:
+        return not implausible(row.get("train_sharpe"), row.get("test_sharpe"), row.get("sharpe"))
+
+    ready, near = await best_first(ready_ids), await best_first(near_ids)
+    flagged = {str(r["alpha_id"]) for r in ready if not plausible(r)}
+    hidden = 0 if show_implausible else len(flagged)
+    if hidden:
+        ready = [r for r in ready if str(r["alpha_id"]) not in flagged]
+    if not show_implausible:
+        # A straight line is no near miss worth repairing, and it would top the list.
+        near = [r for r in near if plausible(r)]
+    total = len(ready)
 
     # Imported here: both modules read this one's check lists at import time.
     from ..labs.ga import independent, series_of
@@ -229,22 +256,28 @@ async def submittable(
     validated = [r for r in ready if r.get("test_sharpe") is not None]
     held = [r for r in validated if held_out_ok(r)]
     chosen = ready[:limit]
+    by_id = {str(r["alpha_id"]): r for r in ready}
+    order = stability_order(held) if shortlist else []
     # One read for both the ranking and the sparklines.
-    days = await alphas.daily_pnl(list(dict.fromkeys(str(r["alpha_id"]) for r in [*held, *chosen])))
-    order = stability_order(held)
+    wanted = [*order, *(str(r["alpha_id"]) for r in chosen)] if shortlist else []
+    days = await alphas.daily_pnl(list(dict.fromkeys(wanted)))
     picks = await asyncio.to_thread(
         independent,
         order,
-        # One market here, so one region: the profile holds a single series.
-        {a: {"": pnl} for a in order if a in days and (pnl := series_of(days[a]))},
+        # Each under its own region: Alphas of two markets are never compared.
+        {
+            a: {str(by_id[a].get("region") or ""): pnl}
+            for a in order
+            if a in days and (pnl := series_of(days[a]))
+        },
         SHORTLIST,
         SHORTLIST_MAX_CORRELATION,
     )
-    by_id = {str(r["alpha_id"]): r for r in ready}
     # Everything the de-correlation walked past before the shortlist filled up.
     walked = order.index(picks[-1]) + 1 if picks else 0
 
-    ids = list(dict.fromkeys([*picks, *(str(r["alpha_id"]) for r in chosen)]))
+    near_shown = near[:limit] if shortlist else []
+    ids = list(dict.fromkeys([*picks, *(str(r["alpha_id"]) for r in [*chosen, *near_shown])]))
     labs = await _labs_for(db, ids)
     series = {a: _sparkline(list(d.values())) for a, d in days.items()}
 
@@ -293,8 +326,12 @@ async def submittable(
         #: Still being judged by the platform. Shown so an empty list reads as
         #: "not yet" rather than "never".
         "pending": pending,
+        #: Submittable but left out for an implausible Sharpe, so the list says so.
+        "implausibleHidden": hidden,
         #: Failing one or two fixable checks, and nothing else.
-        "nearMisses": near,
+        "nearMisses": len(near),
+        #: The first of them by Sharpe, each with the checks that refused it.
+        "nearMissAlphas": [entry(row) for row in near_shown],
         #: Submittable, but their Sharpe collapsed in the held-out test years.
         "heldOutFailed": len(validated) - len(held),
         #: Submittable, but simulated without a test period, so never validated.
@@ -345,8 +382,10 @@ _JUDGED: dict[str, tuple[tuple[int, str | None], Verdict | None, bool]] = {}
 _RESCAN = 500
 
 
-async def _tally(alphas: AlphaVault, where: str, params: list[Any]) -> tuple[list[str], int, int]:
-    """Submittable ids, promising count and near-miss count, judging only rows not seen as-is.
+async def _tally(
+    alphas: AlphaVault, where: str, params: list[Any]
+) -> tuple[list[str], int, list[str]]:
+    """Submittable ids, promising count and near-miss ids, judging only rows not seen as-is.
 
     Judged by :func:`verdict`. A near miss is one or two fixable failures and nothing else
     wrong.
@@ -384,7 +423,8 @@ async def _tally(alphas: AlphaVault, where: str, params: list[Any]) -> tuple[lis
     await asyncio.to_thread(_judge, rows)
 
     ready: list[str] = []
-    pending = near = 0
+    near: list[str] = []
+    pending = 0
     for alpha_id, _, _ in keys:
         # Absent only if the Alpha was deleted between the two reads.
         if (judged := _JUDGED.get(alpha_id)) is None:
@@ -394,7 +434,8 @@ async def _tally(alphas: AlphaVault, where: str, params: list[Any]) -> tuple[lis
             ready.append(alpha_id)
         elif found == "pending":
             pending += 1
-        near += is_near
+        if is_near:
+            near.append(alpha_id)
     return ready, pending, near
 
 
@@ -408,7 +449,8 @@ def _judge(rows: list[dict[str, Any]]) -> None:
             if str(c.get("result", "")).upper() in REFUSING
             and (name := str(c.get("name", "")).upper()) not in IGNORED_CHECKS
         }
-        near = found == "refused" and failed <= FIXABLE_CHECKS and len(failed) <= 2
+        # Something must have failed: every Quick-mode Alpha reads "refused", failing or not.
+        near = found == "refused" and bool(failed) and failed <= FIXABLE_CHECKS and len(failed) <= 2
         _JUDGED[str(row["alpha_id"])] = ((row["h"], row.get("simulation_mode")), found, near)
 
 
@@ -482,3 +524,25 @@ def lab_of(task: str) -> str:
     because quotas and progress are keyed by task while yield is judged per lab across days.
     """
     return re.split(r"-\d", task, maxsplit=1)[0] or "manual"
+
+
+if __name__ == "__main__":
+    import sys
+
+    def near_miss(checks: list[dict[str, Any]], mode: str | None = None) -> bool:
+        _judge([{"alpha_id": "a", "checks": json.dumps(checks), "simulation_mode": mode, "h": 0}])
+        return _JUDGED["a"][2]
+
+    passing = [{"name": "LOW_SHARPE", "result": "PASS"}]
+    checks = {
+        "a Quick-mode Alpha that fails nothing is no near miss": not near_miss(passing, QUICK_MODE),
+        "one fixable failure is one": near_miss(
+            [*passing, {"name": "HIGH_TURNOVER", "result": "FAIL"}]
+        ),
+        "a Sharpe that is not there is not": not near_miss(
+            [{"name": "LOW_SHARPE", "result": "FAIL"}]
+        ),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"yields self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

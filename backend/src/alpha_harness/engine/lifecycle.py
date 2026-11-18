@@ -56,6 +56,14 @@ _STATUS_MAP = {
 }
 #: Platform statuses of a simulation that has not finished.
 _RUNNING = (SimulationStatus.WAITING, SimulationStatus.SIMULATING)
+#: What BRAIN's own client shows when a finished simulation carries no message of its own.
+SILENT = {
+    SimulationStatus.FAIL: "WorldQuant BRAIN is experiencing some difficulties. Please "
+    "contact support if this problem persists.",
+    SimulationStatus.ERROR: "An unknown error has occurred. Please contact support if this "
+    "problem persists.",
+    SimulationStatus.TIMEOUT: "Simulation timed out.",
+}
 
 
 # -- dedup -------------------------------------------------------------------
@@ -342,7 +350,7 @@ def read_outcome(status_code: int, body: Any, retry_after: float | None) -> Outc
             _STATUS_MAP[platform],
             platform_status=platform,
             alpha_id=alpha_id,
-            message=message,
+            message=message or SILENT.get(platform),
         )
     if message is not None and alpha_id is None:
         # ``{detail}`` / ``{details}``: the documented error bodies without a status.

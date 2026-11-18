@@ -15,6 +15,7 @@ import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { today } from '@/api/core'
 import {
   DEFAULT_TRUNCATION,
+  MAX_DECAY,
   MULTI_SIMULATION_SIZE,
   RA_CHILDREN,
   REGION_AGNOSTIC_REGION,
@@ -143,6 +144,25 @@ function defaults(plan: SettingsPlan) {
   }
 }
 
+/** The Alpha's own market, Neutralization and Investability alone, so a sweep of Decay is
+ *  all that changes. */
+function ownSettings(plan: SettingsPlan) {
+  const own = plan.settings
+  return {
+    chosen: new Set([
+      marketKey({ region: own.region ?? '', delay: own.delay ?? 0, universe: own.universe ?? '' }),
+    ]),
+    neutralizations: own.neutralization ? [own.neutralization] : [],
+    pairs: [pairKey(own)],
+  }
+}
+
+/** Steps above the Alpha's own Decay: higher lowers Turnover, and too much attenuates the signal. */
+const DECAY_STEPS = [0, 2, 5, 10, 20]
+const decayLadder = (own: number) => [
+  ...new Set(DECAY_STEPS.map((step) => Math.min(own + step, MAX_DECAY))),
+]
+
 /** How much of a group is chosen. Drives both the look of a chip and what clicking it does. */
 interface Group {
   keys: string[]
@@ -179,6 +199,8 @@ function resolve(
   neutralizations: string[],
   pairs: string[],
   marketNeutralOnly: boolean,
+  /** How many Decays each runs at: one held, or every one swept. */
+  decays: number,
 ) {
   const neutral = new Set(neutralizations)
   const pairSet = new Set(pairs)
@@ -200,7 +222,7 @@ function resolve(
       legalPairs.some((p) => p.maxTrade === 'OFF' && p.maxPosition === 'OFF')
         ? 1
         : 0
-    const runs = neutHere * pairsHere - unhedged
+    const runs = (neutHere * pairsHere - unhedged) * decays
 
     const byDelay = new Map<number, typeof live>()
     for (const market of live) {
@@ -451,6 +473,7 @@ export function SettingsSamplerScreen() {
   const [truncation, setTruncation] = useState(String(DEFAULT_TRUNCATION))
   const [pasteurization, setPasteurization] = useState<'ON' | 'OFF'>('ON')
   const [nanHandling, setNanHandling] = useState<'ON' | 'OFF'>('ON')
+  const [visualization, setVisualization] = useState<'ON' | 'OFF'>('OFF')
   const [testYears, setTestYears] = useState(String(TEST_PERIOD_YEARS))
   const [testMonths, setTestMonths] = useState('0')
   /** The expression last analysed; the draft above only counts once Analyse is pressed. */
@@ -463,6 +486,10 @@ export function SettingsSamplerScreen() {
   const wantedCores = useCores(chosenCores)
   const [marketNeutralOnly, setMarketNeutralOnly] = useState(true)
   const [truncationAgent, setTruncationAgent] = useState(false)
+  /** `null` while Simulation Settings' one Decay is held; otherwise the Decays swept. */
+  const [decays, setDecays] = useState<number[] | null>(null)
+  const sweeps = decays?.length ?? 1
+  const sweepDecay = search.sweep === 'decay'
 
   useEffect(() => {
     setDraft(search.alpha ?? '')
@@ -508,16 +535,20 @@ export function SettingsSamplerScreen() {
     setChosen(start.chosen)
     setNeutralizations(start.neutralizations)
     setPairs(start.pairs)
+    setDecays(null)
   }
 
+  // Sent here to sweep Decay: only the Alpha's own settings, so the sweep is a few simulations.
   useEffect(() => {
     if (!plan) return
-    const start = defaults(plan)
+    const decayOnly = sweepDecay && Boolean(plan.alphaId)
+    const start = decayOnly ? ownSettings(plan) : defaults(plan)
     setChosen(start.chosen)
     setNeutralizations(start.neutralizations)
     setPairs(start.pairs)
+    setDecays(decayOnly ? decayLadder(plan.settings.decay ?? 0) : null)
     setCores(null)
-  }, [plan])
+  }, [plan, sweepDecay])
 
   const change = (keys: string[], on: boolean) =>
     setChosen((prev) => {
@@ -539,9 +570,10 @@ export function SettingsSamplerScreen() {
             [...new Set(plan.regions.flatMap((r) => r.neutralizations))],
             [...new Set(plan.regions.flatMap((r) => r.pairs.map(pairKey)))],
             marketNeutralOnly,
+            sweeps,
           ).simulations
         : 0,
-    [plan, all, marketNeutralOnly],
+    [plan, all, marketNeutralOnly, sweeps],
   )
   // What the agent sets across the markets chosen, from the plan's own figure for each.
   const agentValues = all.filter((m) => chosen.has(marketKey(m))).map((m) => m.agentTruncation)
@@ -562,15 +594,15 @@ export function SettingsSamplerScreen() {
       </span>
     )
   const { branches, picks, simulations, batches, markets } = useMemo(
-    () => resolve(plan, chosen, neutralizations, pairs, marketNeutralOnly),
-    [plan, chosen, neutralizations, pairs, marketNeutralOnly],
+    () => resolve(plan, chosen, neutralizations, pairs, marketNeutralOnly, sweeps),
+    [plan, chosen, neutralizations, pairs, marketNeutralOnly, sweeps],
   )
   // What the skip is worth right now, so the choice is made against a number.
   const unhedged = useMemo(
     () =>
-      resolve(plan, chosen, neutralizations, pairs, false).simulations -
-      resolve(plan, chosen, neutralizations, pairs, true).simulations,
-    [plan, chosen, neutralizations, pairs],
+      resolve(plan, chosen, neutralizations, pairs, false, sweeps).simulations -
+      resolve(plan, chosen, neutralizations, pairs, true, sweeps).simulations,
+    [plan, chosen, neutralizations, pairs, sweeps],
   )
 
   /** The Region, Delay and Universe rows, each a view of the chosen markets. */
@@ -633,6 +665,9 @@ export function SettingsSamplerScreen() {
 
   const anyMarketOn = markets > 0
   const anyNeutralizationOn = neutralizations.length > 0
+  const offeredDecays = [
+    ...new Set([...decayLadder(plan?.settings.decay ?? 0), ...(decays ?? [])]),
+  ].sort((a, b) => a - b)
   const toggleMarkets = () => change(all.map(marketKey), !anyMarketOn)
 
   // The header's own query, so both read one cache. What is already queued will spend first.
@@ -653,6 +688,8 @@ export function SettingsSamplerScreen() {
       truncationAgent,
       neutralizations,
       pairs: allPairs.filter((p) => pairs.includes(pairKey(p))),
+      decays: decays ?? [],
+      visualization: visualization === 'ON',
       cores,
     }),
   )
@@ -802,7 +839,7 @@ export function SettingsSamplerScreen() {
       {plan?.expression && (
         <Panel
           title="Simulation Settings"
-          description={`Every market in the sweep runs at these${truncationAgent ? ', with Truncation set per market' : ''}.`}
+          description={`Every market in the sweep runs at these${truncationAgent ? ', with Truncation set per market' : ''}.${decays ? ' Decay is swept below instead.' : ''}`}
         >
           <SimulationSettingsFields
             decay={decay}
@@ -816,6 +853,8 @@ export function SettingsSamplerScreen() {
             setPasteurization={setPasteurization}
             nanHandling={nanHandling}
             setNanHandling={setNanHandling}
+            visualization={visualization}
+            setVisualization={setVisualization}
             testYears={testYears}
             setTestYears={setTestYears}
             testMonths={testMonths}
@@ -890,6 +929,45 @@ export function SettingsSamplerScreen() {
             )}
 
             <div className="flex flex-col gap-3">
+              {decays && (
+                <Tile
+                  label="Decay"
+                  any={decays.length > 0}
+                  onToggle={() => setDecays(decays.length > 0 ? [] : offeredDecays)}
+                  actions={
+                    <>
+                      {decays.length === 0 && (
+                        <span className="text-body-compact text-status-warning">
+                          Choose at least one
+                        </span>
+                      )}
+                      <Button size="sm" variant="ghost" onClick={() => setDecays(null)}>
+                        Hold Decay
+                      </Button>
+                    </>
+                  }
+                >
+                  <p className="text-body-compact text-ink-subtle">
+                    In place of the Decay above. Higher lowers Turnover; too much attenuates the
+                    signal.
+                  </p>
+                  <Spread columns={offeredDecays.length}>
+                    {offeredDecays.map((value) => (
+                      <GroupChip
+                        key={value}
+                        label={value}
+                        group={{ keys: [String(value)], on: decays.includes(value) ? 1 : 0 }}
+                        onChange={(_, on) =>
+                          setDecays((prev) =>
+                            on ? [...(prev ?? []), value] : (prev ?? []).filter((v) => v !== value),
+                          )
+                        }
+                        className="w-full justify-center"
+                      />
+                    ))}
+                  </Spread>
+                </Tile>
+              )}
               <Tile
                 label="Region"
                 // Region, Delay and Universe are views of one set of markets, so the heading

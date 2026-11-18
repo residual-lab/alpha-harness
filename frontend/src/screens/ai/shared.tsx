@@ -20,10 +20,12 @@ export const useModels = () => useQuery({ queryKey: ['ai', 'models'], queryFn: l
 export function useRunnableModels() {
   const keys = useKeys()
   const models = useModels()
-  const enabled = new Set(keys.data?.keys.filter((k) => k.enabled).map((k) => k.provider))
+  const enabled = new Set(
+    keys.data?.keys.filter((k) => k.enabled && !k.retired).map((k) => k.provider),
+  )
   const left = new Map(keys.data?.budget.map((b) => [b.ref, b.remainingToday]))
   const runnable = (models.data?.models ?? [])
-    .filter((m) => enabled.has(m.provider))
+    .filter((m) => !m.retired && enabled.has(m.provider))
     .sort((a, b) => (left.get(b.ref) ?? 0) - (left.get(a.ref) ?? 0))
   return { runnable, all: models.data?.models ?? [], ready: keys.isSuccess && models.isSuccess }
 }
@@ -43,7 +45,10 @@ export function useInvalidateKeys() {
 
 export function useProviderLabel() {
   const providers = useProviders()
-  return (id: string) => providers.data?.providers.find((p) => p.id === id)?.label ?? id
+  return (id: string) =>
+    providers.data?.providers.find((p) => p.id === id)?.label ??
+    providers.data?.retired.find((p) => p.id === id)?.label ??
+    id
 }
 
 /** Seconds left on a server countdown, ticking locally between refetches. */

@@ -6,6 +6,7 @@ import { toast } from 'sonner'
 import { type CatalogFacets, catalog } from '@/api/catalog'
 import { errorMessage } from '@/api/http'
 import type { Scope } from '@/api/types'
+import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
 import { saveText } from '@/lib/download'
 import { fmt } from '@/lib/format'
@@ -47,10 +48,11 @@ export function DatasetTree({
   // to the clipboard, or to a Markdown file named by the node's BRAIN id.
   const actions = (ids: string[], where: string, file: string) => ({
     onCopy: () =>
-      catalog
-        .outline(scope, { dataset_ids: ids })
-        .then(async (outline) => {
-          await navigator.clipboard.writeText(outline.text)
+      copyText(
+        () => catalog.outline(scope, { dataset_ids: ids }),
+        (outline) => outline.text,
+      )
+        .then((outline) => {
           toast.success(`Copied ${fmt.int(outline.fields)} Data Fields`, { description: where })
         })
         .catch((e: unknown) =>

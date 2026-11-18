@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field, ValidationError
 
 from ..brain.errors import BrainError
-from ..brain.platform import INSTRUMENT_TYPE
+from ..brain.platform import INSTRUMENT_TYPE, MAX_DECAY
 from ..brain.schemas import region_label
 from ..brain.settings_schema import resolve_options
 from ..catalog.queries import FieldFilter
@@ -25,6 +25,7 @@ from .params import (
     CORRELATION_BREAKER,
     FIELDS_SAMPLER,
     GA_SAMPLER,
+    PASTE_ALPHAS,
     POWER_POOL_SAMPLER,
     SEARCH_SAMPLER,
     SETTINGS_SAMPLER,
@@ -57,6 +58,7 @@ _TASKS: dict[str, tuple[str, str]] = {
     CORRELATION_BREAKER: ("correlation-breaker", "sharpe"),
     FIELDS_SAMPLER: ("fields-sampler", "sharpe"),
     SUPER_LAB: ("super-alpha", "sharpe"),
+    PASTE_ALPHAS: ("paste-alphas", "sharpe"),
 }
 
 
@@ -167,11 +169,14 @@ class SearchRequest(BaseModel):
     delay: int = Field(ge=0, le=1)
     #: The chosen market's universe; searched first, other universes join if they overlap.
     universe: str | None = None
+    #: Keeps the other downloaded universes of the market out.
+    only_universe: bool = False
     dataset_ids: list[str] = Field(default_factory=list, max_length=200)
     vector_operators: list[str] = Field(default_factory=list)
     #: What the lab searches. Empty is refused: see :data:`NO_NEUTRALIZATION`.
     neutralizations: list[str] = Field(default_factory=list, max_length=20)
-    decay: int = 0
+    #: One is held for every simulation; several are searched, like the neutralizations.
+    decays: list[int] = Field(default_factory=lambda: [0], max_length=MAX_DECAY + 1)
     cores: int = Field(default=search.MAX_CORES, ge=1, le=search.MAX_CORES)
     #: Needed to add a task; a preview ignores it.
     simulations: int = Field(default=0, ge=0, le=search.MAX_SIMULATIONS)
@@ -194,14 +199,16 @@ async def market_for(body: SearchRequest, state: Any, need: tuple[str, ...] = ()
         problems.append(OPERATORS_UNREAD)
     elif "ts_backfill" not in {o.get("name") for o in operators}:
         problems.append("ts_backfill is not available on this account, so fields can't be cleaned.")
-    if body.decay not in search.DECAYS:
-        problems.append(f"Decay must be one of {', '.join(map(str, search.DECAYS))}.")
+    if not body.decays or any(not 0 <= d <= MAX_DECAY for d in body.decays):
+        problems.append(f"Decay must be one or more whole numbers from 0 to {MAX_DECAY}.")
 
     schema = await state.metadata.cached_settings_schema()
     if not schema:
         problems.append("BRAIN's settings list is not loaded. Sign in again.")
     legal = legal_choices(schema, body.region, body.delay)
     universes = await synced_universes(state, legal, body.region, body.delay, body.universe)
+    if body.only_universe:
+        universes = [u for u in universes if u == body.universe]
     downloaded = bool(universes)
     neutralizations = await neutralizations_for(
         state, body.region, body.delay, body.neutralizations
@@ -233,9 +240,14 @@ async def market_for(body: SearchRequest, state: Any, need: tuple[str, ...] = ()
     if not body.dataset_ids:
         problems.append("Choose at least one dataset.")
     elif not downloaded:
+        where = f"{region_label(body.region)} delay {body.delay}"
         problems.append(
-            f"No {region_label(body.region)} delay {body.delay} market is downloaded. "
-            "Sync it in the Data Explorer."
+            (
+                f"{where} {body.universe} is not downloaded."
+                if body.only_universe
+                else f"No {where} market is downloaded."
+            )
+            + " Sync it in the Data Explorer."
         )
     elif not universes:
         names = ", ".join(sorted(lacking) or need)

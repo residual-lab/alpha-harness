@@ -16,6 +16,8 @@ import { namesIn } from './variables'
 
 /** A built-in template: an idea, and complete templates built on it. */
 export interface Family {
+  /** A name to find it by, for the ideas other screens point to. */
+  title?: string
   /** The idea as the gallery shows it: its lookback written d, its signals `...`. */
   shown: string
   /** What opening the idea writes into the editor; each `...` is a signal to fill. */
@@ -32,6 +34,19 @@ export const GALLERY: Family[] = [
       'r = rank($field);\nif_else(abs(ts_arg_min(low, $lookback) - ts_arg_max(high, $lookback)) > $lookback / 2, r, 1 - r)',
       'rank(if_else(abs(ts_arg_min(low, $lookback) - ts_arg_max(high, $lookback)) > $lookback / 2, $field, -$field))',
     ],
+  },
+  // Named after where their fields come from, so each variable starts with its own datasets.
+  {
+    title: 'Two fields, two datasets',
+    shown: 'rank($fundamental / $pv1)',
+    text: 'rank($fundamental / $pv1)',
+    variations: ['group_rank($fundamental / $pv1, $group)'],
+  },
+  {
+    title: 'Try operators',
+    shown: '$ts_op($field, $lookback)',
+    text: '$ts_op($field, $lookback)',
+    variations: ['$group_op($ts_op($field, $lookback), $group)'],
   },
 ]
 
@@ -120,6 +135,14 @@ export function Facts({
         <Badge tone="outline" title="Every Alpha it makes reads one dataset, grouping fields aside">
           Single Dataset
         </Badge>
+      )}
+      {stats.pyramids != null && stats.pyramids > 2 && (
+        <span
+          className="text-body-compact text-status-warning"
+          title="Since Q2 2025 an Alpha reading more than 2 Dataset Categories counts toward no Genius pyramid, though it still counts toward base payment. Grouping fields are not counted."
+        >
+          Up to {fmt.int(stats.pyramids)} Dataset Categories
+        </span>
       )}
       {stats.holes > 0 && (
         <span
@@ -211,6 +234,7 @@ export function TemplatesPanel({
                   className={cn(CARD, IDLE)}
                   onClick={() => setFamily(index)}
                 >
+                  {f.title && <span className="text-title">{f.title}</span>}
                   <Expression>{f.shown}</Expression>
                   <span className="flex w-full flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
                     <Facts stats={cards.get(galleryKey(index, null))?.stats} />
@@ -333,7 +357,7 @@ function FamilyDialog({
             className="flex shrink-0 flex-col gap-0.5 overflow-y-auto border-b border-hairline p-2 sm:w-56 sm:border-r sm:border-b-0"
           >
             <BDialog.Title className="px-2 pt-1 pb-2 text-caption font-medium text-ink-subtle">
-              Built-in Template
+              {family.title ?? 'Built-in Template'}
             </BDialog.Title>
             {entries.map((e, i) => {
               const stats = cards.get(e.key)?.stats
@@ -378,9 +402,11 @@ function FamilyDialog({
                 <div className="flex flex-col gap-1 pr-10">
                   <h2 className="text-title font-medium text-ink">{entry.label}</h2>
                   <p className="text-body-compact text-ink-subtle">
-                    {chosen === 0
-                      ? 'The idea itself. Each ... is a signal for you to write.'
-                      : 'A complete template built on it, ready to search.'}
+                    {chosen > 0
+                      ? 'A complete template built on it, ready to search.'
+                      : entry.text.includes('...')
+                        ? 'The idea itself. Each ... is a signal for you to write.'
+                        : 'The idea itself, ready to search.'}
                   </p>
                 </div>
                 <Expression className="rounded-md border border-hairline bg-surface-1 p-3 text-body">

@@ -58,6 +58,8 @@ class EvolutionRequest(BaseModel):
     #: ``None`` sizes the population from the simulations.
     population: Literal[50, 100, 200] | None = None
     mutation_rate: float = Field(default=ga.MUTATION_RATE, ge=0.01, le=0.2)
+    #: Off, a mutation may give a child a decay neither parent has.
+    keep_decay: bool = False
     #: Needed to add a task; a preview uses it to size the population.
     simulations: int = Field(default=0, ge=0, le=search.MAX_SIMULATIONS)
 
@@ -94,6 +96,9 @@ class SeedRow(Out):
     returns: float | None
     drawdown: float | None
     margin: float | None
+    #: The held-out years', shown and never bred on. Null without a test period.
+    test_sharpe: float | None = None
+    test_fitness: float | None = None
     score: float | None
     #: The limit each of BRAIN's figure checks names for this Alpha, by check name.
     limits: dict[str, float] = Field(default_factory=dict)
@@ -213,7 +218,7 @@ async def _plan(body: EvolutionRequest, state: Any) -> dict[str, Any]:
 
         def draw(rng: random.Random) -> SimulationRequest | None:
             a, b = rng.choice(parents), rng.choice(parents)
-            made = ga.child(rng, a, b, bred, body.mutation_rate, shapes)
+            made = ga.child(rng, a, b, bred, body.mutation_rate, shapes, keep_decay=body.keep_decay)
             return ga.request_for(*made, run) if made else None
 
         sample = preview_samples(draw, tries=50)
@@ -392,6 +397,7 @@ async def add_task(body: EvolutionRequest, state: State) -> AddedTask:
             mutation_rate=body.mutation_rate,
             test_period=TEST_PERIOD,
             neutralizations=plan["neutralizations"],
+            keep_decay=body.keep_decay,
         ),
         simulations=body.simulations,
         batch_size=body.cores * 10,

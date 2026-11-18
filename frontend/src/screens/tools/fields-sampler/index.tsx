@@ -30,7 +30,7 @@ const MODES: { value: SamplerMode; label: string }[] = [
 
 const ABOUT: Record<SamplerMode, string> = {
   sweep:
-    'Every other field of the same dataset, best covered first. Keeps a single dataset Alpha single dataset.',
+    'Every other field of the same dataset, best covered first, so a single-dataset Alpha stays single-dataset.',
   similar:
     'The fields whose descriptions read closest to it: the closest few from its own dataset, then its subcategory, its category, and the whole market.',
   buckets:
@@ -41,6 +41,7 @@ const PER_TIER = [5, 10, 20]
 const TOP_PICKS = [5, 10, 15, 20, 30]
 
 const TIER: Record<string, string> = {
+  fast_d1: 'Fast D1 twin and overnight change',
   dataset: 'Same dataset',
   subcategory: 'Same subcategory',
   category: 'Same category',

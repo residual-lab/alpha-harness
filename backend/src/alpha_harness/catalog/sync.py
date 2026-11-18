@@ -23,7 +23,8 @@ from sqlalchemy import select, update
 from ..brain.errors import BrainError
 from ..brain.platform import INSTRUMENT_TYPE, REGION_AGNOSTIC_REGION
 from ..brain.schemas import BulkField, FieldRef
-from ..db.duck import DATASET_COLUMNS, CatalogUnusableError
+from ..brain.settings_schema import valid_values
+from ..db.duck import DATASET_COLUMNS, FIELD_COLUMNS, CatalogUnusableError
 from ..db.models import SyncRun, SyncStatus, utcnow
 from . import search
 from .queries import scope_label
@@ -98,6 +99,25 @@ class SyncTarget:
 #: The run row that stands for a whole-catalog sync rather than one scope.
 ALL_TARGET = SyncTarget(INSTRUMENT_TYPE, "*", -1, "*")
 
+#: The market a first sync downloads before any other: the Dashboard's, so a first task can
+#: run while the rest arrive.
+STARTER = SyncTarget(INSTRUMENT_TYPE, "USA", 1, "TOP3000")
+
+
+def offered_markets(schema: dict[str, Any]) -> list[SyncTarget]:
+    """Every EQUITY market the account can simulate, read off BRAIN's own settings schema, so
+    a new region or universe is picked up without a code change."""
+    # EQUITY only, the one instrument type the Data Explorer offers.
+    base: dict[str, Any] = {"instrumentType": INSTRUMENT_TYPE}
+    return [
+        SyncTarget(
+            instrument_type=INSTRUMENT_TYPE, region=region, delay=int(delay), universe=universe
+        )
+        for region in valid_values(schema, "region", base)
+        for delay in valid_values(schema, "delay", {**base, "region": region})
+        for universe in valid_values(schema, "universe", {**base, "region": region, "delay": delay})
+    ]
+
 
 class CatalogSync:
     """Runs and reports catalog downloads."""
@@ -127,13 +147,16 @@ class CatalogSync:
 
     # -- public API ------------------------------------------------------
 
-    async def start_all(self, targets: list[SyncTarget]) -> dict[str, Any]:
+    async def start_all(
+        self, targets: list[SyncTarget], *, first: SyncTarget | None = None
+    ) -> dict[str, Any]:
         """Download every scope in the background and return its progress immediately.
 
         One run row stands for the whole download, so there is one progress feed and one
         cancel. Every market runs its own pipeline at once: its fields first (with dataset
         rows derived from them, so it is browsable immediately), then BRAIN's full dataset
         records. A market that fails is noted and skipped rather than ending the sync.
+        ``first`` fetches its fields alone before any other market starts.
         """
         for run_id in list(self._all):
             if run_id in self._tasks:
@@ -164,7 +187,7 @@ class CatalogSync:
             "catalog-sync", "Downloading BRAIN Data Fields", runId=run.id
         )
         task = asyncio.create_task(
-            self._guarded(run.id, ALL_LABEL, self._crawl_all(run.id, targets, cancel)),
+            self._guarded(run.id, ALL_LABEL, self._crawl_all(run.id, targets, cancel, first)),
             name=f"sync-all-{run.id}",
         )
         self._tasks[run.id] = task
@@ -176,6 +199,19 @@ class CatalogSync:
 
         task.add_done_callback(_done)
         return self._payload(run)
+
+    async def first_wanted(self) -> bool:
+        """Whether the catalog's first download should start by itself: nothing is stored,
+        nothing is downloading, and this empty catalog has not been tried already.
+
+        A try that failed or was cancelled is not repeated: the Sync screen says why it stopped,
+        and its button starts the next one.
+        """
+        if self._tasks or await self.catalog.scalar("SELECT 1 FROM data_field LIMIT 1"):
+            return False
+        last = await self.runs(limit=1)
+        # A finished sync and nothing stored: the catalog was deleted since, so this one is new.
+        return not last or last[0].status == SyncStatus.COMPLETE
 
     async def reset_interrupted(self) -> int:
         """Mark runs left RUNNING by a crash as FAILED, so they stop reading as in progress.
@@ -295,7 +331,7 @@ class CatalogSync:
         if target.region != REGION_AGNOSTIC_REGION:
             return await self.endpoints.list_data_fields_all(**target.params)
 
-        # Region ALL refuses an unlimited read and stops answering past 10,000 of the ~28,000
+        # Region ALL answers an unlimited read with nothing and stops past 10,000 of the ~28,000
         # fields it holds, so it is read one dataset at a time. Hundreds of requests, hence
         # the running count: a market that reports nothing for ten minutes looks hung.
         datasets = await _shared_datasets(bulk_datasets, target)
@@ -336,16 +372,30 @@ class CatalogSync:
         return out
 
     async def _crawl_all(
-        self, run_id: int, targets: list[SyncTarget], cancel: asyncio.Event
+        self,
+        run_id: int,
+        targets: list[SyncTarget],
+        cancel: asyncio.Event,
+        first: SyncTarget | None = None,
     ) -> None:
         progress = self._all[run_id]
         totals = {"fields": 0, "datasets": 0}
         synced: list[SyncTarget] = []
         # Bounds how many markets hold a full field payload in memory at once.
         gate = asyncio.Semaphore(ALL_CONCURRENCY)
+        # ``first`` has the connection to itself: every other read waits until its fields are
+        # in, or are not coming.
+        lead = asyncio.Event()
+        if first not in targets:
+            lead.set()
+
+        async def all_datasets() -> dict[tuple[str, int, str], list[DataSet]] | None:
+            await lead.wait()
+            return await self._all_datasets(targets)
+
         # One unscoped read serves every market and runs beside the field downloads. Markets
         # never block on it for long: see BULK_DATASETS_WAIT.
-        bulk_datasets = asyncio.create_task(self._all_datasets(targets))
+        bulk_datasets = asyncio.create_task(all_datasets())
 
         async def report() -> None:
             await self._update(
@@ -356,7 +406,8 @@ class CatalogSync:
             )
             await self._emit(run_id)
 
-        async def pipeline(target: SyncTarget) -> None:
+        async def fetch(target: SyncTarget) -> bool:
+            """One market's fields, stored: whether they landed."""
             market = progress["markets"][target.label]
             async with gate:
                 _check(cancel)
@@ -373,9 +424,15 @@ class CatalogSync:
                     now = utcnow()
                     rows = await asyncio.to_thread(_field_rows, raw, target, now)
                     datasets = await asyncio.to_thread(_dataset_rows, raw, target, now)
+                    table = await asyncio.to_thread(
+                        self.catalog.to_arrow, "data_field", FIELD_COLUMNS, rows
+                    )
+                    # Only the Arrow table waits for the writer: the structs and tuples it came
+                    # from are over four times its size, and eight markets can be waiting.
+                    del raw, rows
                     prepared = time.perf_counter()
                     scope = [target.instrument_type, target.region, target.delay, target.universe]
-                    await self.catalog.replace_fields(scope, rows)
+                    await self.catalog.replace_fields(scope, table)
                     # Placeholders only fill gaps: a re-sync must not blank the Value Score,
                     # Coverage and counts that an earlier details step stored.
                     await self.catalog.upsert(
@@ -386,12 +443,12 @@ class CatalogSync:
                     log.info(
                         "sync_all.scope_timing",
                         target=target.label,
-                        fields=len(rows),
+                        fields=len(table),
                         fetch_s=round(fetched - started, 2),
                         prepare_s=round(prepared - fetched, 2),
                         write_s=round(time.perf_counter() - prepared, 2),
                     )
-                    return len(rows), len(datasets)
+                    return len(table), len(datasets)
 
                 try:
                     fields, datasets = await _retry(store, cancel, target.label)
@@ -404,7 +461,7 @@ class CatalogSync:
                     progress["failed"].append(f"{target.label}: {_reason(exc)}")
                     log.warning("sync_all.fields_failed", target=target.label, error=_reason(exc))
                     await report()
-                    return
+                    return False
 
             # Browsable now; BRAIN's full dataset records follow straight away.
             totals["fields"] += fields
@@ -412,6 +469,11 @@ class CatalogSync:
             market.update(state="details", fields=fields)
             synced.append(target)
             await report()
+            return True
+
+        async def fill(target: SyncTarget) -> None:
+            """BRAIN's full dataset records, for a market whose fields landed."""
+            market = progress["markets"][target.label]
 
             async def details() -> None:
                 now = utcnow()
@@ -442,6 +504,17 @@ class CatalogSync:
                 progress["failed"].append(f"{target.label} details: {_reason(exc)}")
                 log.warning("sync_all.details_failed", target=target.label, error=_reason(exc))
             await report()
+
+        async def pipeline(target: SyncTarget) -> None:
+            if target != first:
+                await lead.wait()
+            try:
+                landed = await fetch(target)
+            finally:
+                # Landed or not, nothing waits on the first market any longer.
+                lead.set()
+            if landed:
+                await fill(target)
 
         # Every market's pipeline at once, bounded by the gate above.
         await self._update(run_id, phase="fields")
@@ -778,3 +851,99 @@ def serialise_run(run: SyncRun) -> dict[str, Any]:
         "startedAt": run.started_at.isoformat() if run.started_at else None,
         "finishedAt": run.finished_at.isoformat() if run.finished_at else None,
     }
+
+
+if __name__ == "__main__":
+    import sys
+    import tempfile
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from ..db.duck import Catalog as DuckCatalog
+    from ..db.sqlite import Database as SqliteDatabase
+    from ..tasks import TaskRegistry as Registry
+
+    # One try a market: the waits between retries would only slow the check down.
+    SCOPE_ATTEMPTS = 1  # pyright: ignore[reportConstantRedefinition]
+    # The starter is not listed first, so only being held for it puts it ahead.
+    MARKETS = [
+        SyncTarget(INSTRUMENT_TYPE, "EUR", 1, "TOP2500"),
+        STARTER,
+        SyncTarget(INSTRUMENT_TYPE, "ASI", 1, "MINVOL1M"),
+    ]
+
+    class Brain:
+        """BRAIN as a sync meets it: each market's fields after a moment, refused when ``down``."""
+
+        def __init__(self, down: set[str]) -> None:
+            self.down = down
+            self.heard: list[str] = []
+
+        async def list_data_fields_all(self, **params: Any) -> list[BulkField]:
+            region = str(params["region"])
+            self.heard.append(f"asked {region}")
+            await asyncio.sleep(0.05)
+            self.heard.append(f"answered {region}")
+            if region in self.down:
+                raise BrainError("GET /data-fields: not sent while OFFLINE")
+            return [BulkField(id=f"{region}_close", type="MATRIX", dataset=FieldRef("pv1"))]
+
+        async def list_data_sets_all(self, **_params: Any) -> list[DataSet]:
+            return []
+
+    async def quietly(_payload: dict[str, Any]) -> None:
+        return None
+
+    async def first_run(root: Path, name: str, down: set[str]) -> SimpleNamespace:
+        """A sign-in on an empty catalog: whether it wants a first sync, that sync's end, and
+        whether a sign-in after it would want another."""
+        folder = root / name
+        folder.mkdir()
+        brain = Brain(down)
+        endpoints: Any = brain
+        db, catalog = SqliteDatabase(folder / "h.db"), DuckCatalog(folder / "c.db")
+        await db.create_all()
+        await catalog.open()
+        sync = CatalogSync(
+            db, catalog, endpoints, tasks=Registry(on_change=quietly), on_progress=quietly
+        )
+        try:
+            wanted = await sync.first_wanted()
+            run_id = (await sync.start_all(MARKETS, first=STARTER))["id"]
+            crawl = next(t for t in asyncio.all_tasks() if t.get_name() == f"sync-all-{run_id}")
+            # A starter that held the rest back for good would leave this wait unfinished.
+            finished = bool((await asyncio.wait({crawl}, timeout=10))[0])
+            return SimpleNamespace(
+                wanted=wanted,
+                finished=finished,
+                run=await sync.get_run(run_id),
+                heard=brain.heard,
+                again=await sync.first_wanted(),
+            )
+        finally:
+            await sync.shutdown()
+            await catalog.close()
+            await db.dispose()
+
+    async def scenarios() -> dict[str, bool]:
+        with tempfile.TemporaryDirectory() as folder:
+            up = await first_run(Path(folder), "up", set())
+            lost = await first_run(Path(folder), "starter-down", {"USA"})
+            down = await first_run(Path(folder), "all-down", {"USA", "EUR", "ASI"})
+        return {
+            "an empty catalog wants a first sync": up.wanted,
+            "the starter is fetched alone": up.heard[:2] == ["asked USA", "answered USA"],
+            "then every other market": up.finished and up.run.status == SyncStatus.COMPLETE,
+            "a stored catalog wants no other": not up.again,
+            "a refused starter holds nothing back": lost.finished
+            and lost.run.fields_synced == 2
+            and "USA" in (lost.run.error or ""),
+            "a failed try says why": down.run.status == SyncStatus.FAILED
+            and "not sent while OFFLINE" in (down.run.error or ""),
+            "and is not tried again by itself": down.finished and not down.again,
+        }
+
+    checks = asyncio.run(scenarios())
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"sync self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

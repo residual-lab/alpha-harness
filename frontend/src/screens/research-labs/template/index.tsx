@@ -12,6 +12,7 @@ import { toast } from 'sonner'
 import { catalog } from '@/api/catalog'
 import { DEFAULT_TRUNCATION, MAX_DECAY } from '@/api/platform'
 import type { Scope } from '@/api/types'
+import { fingerprint } from '@/lib/fingerprint'
 import { DASH, fmt } from '@/lib/format'
 import { useCores } from '@/lib/preferences'
 import { isRegionAgnostic, regionLabel, useScope, useScopeOptions } from '@/lib/scope'
@@ -164,8 +165,9 @@ export function TemplateLabScreen() {
     for (const t of list ?? []) add(savedKey(t.id), t.text, t.variables)
     return found
   }, [presets, datasets.data, list])
+  const sizingKey = useMemo(() => fingerprint(cards.map((c) => c.sizing)), [cards])
   const sized = useQuery({
-    queryKey: ['template-lab', 'stats', draft.region, draft.delay, cards.map((c) => c.sizing)],
+    queryKey: ['template-lab', 'stats', draft.region, draft.delay, sizingKey],
     queryFn: () =>
       templateLab.stats({
         region: draft.region,

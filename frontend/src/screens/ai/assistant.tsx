@@ -11,6 +11,7 @@ import { toast } from 'sonner'
 import { catalog } from '@/api/catalog'
 import { errorMessage } from '@/api/http'
 import { type Scope, scopeLabel, toScopeBody } from '@/api/types'
+import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/cn'
 import { fmt } from '@/lib/format'
 import { useScope } from '@/lib/scope'
@@ -510,11 +511,11 @@ function Turn({
 function Picks({ picks, scope }: { picks: ChatPick[]; scope: Scope }) {
   const [, setDataScope] = useScope('data')
   const copy = useMutation({
-    mutationFn: async () => {
-      const outline = await catalog.outline(scope, { field_ids: picks.map((p) => p.field) })
-      await navigator.clipboard.writeText(outline.text)
-      return outline
-    },
+    mutationFn: () =>
+      copyText(
+        () => catalog.outline(scope, { field_ids: picks.map((p) => p.field) }),
+        (outline) => outline.text,
+      ),
     onSuccess: (outline) =>
       toast.success(`Copied ${fmt.int(picks.length - outline.missing.length)} Data Fields`, {
         description: 'Grouped by Category, Subcategory and Dataset, ready to paste into any LLM.',

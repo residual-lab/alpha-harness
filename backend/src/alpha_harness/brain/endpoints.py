@@ -244,14 +244,16 @@ class BrainEndpoints:
         r = await self.client.poll(f"/alphas/{alpha_id}/correlations/{kind}")
         return r.body if isinstance(r.body, dict) else {}
 
-    async def alpha_body(self, alpha_id: str) -> dict[str, Any]:
+    async def alpha_body(self, alpha_id: str, *, patience: float | None = None) -> dict[str, Any]:
         """``GET /alphas/{id}`` exactly as sent: the page reads blocks the model leaves out
         (``is.investabilityConstrained``, ``classifications``)."""
-        r = await self.client.request("GET", f"/alphas/{alpha_id}")
+        r = await self.client.request("GET", f"/alphas/{alpha_id}", patience=patience)
         return r.body if isinstance(r.body, dict) else {}
 
-    async def recordset_body(self, alpha_id: str, name: str) -> dict[str, Any]:
-        r = await self.client.poll(f"/alphas/{alpha_id}/recordsets/{name}")
+    async def recordset_body(
+        self, alpha_id: str, name: str, *, patience: float | None = None
+    ) -> dict[str, Any]:
+        r = await self.client.poll(f"/alphas/{alpha_id}/recordsets/{name}", patience=patience)
         return r.body if isinstance(r.body, dict) else {}
 
     async def before_and_after(self, alpha_id: str) -> dict[str, Any]:
@@ -341,8 +343,9 @@ class BrainEndpoints:
     async def list_data_fields_paged(self, dataset_id: str, **params: Any) -> list[BulkField]:
         """Every field of one dataset in one scope, fifty at a time.
 
-        Region ``ALL`` refuses an unlimited read (``400 ["Invalid query"]``) and caps its flat
-        listing well below what it holds, so the only complete route is one dataset at a time.
+        Region ``ALL`` answers an unlimited read with an empty list (it once refused it with
+        ``400 ["Invalid query"]``) and caps its flat listing at 10,000, well below what it holds,
+        so the only complete route is one dataset at a time.
         Every other region is served whole by :meth:`list_data_fields_all`.
         """
         out: list[BulkField] = []
@@ -383,15 +386,30 @@ class BrainEndpoints:
         items = r.body.get("pyramids") if isinstance(r.body, dict) else None
         return items if isinstance(items, list) else []
 
-    async def pyramid_alphas(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
-        """``{category, region, delay, alphaCount}`` submitted between two ISO dates."""
+    async def pyramid_alphas(
+        self, start_date: str | None = None, end_date: str | None = None
+    ) -> list[dict[str, Any]]:
+        """``{category, region, delay, alphaCount}`` submitted between two ISO dates, or ever
+        without them."""
+        dates = {"startDate": start_date, "endDate": end_date}
         r = await self.client.request_retrying(
             "GET",
             "/users/self/activities/pyramid-alphas",
-            params={"startDate": start_date, "endDate": end_date},
+            params={k: v for k, v in dates.items() if v is not None},
         )
         items = r.body.get("pyramids") if isinstance(r.body, dict) else None
         return items if isinstance(items, list) else []
+
+    async def quarters(self) -> list[dict[str, str]]:
+        """``{name, startDate, endDate}`` for each quarter BRAIN's Genius page offers, newest
+        first. ``name`` reads ``2026-Q4``; both dates are inclusive."""
+        body = (await self.client.request_retrying("GET", "/users/self/consultant/summary")).body
+        performance = (body or {}).get("performance") or {}
+        listed = [performance.get("currentQuarter")] + [
+            h.get("quarter") for h in performance.get("history") or []
+        ]
+        unique = {q["name"]: q for q in listed if isinstance(q, dict) and q.get("name")}
+        return sorted(unique.values(), key=lambda q: q.get("startDate") or "", reverse=True)
 
     #: A region's datasets take eight to sixteen seconds, longer than the client's
     #: ordinary timeout allows for. BRAIN itself gives up at thirty with a 504.

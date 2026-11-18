@@ -1,19 +1,23 @@
 /**
  * The one Alpha table. Every screen that lists Alphas uses it, so each gets the same columns,
  * the same column picker, sorting, angles and After-Cost Mode. Each screen keeps its own choice
- * of columns, under its own `view` name.
+ * of columns, under its own `view` name. Where a screen has no use of its own for ticked rows,
+ * ticking them tags those Alphas on BRAIN.
  */
 
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { Columns3Icon } from 'lucide-react'
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Columns3Icon, TagIcon } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { toast } from 'sonner'
 import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type { components } from '@/api/generated'
 import { http } from '@/api/http'
+import { fingerprint } from '@/lib/fingerprint'
 import { fmt } from '@/lib/format'
 import { useDebounced } from '@/lib/use-debounced'
-import { AlphaActionsMenu } from '@/screens/pool/shared'
+import { alpha } from '@/screens/alpha/api'
+import { AlphaActionsMenu, useFlipSign } from '@/screens/pool/shared'
 import { Button, Checkbox, Input, Switch } from '@/ui/kit'
 import { Dialog } from '@/ui/overlay'
 import { type Column, DataTable, type Sort } from '@/ui/table'
@@ -59,6 +63,8 @@ const setView = (id: string, patch: Partial<View>) =>
   useViews.setState((s) => ({ views: { ...s.views, [id]: { ...s.views[id], ...patch } } }))
 
 const DEFAULT_BPS = 5
+/** Alphas tagged in one request, as the backend takes them. */
+const MAX_TAGGED = 500
 
 /** The cost a table charges, in bps. */
 export const useCostBps = (view: string) => useViews((s) => s.views[view]?.bps ?? DEFAULT_BPS)
@@ -118,9 +124,10 @@ function useLocalNet(view: string, rows: AlphaTableRow[], on: boolean) {
     () => [...new Set(rows.flatMap((r) => (r.alphaId ? [r.alphaId] : [])))].sort(),
     [rows],
   )
+  const idsKey = useMemo(() => fingerprint(ids), [ids])
   const charged = on ? bps : undefined
   const query = useQuery({
-    queryKey: ['after-cost', ids, charged ?? null],
+    queryKey: ['after-cost', idsKey, charged ?? null],
     queryFn: () =>
       http.post<components['schemas']['AfterCost']>('/api/vault/alphas/after-cost', {
         alpha_ids: ids,
@@ -128,6 +135,8 @@ function useLocalNet(view: string, rows: AlphaTableRow[], on: boolean) {
       }),
     enabled: charged !== undefined && ids.length > 0,
     placeholderData: keepPreviousData,
+    // Every Alpha a running task adds is a new key, and an old one is seldom asked again.
+    gcTime: 30_000,
   })
   const merged = useMemo(() => {
     if (charged === undefined) return rows
@@ -234,6 +243,27 @@ export function AlphaTable({
     () => (serverSort ? netRows : sortAlphas(netRows, current, overrides, angles)),
     [netRows, current, overrides, serverSort, angles],
   )
+  const flip = useFlipSign()
+  // BRAIN's own Sharpe, not After-Cost Mode's: a flip negates the signal, never its costs.
+  const sharpeOf = useMemo(() => new Map(rows.map((r) => [r.key, r.sharpe])), [rows])
+  // By Alpha rather than by row, so ticks hold across pages; a trial with no Alpha yet has none.
+  const [tagging, setTagging] = useState<ReadonlySet<string>>(() => new Set())
+  const screenTicks = selected && onSelect ? { selected, onSelect } : null
+  const ticks = screenTicks ?? {
+    selected: new Set(sorted.flatMap((r) => (r.alphaId && tagging.has(r.alphaId) ? [r.key] : []))),
+    onSelect: (keys: string[], on: boolean) => {
+      const chosen = new Set(keys)
+      const ids = sorted.flatMap((r) => (r.alphaId && chosen.has(r.key) ? [r.alphaId] : []))
+      setTagging((now) => {
+        const next = new Set(now)
+        for (const id of ids) {
+          if (on) next.add(id)
+          else next.delete(id)
+        }
+        return next
+      })
+    },
+  }
 
   const columns: Column<AlphaTableRow>[] = [
     ...options
@@ -255,7 +285,22 @@ export function AlphaTable({
       ),
       width: '52px',
       align: 'right',
-      cell: (r) => r.alphaId && <AlphaActionsMenu alphaId={r.alphaId} links />,
+      cell: (r) =>
+        r.alphaId && (
+          // Inside a clickable row: a click in its menu must not also open the row.
+          <span
+            role="group"
+            aria-label="Alpha actions"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            <AlphaActionsMenu
+              alphaId={r.alphaId}
+              links
+              {...flip.offer(r.alphaId, sharpeOf.get(r.key))}
+            />
+          </span>
+        ),
     },
   ]
 
@@ -291,6 +336,9 @@ export function AlphaTable({
             )}
           </div>
         )}
+        {!screenTicks && tagging.size > 0 && (
+          <TagTicked ids={[...tagging]} onDone={(left) => setTagging(new Set(left))} />
+        )}
         <DataTable
           label={label}
           rows={sorted}
@@ -299,7 +347,7 @@ export function AlphaTable({
           columns={columns}
           {...(current ? { sort: current } : {})}
           onSort={onSort ?? setOwnSort}
-          {...(selected && onSelect ? { selected, onSelect } : {})}
+          {...ticks}
           {...(onRowClick ? { onRowClick } : {})}
           {...(rowClass ? { rowClass: rowClass(sorted) } : {})}
           loading={(loading ?? false) || netPending}
@@ -308,8 +356,76 @@ export function AlphaTable({
           maxHeight={maxHeight}
           {...(page !== undefined ? { page } : {})}
         />
+        {flip.dialog}
       </div>
     </AnglesContext.Provider>
+  )
+}
+
+/** Adds tags to every ticked Alpha on BRAIN, beside the tags each already has. */
+function TagTicked({ ids, onDone }: { ids: string[]; onDone: (left: string[]) => void }) {
+  const queryClient = useQueryClient()
+  const [text, setText] = useState('')
+  const tags = text
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean)
+  const tooMany = ids.length > MAX_TAGGED
+  const add = useMutation({
+    mutationFn: () => alpha.tag(ids, tags),
+    onSuccess: ({ tagged, failed }) => {
+      void queryClient.invalidateQueries({ queryKey: ['pool'] })
+      void queryClient.invalidateQueries({ queryKey: ['alpha'] })
+      const missed = Object.keys(failed)
+      if (missed.length === 0) {
+        toast.success(`Tagged ${fmt.int(tagged.length)} Alpha${tagged.length === 1 ? '' : 's'}`)
+        setText('')
+      } else {
+        toast.error(`${fmt.int(missed.length)} of ${fmt.int(ids.length)} Alphas not tagged`, {
+          description: [...new Set(Object.values(failed))].join(' '),
+        })
+      }
+      // Those that failed stay ticked, to try again.
+      onDone(missed)
+    },
+  })
+  return (
+    <form
+      className="flex flex-wrap items-center gap-2 rounded-md border border-hairline-strong bg-surface-2 p-2"
+      onSubmit={(e) => {
+        e.preventDefault()
+        add.mutate()
+      }}
+    >
+      <span className="text-body-compact text-ink">
+        <span className="num">{fmt.int(ids.length)}</span> Alpha{ids.length === 1 ? '' : 's'} ticked
+      </span>
+      <Input
+        aria-label="Tags to add"
+        placeholder="Tag, or several separated by commas"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        className="w-72"
+      />
+      <Button
+        type="submit"
+        size="sm"
+        variant="primary"
+        disabled={tags.length === 0 || tooMany}
+        loading={add.isPending}
+      >
+        {!add.isPending && <TagIcon />}
+        Add Tag
+      </Button>
+      <Button size="sm" variant="ghost" disabled={add.isPending} onClick={() => onDone([])}>
+        Clear
+      </Button>
+      <span className="text-body-compact text-ink-subtle">
+        {tooMany
+          ? `At most ${fmt.int(MAX_TAGGED)} at a time.`
+          : 'Saved to BRAIN, beside the tags each Alpha already has.'}
+      </span>
+    </form>
   )
 }
 

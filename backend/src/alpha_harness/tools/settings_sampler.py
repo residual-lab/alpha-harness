@@ -1,7 +1,7 @@
 """Settings Sampler: run one proven expression everywhere BRAIN will accept it.
 
 The expression, decay and truncation are held exactly as the source Alpha has them, unless
-the Truncation Agent sets truncation market by market. What
+the Truncation Agent sets truncation market by market or a Decay sweep asks for several. What
 varies is the market — region, delay, universe — plus neutralization and the
 maxTrade/maxPosition pair. A market only counts when every data field the expression reads
 is downloaded there, so a two-field Alpha is judged on the intersection.
@@ -35,6 +35,8 @@ from ..labs.fastexpr import ParseError, data_fields, parse
 from ..labs.truncation import truncation_for
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..db.models import Study
     from ..labs.study import Optimizer
 
@@ -315,6 +317,7 @@ def expand(
     *,
     market_neutral_only: bool = True,
     truncation_agent: bool = False,
+    decays: Sequence[int] = (),
 ) -> list[SimulationRequest]:
     """Every simulation the selection asks for, ordered for both packing and watching.
 
@@ -326,15 +329,17 @@ def expand(
     So the shuffling happens a batch at a time: each ten stay in one market, and the order
     those tens go out is random. Packing is untouched and no region waits its turn.
 
-    With ``truncation_agent`` each market takes the agent's truncation.
+    With ``truncation_agent`` each market takes the agent's truncation. With ``decays`` each
+    simulation runs once at every one of them instead of at the source's own decay.
     """
     expression = str(source.get("expression") or "")
-    decay = int(source.get("decay") or 0)
+    swept = sorted(set(decays)) or [int(source.get("decay") or 0)]
     held = source.get("truncation")
     truncation = DEFAULT_TRUNCATION if held is None else float(held)
     pasteurization = str(source.get("pasteurization") or DEFAULT_PASTEURIZATION)
     nan_handling = str(source.get("nanHandling") or DEFAULT_NAN_HANDLING)
     test_period = str(source.get("testPeriod") or TEST_PERIOD)
+    visualization = bool(source.get("visualization"))
 
     groups: dict[tuple[str, int], list[SimulationRequest]] = {}
     for region in plan_rows:
@@ -351,8 +356,8 @@ def expand(
             for m in region["markets"]
             if not chosen or (str(m["region"]), int(m["delay"]), str(m["universe"])) in chosen
         ]
-        for market, neutralization, (trade, position) in product(
-            markets, legal_neutral, legal_pairs
+        for market, neutralization, (trade, position), decay in product(
+            markets, legal_neutral, legal_pairs, swept
         ):
             if market_neutral_only and not market_neutral(neutralization, trade, position):
                 continue
@@ -372,6 +377,7 @@ def expand(
                     pasteurization=pasteurization,
                     nan_handling=nan_handling,
                     test_period=test_period,
+                    visualization=visualization,
                     max_trade=trade,
                     max_position=position,
                 ),
@@ -423,6 +429,8 @@ async def refill(optimizer: Optimizer, row: Study, want: int, waiting: bool) -> 
     Only ``want`` rows are read. A sweep may carry thousands of parked trials, and loading
     them all on every scheduler tick is a cost that grows with the task.
     """
+    # Before anything is read to send: what repeats a refusal is never sent.
+    await scheduler.close_refused(optimizer, row.id, PENDING_SEND)
     parked = (
         Trial.study_id == row.id,
         Trial.state == TrialState.PRUNED,
@@ -447,3 +455,30 @@ async def refill(optimizer: Optimizer, row: Study, want: int, waiting: bool) -> 
         # No message: the status is the news, and a notice repeating it is noise.
         await scheduler.finish(optimizer, row.id, StudyStatus.COMPLETE, "")
     return sent
+
+
+if __name__ == "__main__":
+    import sys
+
+    usa = {
+        "region": "USA",
+        "neutralizations": ["SUBINDUSTRY", "INDUSTRY"],
+        "pairs": [{"maxTrade": "OFF", "maxPosition": "OFF"}],
+        "markets": [{"region": "USA", "delay": 1, "universe": "TOP3000"}],
+    }
+    source = {"expression": "rank(close)", "decay": 4}
+    held = expand([usa], set(), {"SUBINDUSTRY"}, set(), source)
+    swept = expand([usa], set(), {"SUBINDUSTRY"}, set(), source, decays=[10, 0, 10])
+    checks = {
+        "held at the source's own decay": [r.settings.decay for r in held] == [4],
+        "each decay once, a repeat dropped": sorted(r.settings.decay for r in swept) == [0, 10],
+        "nothing else swept with it": {r.settings.neutralization for r in swept} == {"SUBINDUSTRY"},
+        "visualization off unless asked": not any(r.settings.visualization for r in held),
+        "...and on for every simulation when asked": all(
+            r.settings.visualization
+            for r in expand([usa], set(), {"SUBINDUSTRY"}, set(), {**source, "visualization": True})
+        ),
+    }
+    if failed := [name for name, ok in checks.items() if not ok]:
+        raise SystemExit(f"settings sampler self-check failed: {'; '.join(failed)}")
+    sys.stdout.write(f"{len(checks)} cases as expected\n")

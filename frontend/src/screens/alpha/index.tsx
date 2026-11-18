@@ -8,7 +8,13 @@ import { Link, useCanGoBack, useParams, useRouter } from '@tanstack/react-router
 import { ArrowLeftIcon, ExternalLinkIcon } from 'lucide-react'
 import { useState } from 'react'
 import { DetailSheet } from '@/screens/pool/detail'
-import { AlphaActionsMenu, AstInspector, OpenInBrain, RecheckButton } from '@/screens/pool/shared'
+import {
+  AlphaActionsMenu,
+  AstInspector,
+  OpenInBrain,
+  RecheckButton,
+  useFlipSign,
+} from '@/screens/pool/shared'
 import { Badge, Button, ErrorNotice, Notice, Page, Panel, Skeleton, type Tone } from '@/ui/kit'
 import { Select } from '@/ui/overlay'
 import { type AlphaInfo, alpha as api, type RecordsetName } from './api'
@@ -162,6 +168,7 @@ function Header({
   const unsubmitted = a.status === 'UNSUBMITTED'
   const quick = unsubmitted && a.settings['simulationMode'] === 'QUICK'
   const failing = (a.periods.is?.checks ?? []).some((c) => c.result === 'FAIL')
+  const flip = useFlipSign()
   return (
     <header className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 rounded-lg border border-hairline bg-surface-1 px-4 py-3">
       <div className="flex flex-wrap items-center gap-3">
@@ -208,7 +215,11 @@ function Header({
             )}
           </>
         )}
-        <AlphaActionsMenu alphaId={a.alphaId} />
+        <AlphaActionsMenu
+          alphaId={a.alphaId}
+          {...flip.offer(a.alphaId, a.periods.is?.['sharpe'])}
+        />
+        {flip.dialog}
       </div>
     </header>
   )

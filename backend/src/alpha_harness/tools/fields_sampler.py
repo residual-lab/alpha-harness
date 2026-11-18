@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 from sqlalchemy import func, select
 
+from ..brain.platform import FAST_D1_MARKET, FAST_D1_SUFFIX
 from ..brain.schemas import SimulationRequest, SimulationSettings
 from ..brain.settings_schema import chosen_labels
 from ..catalog import search
@@ -58,6 +59,8 @@ BUCKETS: Mode = "buckets"
 
 #: The tiers Similar takes its fields from, nearest first.
 TIERS = ("dataset", "subcategory", "category", "market")
+#: The tier of a field's Fast D1 twin and its delta, offered ahead of every other.
+FAST_D1_TIER = "fast_d1"
 
 #: Words in a field id that name a date or a symbol, not a measurement.
 _TECHNICAL = frozenset({"date", "dates", "timestamp", "isin", "cusip", "sedol", "ticker"})
@@ -93,10 +96,11 @@ def slots(tree: Node) -> list[str]:
 
 def swapped(tree: Node, field: str, swap: str) -> Node:
     """The expression with ``field`` read as ``swap`` everywhere it appears, so a field that is
-    used twice stays one field."""
+    used twice stays one field. ``swap`` is a field, or an expression such as a Fast D1 delta."""
+    into = Node("name", swap) if swap.isidentifier() else parse(swap)
     for path, node, parent in walk_with_parents(tree):
         if node.kind == "name" and node.value == field and not guarded(parent, path):
-            tree = replace_at(tree, path, Node("name", swap))
+            tree = replace_at(tree, path, into)
     return tree
 
 
@@ -159,6 +163,24 @@ async def buckets(
     return found
 
 
+async def fast_twins(queries: CatalogQueries, scope: Tuple4, field: str) -> list[Candidate]:
+    """In the Fast D1 market, a field's twin and the overnight change between the two. BRAIN
+    takes a Fast D1 Alpha only if it beats its regular one, and suggests the delta,
+    ``field_fast_d1 - field``, for a lower Production Correlation."""
+    if (scope.region, scope.delay) != FAST_D1_MARKET:
+        return []
+    regular = field.removesuffix(FAST_D1_SUFFIX)
+    fast = regular + FAST_D1_SUFFIX
+    twin = regular if field == fast else fast
+    row = await queries.field(scope, twin)
+    if row is None:
+        return []
+    return [
+        Candidate(twin, row["dataset_id"], FAST_D1_TIER, row["coverage"]),
+        Candidate(f"{fast} - {regular}", row["dataset_id"], FAST_D1_TIER, None),
+    ]
+
+
 async def candidates(
     queries: CatalogQueries, scope: Tuple4, field: str, mode: Mode, k: int
 ) -> tuple[list[Candidate], str | None]:
@@ -167,6 +189,8 @@ async def candidates(
     seed = await queries.field(scope, field)
     if seed is None:
         return [], f"{field} is not in the catalog for {scope.label}. Download it in Data."
+    twins = await fast_twins(queries, scope, field)
+    twinned = {c.field for c in twins}
     kept = (seed["field_type"],)
     if mode == SWEEP:
         rows = await queries.catalog.query(
@@ -177,18 +201,19 @@ async def candidates(
             """,  # noqa: S608 - module constants
             [*scope.params, seed["dataset_id"], *kept, field],
         )
-        found = [
+        found = twins + [
             Candidate(r["field_id"], r["dataset_id"], "dataset", r["coverage"])
             for r in rows
-            if not technical(r["field_id"])
+            if not technical(r["field_id"]) and r["field_id"] not in twinned
         ]
         return found, None if found else f"{seed['dataset_id']} has no other {kept[0]} field."
 
     if not await search.ready(queries.catalog):
-        return [], "Similar needs the catalog's search index, which is not built on this computer."
+        unindexed = "Similar needs the catalog's search index, which is not built on this computer."
+        return twins, None if twins else unindexed
     terms = search.query_terms(f"{field} {seed.get('description') or ''}")
     if terms is None:
-        return [], f"{field} has no description to compare."
+        return twins, None if twins else f"{field} has no description to compare."
     rows = await queries.catalog.query(
         f"""
         SELECT field_id, dataset_id, subcategory_id, category_id, coverage FROM {SCORED_SOURCE}
@@ -199,7 +224,7 @@ async def candidates(
     )
     nearest = {tier: [] for tier in TIERS}
     for r in rows:
-        if technical(r["field_id"]):
+        if technical(r["field_id"]) or r["field_id"] in twinned:
             continue
         tier = (
             "dataset"
@@ -212,7 +237,7 @@ async def candidates(
         )
         if len(nearest[tier]) < k:
             nearest[tier].append(Candidate(r["field_id"], r["dataset_id"], tier, r["coverage"]))
-    found = [c for tier in TIERS for c in nearest[tier]]
+    found = twins + [c for tier in TIERS for c in nearest[tier]]
     return found, None if found else f"No field reads like {field}."
 
 
@@ -492,7 +517,7 @@ async def expand(optimizer: Any, row: Any) -> int:
                 .where(
                     Trial.study_id == row.id,
                     Trial.state == TrialState.COMPLETE,
-                    func.json_extract(Trial.params, "$.read").is_(None),
+                    Trial.read.is_(None),
                 )
                 .order_by(Trial.number)
             )
@@ -525,6 +550,24 @@ async def expand(optimizer: Any, row: Any) -> int:
                 source = render(parse(row.template_source or ""))
                 seen |= {identity(source, dict(st or {})) for _, st in tried}
             number = int(number or 0)
+            # A Full run stands in for the Quick trial it re-ran, which holds its place in the
+            # tree: the Full row is written without one.
+            full_of = {
+                t.number: int(t.params["fullOf"])
+                for t in winners
+                if (t.params or {}).get("fullOf") is not None
+            }
+            depth = dict(
+                (
+                    await session.execute(
+                        select(Trial.number, Trial.generation).where(
+                            Trial.study_id == row.id, Trial.number.in_(set(full_of.values()))
+                        )
+                    )
+                )
+                .tuples()
+                .all()
+            )
             for parent in winners:
                 if room <= 0:
                     break
@@ -534,18 +577,14 @@ async def expand(optimizer: Any, row: Any) -> int:
                     continue
                 settings = dict(parent.settings or {})
                 swaps = await swaps_at(queries, settings, slots(tree), run.mode, run.k)
+                origin = full_of.get(parent.number, parent.number)
+                generation = parent.generation or depth.get(origin) or 1
                 for v in variants(parent.expression or "", settings, swaps, seen)[:room]:
                     number += 1
                     room -= 1
                     added += 1
                     session.add(
-                        _parked(
-                            row.id,
-                            number,
-                            v,
-                            parent=parent.number,
-                            generation=(parent.generation or 1) + 1,
-                        )
+                        _parked(row.id, number, v, parent=origin, generation=generation + 1)
                     )
         await session.commit()
     return added
@@ -632,6 +671,67 @@ if __name__ == "__main__":
             "rank(pe) + rank(ebitda)",
         ],
     )
+
+    async def full_run_wins() -> int:
+        """``expand`` once a winner's Full re-run is back: it reads where the Quick trial sat
+        in the tree. That read once indexed a SQLAlchemy ``Result`` as a mapping."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from ..db.models import Study, StudyStatus
+        from ..db.sqlite import Database
+        from ..labs.params import FIELDS_SAMPLER
+
+        passing = {"checks": [{"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 2}]}
+        usa = {"region": "USA", "delay": 1, "universe": "TOP3000", "instrumentType": "EQUITY"}
+        # No data field, so there is nothing to swap and the catalog is never read.
+        alpha = "rank(1)"
+        with tempfile.TemporaryDirectory() as folder:
+            db = Database(Path(folder) / "harness.db")
+            try:
+                await db.create_all()
+                async with db.session() as session:
+                    study = Study(
+                        name="fields",
+                        template_source=alpha,
+                        sampler=FIELDS_SAMPLER,
+                        sampler_params=FieldsSamplerParams(region="USA", delay=1).dump(),
+                        task="fields",
+                        status=StudyStatus.RUNNING,
+                    )
+                    session.add(study)
+                    await session.flush()
+                    session.add_all(
+                        [
+                            Trial(
+                                study_id=study.id,
+                                number=0,
+                                expression=alpha,
+                                settings=usa,
+                                generation=1,
+                                state=TrialState.COMPLETE,
+                                result={**passing, "quick": True},
+                            ),
+                            Trial(
+                                study_id=study.id,
+                                number=1,
+                                params={"fullOf": 0},
+                                expression=alpha,
+                                settings={**usa, "simulationMode": "FULL"},
+                                state=TrialState.COMPLETE,
+                                result=passing,
+                            ),
+                        ]
+                    )
+                async with db.session() as session:
+                    row = await session.get(Study, study.id)
+                optimizer = SimpleNamespace(db=db, alphas=SimpleNamespace(catalog=None))
+                return await expand(optimizer, row)
+            finally:
+                await db.dispose()
+
+    checks["a Full re-run's win expands"] = (asyncio.run(full_run_wins()), 0)
     wrong = [f"{name}: {got!r}" for name, (got, want) in checks.items() if got != want]
     if wrong:
         raise SystemExit(f"fields sampler self-check failed: {'; '.join(wrong)}")

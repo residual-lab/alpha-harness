@@ -6,8 +6,9 @@
 import { Link } from '@tanstack/react-router'
 import { CheckIcon } from 'lucide-react'
 import type { ReactNode } from 'react'
-import type { Today } from '@/api/types'
+import type { SyncMarket, Today } from '@/api/types'
 import { cn } from '@/lib/cn'
+import { useLive } from '@/lib/live'
 import { useRunnableModels } from '@/screens/ai/shared'
 import { Button, Panel, Progress } from '@/ui/kit'
 
@@ -17,22 +18,37 @@ interface Step {
   key: string
   title: string
   done: boolean
+  /** What an open step is waiting on, under its title. */
+  detail?: ReactNode
   action: (variant: Variant) => ReactNode
 }
 
+/** A market in one of these has its fields stored: a task can already run there. */
+const LANDED = new Set<SyncMarket['state']>(['fields', 'details', 'done'])
+
 export function GettingStarted({ today }: { today: Today | undefined }) {
   const models = useRunnableModels()
+  // The first sign-in starts the first sync by itself; its progress arrives on the socket.
+  const live = useLive((s) => s.sync)
   // Nothing while pending: returning users (setup done) would otherwise see a skeleton collapse.
   if (!today) return null
 
+  const sync = live ?? today.catalog.running
+  const syncing = sync?.status === 'RUNNING'
   const steps: Step[] = [
     {
       key: 'data',
       title: 'Sync BRAIN Datasets',
-      done: today.catalog.anySynced,
+      // Done the moment the first market lands, not when the whole catalog has.
+      done: today.catalog.anySynced || Boolean(live?.markets?.some((m) => LANDED.has(m.state))),
+      detail: syncing ? (
+        'Downloading from BRAIN…'
+      ) : sync?.status === 'FAILED' && sync.error ? (
+        <span className="text-pnl-negative-text">The sync failed. {sync.error}</span>
+      ) : undefined,
       action: (variant) => (
         <Button size="sm" variant={variant} render={<Link to="/sync" />}>
-          Sync
+          {syncing ? 'View' : 'Sync'}
         </Button>
       ),
     },
@@ -116,13 +132,20 @@ export function GettingStarted({ today }: { today: Today | undefined }) {
                   <span className="num">{i + 1}</span>
                 )}
               </span>
-              <span
-                className={cn(
-                  'min-w-0 flex-1 text-body',
-                  step.done ? 'text-ink-subtle line-through decoration-ink-tertiary' : 'text-ink',
+              <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <span
+                  className={cn(
+                    'text-body',
+                    step.done ? 'text-ink-subtle line-through decoration-ink-tertiary' : 'text-ink',
+                  )}
+                >
+                  {step.title}
+                </span>
+                {!step.done && step.detail && (
+                  <span className="text-body-compact text-pretty break-words text-ink-subtle">
+                    {step.detail}
+                  </span>
                 )}
-              >
-                {step.title}
               </span>
               {!step.done && step.action(isNext ? 'primary' : 'secondary')}
             </li>
